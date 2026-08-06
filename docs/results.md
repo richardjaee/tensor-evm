@@ -156,6 +156,53 @@ A purpose-built chain would raise it — worth noting because it is a second pla
 the block gas limit, where a chain's configuration bounds how much work one transaction may
 contain.
 
+## Phase 2 — weights read from chain state
+
+**Verdict: works, and moves the bottleneck to activations.**
+
+Weights live in contract code. The caller passes an address and an offset; the precompile
+reads them through the journal. Nothing about the model appears in the transaction.
+
+This could not be an ordinary precompile. The `fn(&[u8], u64, u64)` signature receives only
+its input bytes and never sees the chain, so reaching state meant implementing the
+`PrecompileProvider` trait, which is handed the context. The result wraps Ethereum's own
+precompiles rather than replacing them, and both matmul forms coexist: `0x100` takes
+weights as calldata, `0x101` reads them from state.
+
+Measured at 256 × 256:
+
+| | calldata form (`0x100`) | state form (`0x101`) |
+|---|---|---|
+| input bytes | 132,360 | **1,056** |
+| total gas | 5,174,310 | **55,200** |
+| of which matmul | 164 | 164 |
+| of which cold account | — | 2,600 |
+
+**93× cheaper, and 125× less input.** The saving grows with `rows`, because calldata for the
+state form scales with `cols` alone rather than `rows × cols`.
+
+Price is independent of blob size — a call touching a small tensor inside a 64 GB model
+costs the same as one against a 64 KB model. Without that, large models would be unusable
+regardless of how little of them any single call reads.
+
+### The next bottleneck is activations
+
+The remaining 55,200 gas is almost entirely the activation vector arriving as calldata.
+Projecting to Qwen3-32B (dim 5120, 64 layers, seven matmuls per layer):
+
+| per token | gas |
+|---|---|
+| matmul (all layers) | ~31M |
+| activations as calldata | ~147M |
+
+**Transport still dominates, now by about 5×.** The fix is the same one that worked here:
+activations belong in state too. The companion project already keeps the residual stream in
+storage between phases, so the contract has them there already — passing a reference rather
+than the bytes is a smaller change than it sounds, and it removes calldata from the inner
+loop entirely.
+
+That is the immediate next step, ahead of the model registry.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

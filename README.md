@@ -67,7 +67,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 |---|---|---|
 | 0 | Deterministic kernel + bandwidth measurement | **done** |
 | 1 | Precompile, callable from contract bytecode | **done** |
-| 2 | Weights read from chain state, not calldata | next |
+| 2 | Weights read from chain state, not calldata | **done** |
+| 2.5 | Activations in state too — transport out of the inner loop | next |
 | 3 | Model registry, session-keyed state, arch flags | |
 | 4 | Scale run | |
 | 5 | Mixture-of-experts support | |
@@ -102,6 +103,18 @@ execution begins. The computation is not cheap relative to transport — it is u
 
 So weights cannot travel as arguments. They must already be on chain, with the caller
 passing a reference and the precompile reading from state.
+
+### Phase 2 headline
+
+Weights now live in contract code and the precompile reads them through the journal. At
+256 x 256 that is **93x cheaper and 125x less input** — 55,200 gas against 5,174,310, with
+calldata falling from 132,360 bytes to 1,056. The saving grows with model size, because
+input now scales with `cols` alone rather than `rows x cols`.
+
+And it moves the bottleneck rather than removing it. At Qwen3-32B the remaining calldata —
+the activation vector — projects to ~147M gas per token against ~31M for the arithmetic.
+Transport still dominates, by about 5x. Activations belong in state for the same reason
+weights did, which is what phase 2.5 does.
 
 ## Layout
 

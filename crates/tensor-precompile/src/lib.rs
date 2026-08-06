@@ -310,3 +310,5 @@ mod tests {
         assert_eq!(decode(&out.bytes).unwrap().len(), rows);
     }
 }
+
+pub mod state;
