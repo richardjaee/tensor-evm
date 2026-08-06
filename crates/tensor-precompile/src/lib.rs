@@ -190,7 +190,7 @@ pub fn encode(rows: usize, cols: usize, scales: &[i8], weights: &[i16], acts: &[
 
 /// Decodes the output.
 pub fn decode(bytes: &[u8]) -> Option<Vec<i32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     Some(
