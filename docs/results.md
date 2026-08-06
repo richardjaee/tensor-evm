@@ -106,6 +106,56 @@ covered by `parallel_matches_scalar`.
 bit-identical output at 1, 2, 3, 7, and 14 threads on a shape above the threshold, so it
 exercises the parallel path rather than trivially passing through the scalar one.
 
+## Phase 1 — the precompile, in a real EVM
+
+**Verdict: reachable and correct, and it exposed the constraint that defines phase 2.**
+
+The precompile is registered at `0x100`, executes under the interpreter's own gas
+accounting, and returns correct results both to a direct transaction and to contract
+bytecode performing a `STATICCALL` — the path Solidity takes. Seventeen tests cover it,
+including ten malformed inputs that would each panic an unchecked implementation.
+
+### Passing weights as calldata does not work
+
+Measured at 256 × 256, with the weights in the transaction's input:
+
+| | gas |
+|---|---|
+| total transaction | 5,174,310 |
+| the matmul itself | 164 |
+| transport (calldata, intrinsic) | 5,174,146 |
+| **ratio** | **31,549×** |
+
+Making the arithmetic 16,000× cheaper accomplishes nothing when moving the operands costs
+31,549× more than performing the operation. Calldata is priced per byte against scarce
+block space; the matmul is priced against measured throughput. Those two schedules are not
+close to each other, and at any real model width the gap only widens.
+
+The property is sharper than the ratio. EIP-7623 places a floor on a transaction's gas
+derived from its calldata, and at this width the floor already exceeds the cost of the
+matmul by four orders of magnitude — so a gas limit low enough to starve the arithmetic is
+**rejected before execution begins**. The computation is not merely cheap relative to
+transport; it is unpriceable. `the_calldata_floor_makes_the_matmul_unpriceable` pins this.
+
+**Therefore weights cannot travel as arguments.** They have to already be on the chain,
+with the caller passing a reference and the precompile reading from state directly. That
+was already the plan for phase 2; it is now the only viable design rather than an
+optimisation.
+
+### A consequence for the implementation
+
+The simple precompile signature — `fn(&[u8], u64, u64)` — receives only its input bytes and
+has no access to chain state. Reading weights from storage therefore requires implementing
+the full `PrecompileProvider` trait, which is handed `&mut CTX` and can reach the journal.
+That is a larger change than extending a precompile set, and it is the substance of phase 2.
+
+### Incidental finding
+
+revm's default spec enforces a per-transaction gas cap of 2²⁴ (16,777,216) under EIP-7825.
+A purpose-built chain would raise it — worth noting because it is a second place, besides
+the block gas limit, where a chain's configuration bounds how much work one transaction may
+contain.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

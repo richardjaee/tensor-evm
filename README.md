@@ -66,8 +66,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | Phase | Deliverable | State |
 |---|---|---|
 | 0 | Deterministic kernel + bandwidth measurement | **done** |
-| 1 | reth fork, stub precompile callable from Solidity | next |
-| 2 | Real precompile against state-resident weights | |
+| 1 | Precompile, callable from contract bytecode | **done** |
+| 2 | Weights read from chain state, not calldata | next |
 | 3 | Model registry, session-keyed state, arch flags | |
 | 4 | Scale run | |
 | 5 | Mixture-of-experts support | |
@@ -87,13 +87,29 @@ billion multiply-accumulates per second.
 | DeepSeek-V3 (37B active) | 9.0 days | 0.38 s |
 
 A 32B model goes from just under eight days of chain time per token to a third of a second
-on a laptop. Phase 1 is worth building.
+on a laptop.
+
+### Phase 1 headline
+
+The precompile works, and measuring it exposed the constraint that shapes everything after.
+Passing weights as calldata costs **31,549× more than multiplying by them** — 5,174,146 gas
+of transport against 164 gas of arithmetic. Making the computation 16,000× cheaper buys
+nothing while moving its operands costs that much more than performing it.
+
+Sharper still: EIP-7623's calldata floor already exceeds the matmul's price by four orders
+of magnitude, so a gas limit low enough to starve the arithmetic is rejected before
+execution begins. The computation is not cheap relative to transport — it is unpriceable.
+
+So weights cannot travel as arguments. They must already be on chain, with the caller
+passing a reference and the precompile reading from state.
 
 ## Layout
 
 ```
-crates/tensor-kernel/   deterministic integer matmul, plus the bandwidth benchmark
-docs/design.md          architecture, scaling analysis, non-goals, limitations
+crates/tensor-kernel/       deterministic integer matmul, plus the bandwidth benchmark
+crates/tensor-precompile/   the EVM precompile, and its end-to-end tests
+docs/design.md              architecture, scaling analysis, non-goals, limitations
+docs/results.md             every measurement, with the command that produces it
 ```
 
 ## Building
