@@ -119,12 +119,7 @@ fn main() {
     ];
     for &(name, params) in models {
         let gb = params * 2.0 / 1e9;
-        println!(
-            "{:<28} {:>10.1} GB {:>14.2}",
-            name,
-            gb,
-            gb / best_parallel
-        );
+        println!("{:<28} {:>10.1} GB {:>14.2}", name, gb, gb / best_parallel);
     }
 
     println!(

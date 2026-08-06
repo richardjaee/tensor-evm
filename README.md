@@ -60,19 +60,34 @@ different core counts would fork the chain.
 
 ## Status
 
-Early. Phase 0 of six — see [`docs/design.md`](docs/design.md) for the full plan.
+Phase 0 complete and the premise holds. See [`docs/results.md`](docs/results.md) for the
+measurements and [`docs/design.md`](docs/design.md) for the plan.
 
 | Phase | Deliverable | State |
 |---|---|---|
-| 0 | Deterministic kernel + bandwidth measurement | in progress |
-| 1 | reth fork, stub precompile callable from Solidity | |
+| 0 | Deterministic kernel + bandwidth measurement | **done** |
+| 1 | reth fork, stub precompile callable from Solidity | next |
 | 2 | Real precompile against state-resident weights | |
 | 3 | Model registry, session-keyed state, arch flags | |
 | 4 | Scale run | |
 | 5 | Mixture-of-experts support | |
 
-Phase 0 gates the rest. If native integer matmul is not dramatically faster than the EVM
-baseline, the premise is wrong and nothing else should be built.
+### Phase 0 headline
+
+The EVM charges **63 gas per multiply-accumulate**, flat across three orders of magnitude
+of shape — measured against the companion project's already-optimised assembly
+implementation, so the figure reflects the interpreter rather than the Solidity. The native
+kernel sustains **196 GB/s**, about 72% of the test machine's theoretical peak, or 98
+billion multiply-accumulates per second.
+
+| model | EVM chain time/token | native |
+|---|---|---|
+| SmolLM2-135M | 47 minutes | 0.003 s |
+| Qwen3-32B | 7.8 days | 0.33 s |
+| DeepSeek-V3 (37B active) | 9.0 days | 0.38 s |
+
+A 32B model goes from just under eight days of chain time per token to a third of a second
+on a laptop. Phase 1 is worth building.
 
 ## Layout
 
