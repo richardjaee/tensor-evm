@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Model weights and conversion artifacts — never commit these
+/models/
+*.safetensors
+*.bin
+*.gguf
+
+# Chain data
+/datadir/
+/genesis-out/
+
+.env
+.env.*
+!.env.example
+.DS_Store
