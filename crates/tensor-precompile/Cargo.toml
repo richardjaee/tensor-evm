@@ -1,0 +1,12 @@
+[package]
+name = "tensor-precompile"
+description = "EVM precompile exposing deterministic integer matmul"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tensor-kernel = { path = "../tensor-kernel" }
+revm = "42"

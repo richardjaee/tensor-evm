@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tensor-kernel"]
+members = ["crates/tensor-kernel", "crates/tensor-precompile"]
 resolver = "2"
 
 [workspace.package]
@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/richardjaee/tensor-evm"
-rust-version = "1.82"
+rust-version = "1.91"
 
 [profile.release]
 opt-level = 3
