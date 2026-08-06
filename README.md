@@ -68,8 +68,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | 0 | Deterministic kernel + bandwidth measurement | **done** |
 | 1 | Precompile, callable from contract bytecode | **done** |
 | 2 | Weights read from chain state, not calldata | **done** |
-| 2.5 | Activations in state too — transport out of the inner loop | next |
-| 3 | Model registry, session-keyed state, arch flags | |
+| ~~2.5~~ | ~~Activations in state too~~ | dropped — measured unnecessary |
+| 3 | Model registry, session-keyed state, arch flags | next |
 | 4 | Scale run | |
 | 5 | Mixture-of-experts support | |
 
@@ -111,10 +111,16 @@ Weights now live in contract code and the precompile reads them through the jour
 calldata falling from 132,360 bytes to 1,056. The saving grows with model size, because
 input now scales with `cols` alone rather than `rows x cols`.
 
-And it moves the bottleneck rather than removing it. At Qwen3-32B the remaining calldata —
-the activation vector — projects to ~147M gas per token against ~31M for the arithmetic.
-Transport still dominates, by about 5x. Activations belong in state for the same reason
-weights did, which is what phase 2.5 does.
+That looked like it moved the bottleneck rather than removing it: the remaining calldata is
+the activation vector, which projected to ~147M gas per token at 32B against ~31M for the
+arithmetic. The projection was wrong. It priced inner-loop calls as transaction calldata,
+but a forward pass never re-enters the transaction between layers — the contract holds the
+residual stream in memory and passes it from there, where arguments cost memory instead.
+
+Measured by increment across repeated calls in one transaction: **217 gas of overhead per
+call, and flat.** At 32 columns it is 217; at 2048 columns, sixty-four times the activation
+width, it is still 217. So transport is about **0.3%** of a token at 32B, not 500%, and
+activations stay in memory.
 
 ## Layout
 
