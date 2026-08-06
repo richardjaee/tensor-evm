@@ -16,3 +16,6 @@
 .env.*
 !.env.example
 .DS_Store
+
+# solc artifacts
+/contracts/out/

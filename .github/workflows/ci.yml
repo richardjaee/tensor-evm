@@ -18,6 +18,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      # The Solidity tests compile the contracts and run them against the EVM that
+      # carries the precompile. Without solc they fail rather than skip, deliberately:
+      # a silently absent end-to-end test is how this project already lost a day to an
+      # inner loop that appeared free because none of its calls reached anything.
+      - name: install solc
+        uses: pontem-network/get-solc@master
+        with:
+          version: v0.8.30
+
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       # Determinism is the property the whole design rests on, so the tests that
