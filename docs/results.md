@@ -244,6 +244,42 @@ touches the same account hundreds of times per token, so all but the first were 
 `is_cold` flag the journal already returns, which took the per-call overhead from 2,716 to
 217.
 
+## Phase 3 — Solidity through the precompile
+
+**Verdict: the stack closes.** A contract compiled by `solc`, executing on the EVM that
+carries the precompile, gets bit-identical results to the reference kernel.
+
+`TensorMatmul` wraps the call; `ModelRegistry` holds models and sessions. Five tests cover
+registration, immutability, unregistered models, shapes the blob cannot satisfy, and the
+round trip itself.
+
+### Why the tests are in Rust
+
+`forge` cannot test this. Its EVM is stock revm with no matmul precompile, so a Solidity
+test would find an empty account at `0x101`, receive success with no data, and **pass while
+computing nothing**. That is not hypothetical — it is exactly the failure that made an inner
+loop appear free earlier in this project. The contracts are compiled with `solc` and run
+against the EVM that actually carries the precompile.
+
+The library defends against the same thing at runtime: it checks the returned length rather
+than the success flag, so a contract deployed to a chain without the precompile reverts
+instead of quietly producing a forward pass of zeros.
+
+### Two corrections to the companion project
+
+**One runtime, many models.** That project bakes a model's configuration into a constructor,
+so every model is a separate deployment carrying its own copy of the inference code. Adding
+a model is now a transaction rather than a deploy.
+
+**Sessions are keyed and owned.** That project holds generation state in globals — one
+generation chain-wide, and any address may call `start` and destroy another's work. Keying
+state by session gives concurrency and access control from the same change.
+
+**Registration is one-way and commits to `extcodehash` of the weight blob.** Both properties
+serve the same end. Re-executing a computation proves the arithmetic and says nothing about
+*which* parameters were used; a model whose weights could be repointed would make every hash
+previously published against it a claim about something that no longer exists.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

@@ -69,8 +69,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | 1 | Precompile, callable from contract bytecode | **done** |
 | 2 | Weights read from chain state, not calldata | **done** |
 | ~~2.5~~ | ~~Activations in state too~~ | dropped — measured unnecessary |
-| 3 | Model registry, session-keyed state, arch flags | next |
-| 4 | Scale run | |
+| 3 | Model registry, session-keyed state, arch flags | **done** |
+| 4 | Scale run | next |
 | 5 | Mixture-of-experts support | |
 
 ### Phase 0 headline
@@ -127,6 +127,7 @@ activations stay in memory.
 ```
 crates/tensor-kernel/       deterministic integer matmul, plus the bandwidth benchmark
 crates/tensor-precompile/   the EVM precompile, and its end-to-end tests
+contracts/src/              Solidity: the matmul library and the model registry
 docs/design.md              architecture, scaling analysis, non-goals, limitations
 docs/results.md             every measurement, with the command that produces it
 ```
