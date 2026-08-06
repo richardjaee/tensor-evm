@@ -30,11 +30,14 @@
 //! real and is charged.
 
 use revm::context::{Cfg, ContextTr};
+use revm::context_interface::JournalTr;
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInputs, Gas, InstructionResult, InterpreterResult};
-use revm::precompile::{u64_to_address, PrecompileSpecId, Precompiles};
+use revm::precompile::{
+    u64_to_address, Precompile, PrecompileId, PrecompileOutput, PrecompileResult, PrecompileSpecId,
+    Precompiles,
+};
 use revm::primitives::{Address, Bytes};
-use revm::context_interface::JournalTr;
 use tensor_kernel::matmul;
 
 use crate::{gas_cost, BASE_GAS, MAX_DIM};
@@ -45,9 +48,14 @@ use crate::{gas_cost, BASE_GAS, MAX_DIM};
 /// operands, and its cost is the measurement that justifies this one existing.
 pub const MATMUL_STATE_ADDRESS: Address = u64_to_address(0x101);
 
-/// Charged once for reading the weights account, mirroring the EVM's own cold account
-/// access cost. The bytes themselves are paid for through the matmul price.
+/// First touch of the weights account, mirroring the EVM's own cold access cost. The bytes
+/// themselves are paid for through the matmul price.
 pub const COLD_ACCOUNT_GAS: u64 = 2600;
+
+/// Every touch after the first. A forward pass reads the same weights account on every
+/// call of every layer, so this is the price that governs — charging the cold figure
+/// throughout would overcharge by 26x on all but one call.
+pub const WARM_ACCOUNT_GAS: u64 = 100;
 
 /// ```text
 /// [0..4)     rows      u32
@@ -92,7 +100,7 @@ impl TensorPrecompiles {
     pub fn new(spec: revm::primitives::hardfork::SpecId) -> Self {
         Self {
             inner: EthPrecompiles {
-                precompiles: eth_plus_calldata_matmul(spec),
+                precompiles: eth_plus_matmuls(spec),
                 spec,
             },
         }
@@ -105,11 +113,23 @@ impl Default for TensorPrecompiles {
     }
 }
 
-/// Ethereum's precompiles plus the calldata matmul, for one spec.
+/// Placeholder occupying [`MATMUL_STATE_ADDRESS`] in the precompile set.
+///
+/// It is never executed — [`TensorPrecompiles::run`] intercepts the address first — but it
+/// has to be registered, because membership in the set is what makes the interpreter treat
+/// the address as a precompile at all. Without it a `STATICCALL` from a contract finds an
+/// ordinary account with no code and returns success having done nothing, silently, which
+/// is exactly the failure this replaced: an inner loop that appeared free because none of
+/// its calls were reaching anything.
+fn unreachable_stub(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+    Ok(PrecompileOutput::revert(BASE_GAS, Bytes::new(), reservoir))
+}
+
+/// Ethereum's precompiles, plus both matmul forms, for one spec.
 ///
 /// Leaked into a `'static` deliberately: a chain's precompile set is fixed for the life of
 /// the process, so one initialisation per spec is its natural lifetime.
-fn eth_plus_calldata_matmul(spec: revm::primitives::hardfork::SpecId) -> &'static Precompiles {
+fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precompiles {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static SETS: OnceLock<Mutex<HashMap<u8, &'static Precompiles>>> = OnceLock::new();
@@ -117,7 +137,14 @@ fn eth_plus_calldata_matmul(spec: revm::primitives::hardfork::SpecId) -> &'stati
     let mut map = map.lock().expect("precompile set registry poisoned");
     map.entry(spec as u8).or_insert_with(|| {
         let mut p = Precompiles::new(PrecompileSpecId::from_spec_id(spec)).clone();
-        p.extend([crate::precompile()]);
+        p.extend([
+            crate::precompile(),
+            Precompile::new(
+                PrecompileId::Custom("tensor-matmul-state".into()),
+                MATMUL_STATE_ADDRESS,
+                unreachable_stub,
+            ),
+        ]);
         Box::leak(Box::new(p))
     })
 }
@@ -131,7 +158,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             return false;
         }
         self.inner = EthPrecompiles {
-            precompiles: eth_plus_calldata_matmul(spec),
+            precompiles: eth_plus_matmuls(spec),
             spec,
         };
         true
@@ -165,10 +192,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         let Some(compute) = gas_cost(rows, cols) else {
             return Ok(Some(revert(gas_limit)));
         };
-        let Some(total) = compute.checked_add(COLD_ACCOUNT_GAS) else {
+        // Priced against the cheaper of the two access costs. The real figure depends on
+        // whether the weights account is already warm, which is not known until it is
+        // loaded; this is only the affordability precheck, so it must not reject a caller
+        // who can in fact pay.
+        let Some(floor) = compute.checked_add(WARM_ACCOUNT_GAS) else {
             return Ok(Some(revert(gas_limit)));
         };
-        if total > gas_limit {
+        if floor > gas_limit {
             return Ok(Some(oog(gas_limit)));
         }
 
@@ -187,13 +218,27 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Charged before the read, so a caller cannot probe accounts for free by passing
-        // a shape it cannot afford.
-        let code = context
+        // Warmth is what the access actually costs, and it is only knowable from the load
+        // itself. A forward pass hits the same weights account on every call of every
+        // layer, so charging the cold price unconditionally would overcharge by 26x on all
+        // but the first — around a million gas per token at 32B, for nothing.
+        let loaded = context
             .journal_mut()
             .code(weights_at)
-            .map_err(|_| "failed to load weights account".to_string())?
-            .data;
+            .map_err(|_| "failed to load weights account".to_string())?;
+        let access = if loaded.is_cold {
+            COLD_ACCOUNT_GAS
+        } else {
+            WARM_ACCOUNT_GAS
+        };
+        let code = loaded.data;
+
+        let Some(total) = compute.checked_add(access) else {
+            return Ok(Some(revert(gas_limit)));
+        };
+        if total > gas_limit {
+            return Ok(Some(oog(gas_limit)));
+        }
 
         let Some(weights_len) = rows_u.checked_mul(cols_u).and_then(|n| n.checked_mul(2)) else {
             return Ok(Some(revert(gas_limit)));
@@ -252,7 +297,13 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
 }
 
 /// Encodes a call to the state-reading form.
-pub fn encode_state(rows: usize, cols: usize, weights_at: Address, offset: u32, acts: &[i32]) -> Vec<u8> {
+pub fn encode_state(
+    rows: usize,
+    cols: usize,
+    weights_at: Address,
+    offset: u32,
+    acts: &[i32],
+) -> Vec<u8> {
     assert_eq!(acts.len(), cols, "activations must be cols");
     let mut v = Vec::with_capacity(HEADER + cols * 4);
     v.extend_from_slice(&(rows as u32).to_be_bytes());

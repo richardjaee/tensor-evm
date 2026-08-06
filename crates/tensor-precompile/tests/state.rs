@@ -97,7 +97,10 @@ fn reads_weights_from_state() {
     let result = run(db, MATMUL_STATE_ADDRESS, input, 10_000_000);
     let got = decode(output(&result)).expect("output must decode");
 
-    assert_eq!(got, expected, "state-resident weights gave a different answer");
+    assert_eq!(
+        got, expected,
+        "state-resident weights gave a different answer"
+    );
 }
 
 /// The measurement this phase exists to produce: what moving weights off the wire saves.
@@ -160,9 +163,20 @@ fn price_is_independent_of_blob_size() {
     large.extend(std::iter::repeat_n(0u8, 200_000)); // same matmul, far more code
 
     let input = encode_state(rows, cols, WEIGHTS, 0, &acts);
-    let a = run(db_with_weights(small), MATMUL_STATE_ADDRESS, input.clone(), 10_000_000)
-        .tx_gas_used();
-    let b = run(db_with_weights(large), MATMUL_STATE_ADDRESS, input, 10_000_000).tx_gas_used();
+    let a = run(
+        db_with_weights(small),
+        MATMUL_STATE_ADDRESS,
+        input.clone(),
+        10_000_000,
+    )
+    .tx_gas_used();
+    let b = run(
+        db_with_weights(large),
+        MATMUL_STATE_ADDRESS,
+        input,
+        10_000_000,
+    )
+    .tx_gas_used();
 
     assert_eq!(a, b, "price varied with blob size");
 }
@@ -176,7 +190,12 @@ fn refuses_a_shape_the_blob_cannot_satisfy() {
 
     // Same blob, but ask for twice the rows.
     let input = encode_state(rows * 2, cols, WEIGHTS, 0, &acts);
-    let result = run(db_with_weights(blob), MATMUL_STATE_ADDRESS, input, 10_000_000);
+    let result = run(
+        db_with_weights(blob),
+        MATMUL_STATE_ADDRESS,
+        input,
+        10_000_000,
+    );
 
     assert!(
         matches!(result, ExecutionResult::Revert { .. }),
@@ -199,7 +218,12 @@ fn honours_an_offset_into_the_blob() {
     blob.extend(weight_blob(rows, cols, &scales, &weights));
 
     let input = encode_state(rows, cols, WEIGHTS, pad as u32, &acts);
-    let result = run(db_with_weights(blob), MATMUL_STATE_ADDRESS, input, 10_000_000);
+    let result = run(
+        db_with_weights(blob),
+        MATMUL_STATE_ADDRESS,
+        input,
+        10_000_000,
+    );
     let got = decode(output(&result)).expect("output must decode");
 
     assert_eq!(got, expected, "offset was not applied correctly");
@@ -229,7 +253,11 @@ fn ethereum_precompiles_still_reachable() {
     let data = b"round trip".to_vec();
     let db = db_with_weights(vec![]);
     let result = run(db, Address::with_last_byte(4), data.clone(), 1_000_000);
-    assert_eq!(output(&result), &data[..], "identity precompile was shadowed");
+    assert_eq!(
+        output(&result),
+        &data[..],
+        "identity precompile was shadowed"
+    );
 }
 
 /// The calldata form must remain reachable alongside the state form.

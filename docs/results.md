@@ -185,23 +185,64 @@ Price is independent of blob size — a call touching a small tensor inside a 64
 costs the same as one against a 64 KB model. Without that, large models would be unusable
 regardless of how little of them any single call reads.
 
-### The next bottleneck is activations
+### What the remaining 55,200 gas is — and why it does not matter
 
-The remaining 55,200 gas is almost entirely the activation vector arriving as calldata.
-Projecting to Qwen3-32B (dim 5120, 64 layers, seven matmuls per layer):
+Almost all of it is the activation vector arriving as *transaction* calldata at 16 gas per
+byte. That is the correct price for a transaction sent straight to the precompile, and the
+wrong price for a forward pass, which does not re-enter the transaction between layers: the
+contract holds the residual stream in memory and hands it over from there, where arguments
+are priced as memory rather than calldata.
+
+Measured directly, by running the same call a varying number of times in one transaction
+and taking the increment:
+
+| | gas |
+|---|---|
+| marginal cost of a call | 2,365 |
+| of which matmul | 2,148 |
+| of which everything else | **217** |
+
+And that 217 is flat. At 32 columns it is 217; at 2048 columns — sixty-four times the
+activation width — it is still 217, byte for byte:
+
+| activation width | matmul | overhead |
+|---|---|---|
+| 32 columns | 228 | 217 |
+| 2048 columns | 228 | 217 |
+
+**So activations do not need to follow the weights into state.** Corrected projection for
+Qwen3-32B, ~450 matmuls per token:
 
 | per token | gas |
 |---|---|
-| matmul (all layers) | ~31M |
-| activations as calldata | ~147M |
+| matmul, all layers | ~31.3M |
+| per-call overhead | ~0.1M |
 
-**Transport still dominates, now by about 5×.** The fix is the same one that worked here:
-activations belong in state too. The companion project already keeps the residual stream in
-storage between phases, so the contract has them there already — passing a reference rather
-than the bytes is a smaller change than it sounds, and it removes calldata from the inner
-loop entirely.
+Transport is about 0.3% of the cost, not 500%. Phase 2.5 is unnecessary and has been
+dropped; the next step is the model registry.
 
-That is the immediate next step, ahead of the model registry.
+### Two measurement traps worth recording
+
+**EIP-7623's floor silently swallowed the first attempt.** A transaction pays the greater of
+what it executed and a floor derived from its input. With a wide activation vector the floor
+exceeded execution entirely, so one call and five calls reported *identical* gas — which
+reads as "calls are free" when it means "nothing was measured". Carrying the arguments in
+the calling contract's own code leaves the transaction empty and makes the increment real.
+
+**A precompile absent from the set fails silently.** Before the state matmul was registered
+as a member of `Precompiles`, a `STATICCALL` to `0x101` from contract bytecode found an
+ordinary account with no code, returned success, and did nothing. Overriding `contains` was
+not enough — membership in the set is what makes the interpreter treat the address as a
+precompile at all. The symptom was the same as the floor's: an inner loop that appeared to
+cost zero.
+
+### A pricing bug the measurement caught
+
+The weights account was being charged the cold access price on *every* call. A forward pass
+touches the same account hundreds of times per token, so all but the first were overcharged
+26x — roughly a million gas per token at 32B, for nothing. Access is now priced from the
+`is_cold` flag the journal already returns, which took the per-call overhead from 2,716 to
+217.
 
 ## Caveats
 
