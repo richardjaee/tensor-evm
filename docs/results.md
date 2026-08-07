@@ -280,6 +280,63 @@ serve the same end. Re-executing a computation proves the arithmetic and says no
 *which* parameters were used; a model whose weights could be repointed would make every hash
 previously published against it a claim about something that no longer exists.
 
+## Phase 4 — real weights
+
+**Verdict: correct against the model, and it caught a bug every prior test had missed.**
+
+Slices of the published Qwen3-0.6B checkpoint, quantised to `int16` with per-row
+power-of-two scales, registered as a model, and projected through Solidity → precompile →
+kernel. Compared two ways: bit-exactly against an independently derived integer answer, and
+numerically against float64 from the original bf16 weights.
+
+| fixture | shape | vs float64 |
+|---|---|---|
+| `self_attn.q_proj` | 48 × 1024 | 5.16e-06 |
+| `self_attn.k_proj` | 32 × 1024 | 4.87e-06 |
+| `mlp.gate_proj` | 64 × 1024 | 1.06e-05 |
+
+### The bug float64 found and integers could not
+
+The kernel requantised by `32 - shift` rather than `shift`.
+
+A weight is stored as `w * 2^s` and an activation as `v * 2^32`, so their product carries
+`s + 32` fractional bits. Returning to Q32 sheds exactly `s` — the activation's own 32 are
+the ones being kept. The two expressions agree at `s = 32` and nowhere else.
+
+Every integer test passed, because the reference vector generator implemented the same
+mistake. The two agreed with each other and disagreed with the model by **1137%**. After the
+fix, 7e-06.
+
+The lesson is about test design rather than fixed point: two implementations sharing a
+specification cannot validate that specification, however carefully each is written. Only an
+external reference can.
+
+### int16 encodes bf16 essentially losslessly
+
+| | mean relative error |
+|---|---|
+| int16 weights vs bf16 weights | ~1e-06 |
+| full integer path vs float64 | ~7e-06 |
+
+bf16 carries eight mantissa bits; int16 with a per-row scale gives fifteen of magnitude. The
+quantisation is not discarding anything the checkpoint had — the residual error is Q32
+rounding of the accumulator, not the weights. This matters for the wider argument: the
+`int16` representation is not a compromise made to fit on chain, it is a faithful encoding
+of what these models already are.
+
+### Qwen3 is not Llama
+
+The companion project's exporter targets Llama and would have produced fluent nonsense here:
+
+- `head_dim` is 128 while `hidden_size / num_attention_heads` is 64, so `q_proj` is
+  2048 × 1024 and `o_proj` is 1024 × 2048 — **neither is square**, which that exporter
+  assumes throughout.
+- `q_norm` and `k_norm` are present at `head_dim`, applied per head before rotary.
+- `rope_theta` is 1e6 rather than 1e4.
+
+Each is silent when unhandled, so `tools/quantize.py` reports them rather than proceeding
+quietly.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

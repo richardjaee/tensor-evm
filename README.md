@@ -70,7 +70,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | 2 | Weights read from chain state, not calldata | **done** |
 | ~~2.5~~ | ~~Activations in state too~~ | dropped — measured unnecessary |
 | 3 | Model registry, session-keyed state, arch flags | **done** |
-| 4 | Scale run | next |
+| 4 | Real weights, verified against float64 | **done** |
+| 5 | Full forward pass — attention, RoPE, QK-norm | next |
 | 5 | Mixture-of-experts support | |
 
 ### Phase 0 headline
@@ -128,6 +129,8 @@ activations stay in memory.
 crates/tensor-kernel/       deterministic integer matmul, plus the bandwidth benchmark
 crates/tensor-precompile/   the EVM precompile, and its end-to-end tests
 contracts/src/              Solidity: the matmul library and the model registry
+tools/                      safetensors -> int16 conversion, and reference vectors
+testdata/                   real Qwen3-0.6B slices the end-to-end tests run against
 docs/design.md              architecture, scaling analysis, non-goals, limitations
 docs/results.md             every measurement, with the command that produces it
 ```
