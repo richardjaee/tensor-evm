@@ -9,3 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 tensor-kernel = { path = "../tensor-kernel" }
+
+[dev-dependencies]
+tensor-kernel = { path = "../tensor-kernel" }

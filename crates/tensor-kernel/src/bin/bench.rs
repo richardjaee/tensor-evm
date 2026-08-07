@@ -55,6 +55,13 @@ fn main() {
         ("Qwen3-4B      dim 2560", 2560, 2560),
         ("Qwen3-32B     dim 5120", 5120, 5120),
         ("Qwen3-32B     ffn", 25600, 5120),
+        // The shapes a real Qwen3-0.6B layer actually issues. Peak throughput is measured
+        // on slabs far larger than these, and the gap between the two is the difference
+        // between a projection and a measurement.
+        ("Qwen3-0.6B    q_proj", 2048, 1024),
+        ("Qwen3-0.6B    k_proj", 1024, 1024),
+        ("Qwen3-0.6B    gate", 3072, 1024),
+        ("Qwen3-0.6B    down", 1024, 3072),
     ];
 
     println!(

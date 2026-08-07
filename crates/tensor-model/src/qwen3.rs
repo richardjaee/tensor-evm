@@ -139,6 +139,9 @@ pub struct Scratch {
     up: Vec<i64>,
     ffn: Vec<i64>,
     scores: Vec<i64>,
+    /// One head's worth of workspace for QK-norm, which cannot normalise in place.
+    /// Allocating this per head per position cost more than the matmuls it sits between.
+    head: Vec<i64>,
 }
 
 impl Scratch {
@@ -154,6 +157,7 @@ impl Scratch {
             up: vec![0; cfg.hidden],
             ffn: vec![0; cfg.hidden],
             scores: vec![0; cfg.seq_len],
+            head: vec![0; cfg.head_dim],
         }
     }
 }
@@ -190,16 +194,14 @@ pub fn forward_layer(
     let (cos, sin) = rope_tab.at(pos);
     for h in 0..cfg.n_heads {
         let seg = &mut s.q[h * hs..(h + 1) * hs];
-        let mut tmp = vec![0i64; hs];
-        rmsnorm(seg, w.q_norm, &mut tmp);
-        seg.copy_from_slice(&tmp);
+        rmsnorm(seg, w.q_norm, &mut s.head);
+        seg.copy_from_slice(&s.head);
         rope(seg, cos, sin);
     }
     for h in 0..cfg.n_kv {
         let seg = &mut s.k[h * hs..(h + 1) * hs];
-        let mut tmp = vec![0i64; hs];
-        rmsnorm(seg, w.k_norm, &mut tmp);
-        seg.copy_from_slice(&tmp);
+        rmsnorm(seg, w.k_norm, &mut s.head);
+        seg.copy_from_slice(&s.head);
         rope(seg, cos, sin);
     }
 

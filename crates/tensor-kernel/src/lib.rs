@@ -143,12 +143,15 @@ pub fn matmul_scalar(
 
 /// Below this many weights, dispatching to a thread pool costs more than the work saved.
 ///
-/// Measured, not guessed: at 0.6 MiB the parallel path ran at a fifth of scalar speed and
-/// at 12.5 MiB it ran at nearly twice, so the crossover sits between. The overhead is a
-/// fixed per-call cost, so the threshold is expressed in absolute work rather than as a
-/// ratio. Attention projections in small models land below it, which is exactly the case
-/// that regressed before this existed.
-pub const PARALLEL_THRESHOLD: usize = 2 << 20;
+/// Measured by sweep, and re-measured after activations widened to `i64` — which moved the
+/// crossover, because the kernel itself got slower and the dispatch cost did not. At 2^18 a
+/// 576-wide projection regresses to 0.7x scalar; at 2^21 a 1024x1024 projection is denied
+/// parallelism it would gain 1.8x from. 2^19 is the first value that costs nothing on the
+/// small shape and recovers the larger one.
+///
+/// This mattered more than it looks. Qwen3-0.6B's `k_proj` is exactly 1024x1024, and under
+/// the old threshold every key projection of every layer ran single-threaded.
+pub const PARALLEL_THRESHOLD: usize = 1 << 19;
 
 /// Multi-threaded above [`PARALLEL_THRESHOLD`], scalar below. Bit-identical to
 /// [`matmul_scalar`] either way, regardless of thread count.
