@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
-import {TensorMatmul} from "./TensorMatmul.sol";
+import {Tensor} from "./Tensor.sol";
 
 /// @notice Models available on this chain, and the generations running against them.
 ///
@@ -159,7 +159,9 @@ contract ModelRegistry {
         if (s.owner != msg.sender) revert NotSessionOwner();
         if (!s.active) revert SessionInactive();
 
-        return _narrow(TensorMatmul.matmul(rows, cols, _models[s.modelId].weights, offset, _widen(x)));
+        return _narrow(Tensor.unpack(
+            Tensor.matmul(rows, cols, _models[s.modelId].weights, offset, Tensor.pack(_widen(x)))
+        ));
     }
 
     /// @notice Matmul against a registered model without a session, for reads and probing.
@@ -169,7 +171,9 @@ contract ModelRegistry {
         returns (int64[] memory)
     {
         if (!_models[modelId].exists) revert NoSuchModel();
-        return _narrow(TensorMatmul.matmul(rows, cols, _models[modelId].weights, offset, _widen(x)));
+        return _narrow(Tensor.unpack(
+            Tensor.matmul(rows, cols, _models[modelId].weights, offset, Tensor.pack(_widen(x)))
+        ));
     }
 
     /// @dev The ABI speaks int64 because that is the value's actual width; Solidity memory

@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
-import {FixedPoint} from "./FixedPoint.sol";
-import {Ops} from "./Ops.sol";
-import {TensorMatmul} from "./TensorMatmul.sol";
+import {Tensor} from "./Tensor.sol";
 
 /// @notice A Qwen3 transformer block, executed on chain.
 ///
-/// @dev This is the piece that makes the claim true. Everything before it demonstrated
-///      that *a matmul* runs on chain; the forward pass itself lived in Rust, beside the
-///      chain rather than on it. Here the orchestration is contract code: the layer decides
-///      what to multiply, in what order, against weights held in chain state, and calls out
-///      only for the arithmetic a precompile accelerates.
+/// @dev The orchestration is contract code: this decides what to multiply and in what
+///      order, reads weights from another contract's code, and calls out for the
+///      arithmetic. What it never does is reshape data. Activations stay in the
+///      precompiles' own packed form from the residual stream in to the residual stream
+///      out, so one operation's result is already the next one's argument.
 ///
-///      Weights never travel. They live in the code of a contract already deployed, and
-///      what crosses the call boundary is an address and an offset — passing them as
-///      arguments costs about 31,500 times more than multiplying by them.
+///      That is not a micro-optimisation. With the arithmetic already native, a block spent
+///      99.8% of its gas converting between a Solidity array's 32-byte elements and the
+///      wire format's 8 — nine million gas of marshalling around eighteen thousand of
+///      computation.
 ///
-///      Activations do travel, and that is fine. Arguments to a call within a transaction
-///      come from memory, not transaction calldata, so the overhead is a flat 217 gas
-///      regardless of width.
+///      Weights never travel at all. They live in the code of a deployed contract and what
+///      crosses the call boundary is an address and an offset; passing them as arguments
+///      costs about 31,500 times more than multiplying by them.
 library Transformer {
-    /// @notice Geometry. `headDim` is deliberately independent of `dim / nHeads` — in
-    ///         Qwen3-0.6B it is 128 against 64, so the query and output projections are not
-    ///         square, and code assuming otherwise produces fluent nonsense.
+    /// @notice Geometry. `headDim` is independent of `dim / nHeads` — in Qwen3-0.6B it is
+    ///         128 against 64, so the query and output projections are not square, and code
+    ///         assuming otherwise produces fluent nonsense.
     struct Config {
         uint32 dim;
         uint32 hidden;
@@ -36,8 +35,6 @@ library Transformer {
     }
 
     /// @notice Byte offsets of one layer's tensors within the weight contract's code.
-    /// @dev Offsets rather than a derived layout, so a model whose tensors are laid out
-    ///      differently needs no new code — only a different set of numbers.
     struct Layer {
         uint32 q;
         uint32 k;
@@ -48,54 +45,45 @@ library Transformer {
         uint32 down;
     }
 
-    /// @notice Norm weights and rotary tables, which are Q32 vectors rather than quantised
-    ///         matrices and so are passed directly rather than read from a blob.
+    /// @notice Norm weights, packed once by the caller rather than per layer.
     struct Norms {
-        int256[] input;
-        int256[] qNorm;
-        int256[] kNorm;
-        int256[] post;
+        bytes input;
+        bytes qNorm;
+        bytes kNorm;
+        bytes post;
     }
 
-    /// @notice Optional gas attribution, recorded in place as a block runs.
-    /// @dev A profile with a zero-length array costs one comparison per section and is
-    ///      what a real caller passes. Measuring from outside instead would fold the
-    ///      transaction's own calldata into every figure — a 1024-wide activation vector
-    ///      ABI-encodes to 32KB, which is around 500k gas of transport attributed to
-    ///      whichever operation happened to be under test.
-    struct Profile {
-        uint256[] gas;
-        uint256 at;
+    /// @notice Rotary tables for this position only, sliced by the caller so that nothing
+    ///         downstream needs a notion of position.
+    struct RopeTable {
+        bytes cos;
+        bytes sin;
     }
 
-    /// @notice Everything identifying one layer: its geometry, where its tensors live, and
-    ///         the norm weights that are vectors rather than matrices.
-    /// @dev Bundled because the EVM's stack, not gas, is what limits how a transformer
-    ///      block can be written. Passing these separately leaves `_attention` with eight
-    ///      parameters and no room for the values it computes, and `--via-ir` would compile
-    ///      it at a measured 2.2x the gas.
+    /// @notice Keys and values for every position so far, packed.
+    /// @dev The state that grows with generation, and what will dominate at long context.
+    struct Kv {
+        bytes k;
+        bytes v;
+    }
+
+    /// @notice Everything identifying one layer, bundled because the EVM's stack — not gas
+    ///         — is what limits how a block can be written.
     struct Block {
         Config c;
         Layer l;
         Norms n;
         address weights;
+        /// @dev Carried here rather than passed alongside, because a memory struct is a
+        ///      reference and a separate parameter is a stack slot the caller does not
+        ///      have. The stack, not gas, is what limits how a block can be written.
+        Profile p;
     }
 
-    /// @notice Precomputed rotary tables, `seqLen * headDim/2` entries each.
-    /// @dev Bundled because the EVM's stack is the binding constraint on how a transformer
-    ///      block can be written: passing `cos` and `sin` separately costs two slots that
-    ///      `_attention` does not have.
-    struct RopeTable {
-        int256[] cos;
-        int256[] sin;
-    }
-
-    /// @notice Keys and values for every position seen so far, for one layer.
-    /// @dev Flat, indexed `[pos][kvWidth]`. This is the state that grows with generation
-    ///      and dominates everything else at long context.
-    struct Kv {
-        int256[] k;
-        int256[] v;
+    /// @notice Optional gas attribution, recorded as a block runs.
+    struct Profile {
+        uint256[] gas;
+        uint256 at;
     }
 
     function qWidth(Config memory c) internal pure returns (uint256) {
@@ -106,179 +94,124 @@ library Transformer {
         return uint256(c.nKv) * c.headDim;
     }
 
-    /// @notice One transformer block, applied to the residual stream
-    /// @param b   Geometry, tensor offsets, norm weights, and the weight contract
+    function _mark(Block memory b, uint256 before) private view {
+        if (b.p.gas.length == 0) return;
+        b.p.gas[b.p.at] = before - gasleft();
+        b.p.at += 1;
+    }
+
+    /// @notice One transformer block, applied to the packed residual stream
     /// @param pos Position in the sequence; the causal mask and the cache follow from it
-    /// @param x   Residual stream in, Q32
-    /// @return    The residual stream after the block
-    ///
-    /// @dev Split into two halves not for tidiness but because the EVM's stack cannot hold
-    ///      a whole block at once. Nine parameters and a dozen live values exhaust it, and
-    ///      `--via-ir` would compile it at a measured 2.2x the gas.
     function forwardLayer(
         Block memory b,
         Kv memory kv,
         RopeTable memory rope,
         uint256 pos,
-        int256[] memory x,
-        Profile memory p
-    ) internal view returns (int256[] memory) {
-        _attention(b, kv, rope, pos, x, p);
-        _feedForward(b, x, p);
+        bytes memory x
+    ) internal view returns (bytes memory) {
+        _attention(b, kv, rope, pos, x);
+        _feedForward(b, x);
         return x;
     }
 
-    /// @dev Records what has been spent since the last mark. `gasleft()` is itself two gas,
-    ///      which is below the resolution of anything being measured here.
-    function _mark(Profile memory p, uint256 before) private view {
-        if (p.gas.length == 0) return;
-        p.gas[p.at] = before - gasleft();
-        p.at += 1;
-    }
-
-    /// @dev Writes its projection back into `x`, so the residual add happens here rather
-    ///      than returning a vector the caller has to fold in.
     function _attention(
         Block memory b,
         Kv memory kv,
         RopeTable memory rope,
         uint256 pos,
-        int256[] memory x,
-        Profile memory p
+        bytes memory x
     ) private view {
         Config memory c = b.c;
+
         uint256 g = gasleft();
-        int256[] memory normed = TensorMatmul.rmsnorm(c.rmsEps, b.n.input, x);
-        _mark(p, g);
+        bytes memory normed = Tensor.rmsnorm(c.rmsEps, b.n.input, x);
+        _mark(b, g);
 
         g = gasleft();
         _extendCache(b, kv, rope, pos, normed);
-        _mark(p, g);
+        _mark(b, g);
 
         g = gasleft();
-        int256[] memory q =
-            TensorMatmul.matmul(uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
-        _mark(p, g);
+        bytes memory q = Tensor.matmul(uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
+        _mark(b, g);
 
         // QK-norm before rotary, not after. Normalising a rotated vector rescales its
         // components unequally and destroys the angle the embedding encodes.
         g = gasleft();
-        q = _normAndRotate(q, c.nHeads, c.headDim, b.n.qNorm, rope, pos, c.rmsEps);
-        _mark(p, g);
+        q = Tensor.normRope(
+            c.nHeads,
+            c.headDim,
+            c.rmsEps,
+            Tensor.NormRopeArgs({weight: b.n.qNorm, cos: rope.cos, sin: rope.sin, vec: q})
+        );
+        _mark(b, g);
 
         g = gasleft();
-        int256[] memory attn = _attend(c, kv, q, pos);
-        _mark(p, g);
+        bytes memory attn = Tensor.attention(
+            c.nHeads,
+            c.nKv,
+            c.headDim,
+            uint32(pos + 1),
+            Tensor.AttnArgs({q: q, k: kv.k, v: kv.v})
+        );
+        _mark(b, g);
 
         g = gasleft();
-        int256[] memory proj =
-            TensorMatmul.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, attn);
-        _mark(p, g);
-
-        for (uint256 i = 0; i < c.dim; ++i) {
-            x[i] += proj[i];
-        }
+        Tensor.addInto(x, Tensor.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, attn));
+        _mark(b, g);
     }
 
-    /// @dev Keys and values, normalised, rotated, and appended to the cache. Its own
-    ///      function because holding `k` and `v` alive alongside the rest of a block
-    ///      exhausts the EVM's stack.
+    /// @dev Keys and values, normalised, rotated, and appended to the cache.
+    ///
+    ///      The cache is exactly `pos + 1` positions deep when attention reads it, which is
+    ///      what makes the mask causal: the precompile has no notion of position and
+    ///      attends to everything it is given.
     function _extendCache(
         Block memory b,
         Kv memory kv,
         RopeTable memory rope,
         uint256 pos,
-        int256[] memory normed
+        bytes memory normed
     ) private view {
-        uint32 kvw = uint32(kvWidth(b.c));
-        int256[] memory k = TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.k, normed);
-        k = _normAndRotate(k, b.c.nKv, b.c.headDim, b.n.kNorm, rope, pos, b.c.rmsEps);
-        _store(kv, kvw, pos, k, TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.v, normed));
-    }
+        Config memory c = b.c;
+        uint32 kvw = uint32(kvWidth(c));
 
-    function _feedForward(Block memory b, int256[] memory x, Profile memory p) private view {
-        uint256 g = gasleft();
-        int256[] memory normed = TensorMatmul.rmsnorm(b.c.rmsEps, b.n.post, x);
-        _mark(p, g);
-
-        g = gasleft();
-        int256[] memory gate = TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.gate, normed);
-        int256[] memory up = TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.up, normed);
-        _mark(p, g);
-
-        g = gasleft();
-        int256[] memory gated = TensorMatmul.swiglu(gate, up);
-        _mark(p, g);
-
-        g = gasleft();
-        int256[] memory proj =
-            TensorMatmul.matmul(b.c.dim, b.c.hidden, b.weights, b.l.down, gated);
-        _mark(p, g);
-
-        for (uint256 i = 0; i < b.c.dim; ++i) {
-            x[i] += proj[i];
-        }
-    }
-
-    /// @dev One precompile call for every head at once. Written as a Solidity loop this
-    ///      was 43% of a layer's gas — trivial arithmetic on 128 values, made expensive by
-    ///      being performed sixteen times with an allocation apiece.
-    ///
-    ///      The rotary table is sliced to this position before the call rather than passing
-    ///      the whole table and an index, so the precompile needs no notion of position.
-    function _normAndRotate(
-        int256[] memory vec,
-        uint256 heads,
-        uint256 hs,
-        int256[] memory weight,
-        RopeTable memory rope,
-        uint256 pos,
-        int256 eps
-    ) private view returns (int256[] memory) {
-        uint256 half = hs / 2;
-        TensorMatmul.NormRope memory a = TensorMatmul.NormRope({
-            weight: weight,
-            cos: new int256[](half),
-            sin: new int256[](half),
-            vec: vec
-        });
-        for (uint256 j = 0; j < half; ++j) {
-            a.cos[j] = rope.cos[pos * half + j];
-            a.sin[j] = rope.sin[pos * half + j];
-        }
-        return TensorMatmul.normRope(uint32(heads), uint32(hs), eps, a);
-    }
-
-    function _store(Kv memory kv, uint256 kvw, uint256 pos, int256[] memory k, int256[] memory v)
-        private
-        pure
-    {
-        uint256 at = pos * kvw;
-        for (uint256 i = 0; i < kvw; ++i) {
-            kv.k[at + i] = k[i];
-            kv.v[at + i] = v[i];
-        }
-    }
-
-    /// @dev Grouped-query attention over every position up to and including `pos`.
-    ///
-    ///      The cache slices passed here are exactly `pos + 1` positions deep, which is
-    ///      what makes the mask causal: the precompile has no notion of position and
-    ///      attends to everything it is given.
-    function _attend(Config memory c, Kv memory kv, int256[] memory q, uint256 pos)
-        private
-        view
-        returns (int256[] memory)
-    {
-        uint256 depth = (pos + 1) * kvWidth(c);
-        int256[] memory k = new int256[](depth);
-        int256[] memory v = new int256[](depth);
-        for (uint256 i = 0; i < depth; ++i) {
-            k[i] = kv.k[i];
-            v[i] = kv.v[i];
-        }
-        return TensorMatmul.attention(
-            uint32(c.nHeads), uint32(c.nKv), uint32(c.headDim), uint32(pos + 1), q, k, v
+        bytes memory k = Tensor.matmul(kvw, c.dim, b.weights, b.l.k, normed);
+        k = Tensor.normRope(
+            c.nKv,
+            c.headDim,
+            c.rmsEps,
+            Tensor.NormRopeArgs({weight: b.n.kNorm, cos: rope.cos, sin: rope.sin, vec: k})
         );
+        bytes memory v = Tensor.matmul(kvw, c.dim, b.weights, b.l.v, normed);
+
+        uint256 at = pos * uint256(kvw) * 8;
+        bytes memory kc = kv.k;
+        bytes memory vc = kv.v;
+        assembly ("memory-safe") {
+            mcopy(add(add(kc, 0x20), at), add(k, 0x20), mload(k))
+            mcopy(add(add(vc, 0x20), at), add(v, 0x20), mload(v))
+        }
+    }
+
+    function _feedForward(Block memory b, bytes memory x) private view {
+        Config memory c = b.c;
+
+        uint256 g = gasleft();
+        bytes memory normed = Tensor.rmsnorm(c.rmsEps, b.n.post, x);
+        _mark(b, g);
+
+        g = gasleft();
+        bytes memory gate = Tensor.matmul(c.hidden, c.dim, b.weights, b.l.gate, normed);
+        bytes memory up = Tensor.matmul(c.hidden, c.dim, b.weights, b.l.up, normed);
+        _mark(b, g);
+
+        g = gasleft();
+        bytes memory gated = Tensor.swiglu(gate, up);
+        _mark(b, g);
+
+        g = gasleft();
+        Tensor.addInto(x, Tensor.matmul(c.dim, c.hidden, b.weights, b.l.down, gated));
+        _mark(b, g);
     }
 }
