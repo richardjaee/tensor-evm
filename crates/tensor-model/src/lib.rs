@@ -12,3 +12,4 @@
 
 pub mod fixed;
 pub mod ops;
+pub mod qwen3;
