@@ -68,7 +68,7 @@ fn meta(dir: &Path, key: &str) -> usize {
         .find(&format!("\"{key}\":"))
         .unwrap_or_else(|| panic!("meta.json has no {key}"));
     s[at + key.len() + 3..]
-        .split(|c: char| c == ',' || c == '\n' || c == '}')
+        .split([',', '\n', '}'])
         .next()
         .expect("value")
         .trim()
