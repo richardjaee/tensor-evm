@@ -46,8 +46,8 @@ struct Fixture {
     rows: u32,
     cols: u32,
     blob: Vec<u8>,
-    activations: Vec<i32>,
-    expected: Vec<i32>,
+    activations: Vec<i64>,
+    expected: Vec<i64>,
     float_reference: Vec<f64>,
 }
 
@@ -95,8 +95,8 @@ fn load(name: &str) -> Fixture {
 
     let rows = number(&json, "rows") as u32;
     let cols = number(&json, "cols") as u32;
-    let activations: Vec<i32> = array(&json, "activations");
-    let expected: Vec<i32> = array(&json, "expected");
+    let activations: Vec<i64> = array(&json, "activations");
+    let expected: Vec<i64> = array(&json, "expected");
     let float_reference: Vec<f64> = array(&json, "float_reference");
 
     assert_eq!(activations.len(), cols as usize, "{name}: activation width");
@@ -171,8 +171,8 @@ fn encode_register() -> Vec<u8> {
     v
 }
 
-fn encode_project(rows: u32, cols: u32, acts: &[i32]) -> Vec<u8> {
-    let sig = "projectStateless(uint256,uint32,uint32,uint32,int32[])";
+fn encode_project(rows: u32, cols: u32, acts: &[i64]) -> Vec<u8> {
+    let sig = "projectStateless(uint256,uint32,uint32,uint32,int64[])";
     let mut v = selector(sig).to_vec();
     v.extend_from_slice(&word(MODEL_ID));
     v.extend_from_slice(&word(rows as u64));
@@ -183,27 +183,27 @@ fn encode_project(rows: u32, cols: u32, acts: &[i32]) -> Vec<u8> {
     for &a in acts {
         let mut w = [0u8; 32];
         if a < 0 {
-            w[..28].fill(0xff);
+            w[..24].fill(0xff);
         }
-        w[28..].copy_from_slice(&a.to_be_bytes());
+        w[24..].copy_from_slice(&a.to_be_bytes());
         v.extend_from_slice(&w);
     }
     v
 }
 
-fn decode_int32_array(ret: &[u8]) -> Vec<i32> {
+fn decode_int64_array(ret: &[u8]) -> Vec<i64> {
     assert!(ret.len() >= 64, "return too short");
     let len = u64::from_be_bytes(ret[56..64].try_into().unwrap()) as usize;
     (0..len)
         .map(|i| {
-            let at = 64 + i * 32 + 28;
-            i32::from_be_bytes(ret[at..at + 4].try_into().unwrap())
+            let at = 64 + i * 32 + 24;
+            i64::from_be_bytes(ret[at..at + 8].try_into().unwrap())
         })
         .collect()
 }
 
 /// Registers the fixture as a model and projects against it, exactly as a caller would.
-fn project(f: &Fixture) -> Vec<i32> {
+fn project(f: &Fixture) -> Vec<i64> {
     let mut db = CacheDB::new(EmptyDB::default());
     db.insert_account_info(
         CALLER,
@@ -258,8 +258,8 @@ fn project(f: &Fixture) -> Vec<i32> {
     let proj = call(encode_project(f.rows, f.cols, &f.activations));
     match &proj {
         ExecutionResult::Success { output, .. } => match output {
-            Output::Call(b) => decode_int32_array(b),
-            Output::Create(b, _) => decode_int32_array(b),
+            Output::Call(b) => decode_int64_array(b),
+            Output::Create(b, _) => decode_int64_array(b),
         },
         other => panic!("{}: projection failed: {other:?}", f.name),
     }

@@ -10,9 +10,24 @@
 //! # Format
 //!
 //! Weights are `i16`, row-major, with one power-of-two scale per row. Activations are
-//! Q32 fixed point in `i32`. Products accumulate in `i64`, which cannot overflow for any
-//! width we care about: the worst case is `cols * i16::MIN * i32::MIN`, and at
-//! `cols = 65536` that still leaves 15 bits of headroom.
+//! Q32 fixed point in `i64`.
+//!
+//! `i64` rather than `i32`, which is not a detail. Q32 in an `i32` spans only [-0.5, 0.5),
+//! and a transformer's activations after normalisation are around unit scale — the
+//! representation would saturate on ordinary values, silently, everywhere. Widening costs
+//! four bytes per activation and nothing per weight, and activations are a vanishing
+//! fraction of what a forward pass reads.
+//!
+//! Products are formed in `i64` and accumulated in `i128`, which is not the same as doing
+//! both at the wider width. An unbounded `i64` activation times an `i16` weight reaches 79
+//! bits and would wrap — on a chain that is a soundness failure, not a precision one — so
+//! activations are bounded by [`MAX_ABS_ACTIVATION`] and the bound is checked once per
+//! call, in `O(cols)`, against `O(rows * cols)` of arithmetic. Within it every product fits
+//! `i64` comfortably, while the running sum still needs `i128` because `cols` of them do
+//! not.
+//!
+//! The split matters: forming products in `i128` costs a little over half the kernel's
+//! throughput, and the bound recovers it without giving up soundness.
 //!
 //! This mirrors the representation used by the Solidity implementation it is meant to
 //! replace, so outputs can be compared directly rather than approximately.
@@ -35,6 +50,34 @@ use rayon::prelude::*;
 /// more than a thousand percent. Only checking against float64 truth exposed it.
 pub const Q: u32 = 32;
 
+/// Largest activation magnitude the kernel accepts.
+///
+/// `2^36` in Q32 is a real value of 16, comfortably above anything a normalised transformer
+/// produces — post-RMSNorm values sit near unit scale — while being small enough that a
+/// whole chunk of products can be summed in `i64`. See [`CHUNK`].
+pub const MAX_ABS_ACTIVATION: i64 = 1 << 36;
+
+/// Products summed per `i64` accumulator before widening.
+///
+/// The bound is arithmetic, not taste: a weight is at most `2^15`, an activation at most
+/// [`MAX_ABS_ACTIVATION`] = `2^36`, so each product is at most `2^51` and `2^11` of them
+/// reach `2^62` — one bit inside `i64`.
+///
+/// Chunking exists because of what the alternative costs. Accumulating every product
+/// directly into an `i128` is correct and defeats auto-vectorisation, which measured as
+/// less than half the kernel's throughput. Summing within a chunk at `i64` keeps the hot
+/// loop vectorisable, and only the chunk totals — `cols/2048` of them — are widened.
+const CHUNK: usize = 1 << 11;
+
+/// Whether every activation is inside [`MAX_ABS_ACTIVATION`].
+///
+/// Checked once per call rather than per product: this is `O(cols)` against `O(rows*cols)`
+/// of arithmetic, so it does not show up in the measurements.
+pub fn activations_in_range(x: &[i64]) -> bool {
+    x.iter()
+        .all(|v| *v >= -MAX_ABS_ACTIVATION && *v <= MAX_ABS_ACTIVATION)
+}
+
 /// One row's dot product against `x`.
 ///
 /// Split out because it is the unit of parallelism. Every output row reads the same
@@ -42,13 +85,19 @@ pub const Q: u32 = 32;
 /// no cross-thread reduction anywhere in this kernel, which is what makes the parallel
 /// and scalar paths bit-identical rather than merely close.
 #[inline]
-fn dot(w_row: &[i16], x: &[i32]) -> i64 {
+fn dot(w_row: &[i16], x: &[i64]) -> i128 {
     debug_assert_eq!(w_row.len(), x.len());
-    let mut acc: i64 = 0;
-    for i in 0..w_row.len() {
-        // The cast happens before the multiply so the product is computed in 64 bits.
-        // Multiplying as i32 first would overflow for large activations.
-        acc += (w_row[i] as i64) * (x[i] as i64);
+    let mut acc: i128 = 0;
+    for (wc, xc) in w_row.chunks(CHUNK).zip(x.chunks(CHUNK)) {
+        let mut part: i64 = 0;
+        for i in 0..wc.len() {
+            // Both the product and this partial sum stay in `i64` by construction, which
+            // is what lets the compiler vectorise the loop. Callers guarantee the bound
+            // through `activations_in_range`.
+            debug_assert!(xc[i].unsigned_abs() <= MAX_ABS_ACTIVATION as u64);
+            part += (wc[i] as i64) * xc[i];
+        }
+        acc += part as i128;
     }
     acc
 }
@@ -62,14 +111,14 @@ fn dot(w_row: &[i16], x: &[i32]) -> i64 {
 /// downstream layer; saturation is wrong in the same place but stays bounded, and shows
 /// up as a degraded output rather than as noise.
 #[inline]
-fn finish(acc: i64, row_scale: i8) -> i32 {
+fn finish(acc: i128, row_scale: i8) -> i64 {
     let shift = row_scale as i32;
     let v = if shift >= 0 {
-        acc >> shift.min(63)
+        acc >> shift.min(127)
     } else {
-        acc.saturating_mul(1i64 << (-shift).min(62))
+        acc.saturating_mul(1i128 << (-shift).min(126))
     };
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 /// Single-threaded reference. The definition of correct — every other path is checked
@@ -77,10 +126,10 @@ fn finish(acc: i64, row_scale: i8) -> i32 {
 pub fn matmul_scalar(
     w: &[i16],
     scales: &[i8],
-    x: &[i32],
+    x: &[i64],
     rows: usize,
     cols: usize,
-    out: &mut [i32],
+    out: &mut [i64],
 ) {
     assert_eq!(w.len(), rows * cols, "weight length must be rows*cols");
     assert_eq!(scales.len(), rows, "one scale per row");
@@ -109,7 +158,7 @@ pub const PARALLEL_THRESHOLD: usize = 2 << 20;
 /// partial products would still be deterministic in integer arithmetic, but it would tie
 /// the result to the partition size — and therefore to the machine. This does not, which
 /// is also why switching between the two paths on a size threshold is safe.
-pub fn matmul(w: &[i16], scales: &[i8], x: &[i32], rows: usize, cols: usize, out: &mut [i32]) {
+pub fn matmul(w: &[i16], scales: &[i8], x: &[i64], rows: usize, cols: usize, out: &mut [i64]) {
     assert_eq!(w.len(), rows * cols, "weight length must be rows*cols");
     assert_eq!(scales.len(), rows, "one scale per row");
     assert_eq!(x.len(), cols, "activation length must be cols");
@@ -138,6 +187,45 @@ pub fn weight_bytes(rows: usize, cols: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// The chunked accumulator must not depend on where the chunk boundaries fall.
+    #[test]
+    fn chunk_boundaries_do_not_change_the_result() {
+        // Straddling one, two, and several chunks, plus a length that is not a multiple.
+        for cols in [CHUNK - 1, CHUNK, CHUNK + 1, CHUNK * 3 + 7] {
+            let rows = 3usize;
+            let w = fill(rows * cols, 3);
+            let scales = vec![20i8; rows];
+            let x: Vec<i64> = (0..cols)
+                .map(|i| ((i as i64 * 7919) % 2001) - 1000)
+                .collect();
+
+            let mut got = vec![0i64; rows];
+            matmul_scalar(&w, &scales, &x, rows, cols, &mut got);
+
+            // Independent reference: one accumulator, full width, no chunking at all.
+            for r in 0..rows {
+                let mut acc: i128 = 0;
+                for c in 0..cols {
+                    acc += (w[r * cols + c] as i128) * (x[c] as i128);
+                }
+                assert_eq!(got[r], (acc >> 20) as i64, "cols {cols}, row {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_activation_bound_is_enforceable() {
+        assert!(activations_in_range(&[
+            0,
+            MAX_ABS_ACTIVATION,
+            -MAX_ABS_ACTIVATION
+        ]));
+        assert!(!activations_in_range(&[MAX_ABS_ACTIVATION + 1]));
+        // The bound must keep a full chunk of worst-case products inside i64.
+        let worst = (i16::MIN as i128).unsigned_abs() * MAX_ABS_ACTIVATION as u128 * CHUNK as u128;
+        assert!(worst < i64::MAX as u128, "chunk can overflow: {worst}");
+    }
+
     /// Deterministic filler. Not random, so a failure is reproducible from the test name
     /// alone without carrying a seed around.
     fn fill(n: usize, salt: i64) -> Vec<i16> {
@@ -146,9 +234,9 @@ mod tests {
             .collect()
     }
 
-    fn acts(n: usize) -> Vec<i32> {
+    fn acts(n: usize) -> Vec<i64> {
         (0..n)
-            .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+            .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
             .collect()
     }
 
@@ -166,8 +254,8 @@ mod tests {
             let scales: Vec<i8> = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
             let x = acts(cols);
 
-            let mut a = vec![0i32; rows];
-            let mut b = vec![0i32; rows];
+            let mut a = vec![0i64; rows];
+            let mut b = vec![0i64; rows];
             matmul_scalar(&w, &scales, &x, rows, cols, &mut a);
             matmul(&w, &scales, &x, rows, cols, &mut b);
 
@@ -186,7 +274,7 @@ mod tests {
         let scales = vec![30i8; rows];
         let x = acts(cols);
 
-        let mut reference = vec![0i32; rows];
+        let mut reference = vec![0i64; rows];
         matmul_scalar(&w, &scales, &x, rows, cols, &mut reference);
 
         for threads in [1usize, 2, 3, 7, 14] {
@@ -194,7 +282,7 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let mut got = vec![0i32; rows];
+            let mut got = vec![0i64; rows];
             pool.install(|| matmul(&w, &scales, &x, rows, cols, &mut got));
             assert_eq!(reference, got, "result changed at {threads} threads");
         }
@@ -202,17 +290,18 @@ mod tests {
 
     #[test]
     fn saturates_instead_of_wrapping() {
-        // One row of maximum-magnitude products, scaled up hard enough to overflow i32.
-        let (rows, cols) = (1, 64);
+        // Every product at the largest magnitude the kernel accepts, across enough columns
+        // to exceed what the output can hold. The result must clamp rather than wrap.
+        let (rows, cols) = (1, 4096);
         let w = vec![i16::MIN; cols];
-        let scales = vec![0i8; rows]; // no requantising shift, so the raw accumulator survives
-        let x = vec![i32::MAX; cols];
+        let scales = vec![-40i8; rows]; // negative shift scales the accumulator up
+        let x = vec![MAX_ABS_ACTIVATION; cols];
 
-        let mut out = vec![0i32; rows];
+        let mut out = vec![0i64; rows];
         matmul_scalar(&w, &scales, &x, rows, cols, &mut out);
         assert_eq!(
             out[0],
-            i32::MIN,
+            i64::MIN,
             "expected saturation at the negative bound"
         );
     }
@@ -222,8 +311,8 @@ mod tests {
         // Hand-checkable: 2x3 with no requantising shift.
         let w: Vec<i16> = vec![1, 2, 3, 4, 5, 6];
         let scales = vec![0i8, 0];
-        let x: Vec<i32> = vec![10, 20, 30];
-        let mut out = vec![0i32; 2];
+        let x: Vec<i64> = vec![10, 20, 30];
+        let mut out = vec![0i64; 2];
         matmul_scalar(&w, &scales, &x, 2, 3, &mut out);
         assert_eq!(out, vec![140, 320]); // 10+40+90, 40+100+180
     }

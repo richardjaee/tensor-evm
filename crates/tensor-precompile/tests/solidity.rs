@@ -114,8 +114,8 @@ fn encode_register(model_id: u64, weights: Address, dim: u64, cols: u64) -> Vec<
 }
 
 /// `projectStateless(uint256,uint32,uint32,uint32,int32[])`
-fn encode_project(model_id: u64, rows: u32, cols: u32, offset: u32, acts: &[i32]) -> Vec<u8> {
-    let sig = "projectStateless(uint256,uint32,uint32,uint32,int32[])";
+fn encode_project(model_id: u64, rows: u32, cols: u32, offset: u32, acts: &[i64]) -> Vec<u8> {
+    let sig = "projectStateless(uint256,uint32,uint32,uint32,int64[])";
     let mut v = selector(sig).to_vec();
     v.extend_from_slice(&word(model_id));
     v.extend_from_slice(&word(rows as u64));
@@ -124,37 +124,36 @@ fn encode_project(model_id: u64, rows: u32, cols: u32, offset: u32, acts: &[i32]
     v.extend_from_slice(&word(5 * 32)); // offset to the array, past five head words
     v.extend_from_slice(&word(acts.len() as u64));
     for &a in acts {
-        // int32 is sign-extended to a full word by the ABI.
+        // int64 is sign-extended to a full word by the ABI.
         let mut w = [0u8; 32];
-        let bytes = a.to_be_bytes();
         if a < 0 {
-            w[..28].fill(0xff);
+            w[..24].fill(0xff);
         }
-        w[28..].copy_from_slice(&bytes);
+        w[24..].copy_from_slice(&a.to_be_bytes());
         v.extend_from_slice(&w);
     }
     v
 }
 
 /// Decodes an `int32[]` return: offset word, length word, then sign-extended values.
-fn decode_int32_array(ret: &[u8]) -> Vec<i32> {
+fn decode_int64_array(ret: &[u8]) -> Vec<i64> {
     assert!(ret.len() >= 64, "return too short for a dynamic array");
     let len = u64::from_be_bytes(ret[56..64].try_into().unwrap()) as usize;
     (0..len)
         .map(|i| {
-            let at = 64 + i * 32 + 28;
-            i32::from_be_bytes(ret[at..at + 4].try_into().unwrap())
+            let at = 64 + i * 32 + 24;
+            i64::from_be_bytes(ret[at..at + 8].try_into().unwrap())
         })
         .collect()
 }
 
-fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i32>) {
+fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
         .collect();
     let scales = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
     let acts = (0..cols)
-        .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+        .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
         .collect();
     (scales, weights, acts)
 }
@@ -233,7 +232,7 @@ fn solidity_reaches_the_precompile() {
     let (rows, cols) = (48usize, 64usize);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     let mut h = Harness::new(weight_blob(rows, cols, &scales, &weights));
@@ -244,7 +243,7 @@ fn solidity_reaches_the_precompile() {
     let proj = h.call(encode_project(MODEL_ID, rows as u32, cols as u32, 0, &acts));
     assert!(proj.is_success(), "projectStateless failed: {proj:?}");
 
-    let got = decode_int32_array(returned(&proj));
+    let got = decode_int64_array(returned(&proj));
     assert_eq!(
         got, expected,
         "Solidity disagreed with the reference kernel"
@@ -315,7 +314,7 @@ fn a_shape_the_blob_cannot_satisfy_reverts_through_solidity() {
 /// Sanity: the wire decoder agrees with the ABI decoder on the same bytes.
 #[test]
 fn abi_and_raw_decoders_agree() {
-    let raw: Vec<i32> = vec![-5, 0, 7, i32::MIN, i32::MAX];
+    let raw: Vec<i64> = vec![-5, 0, 7, i64::MIN, i64::MAX];
     let mut bytes = Vec::new();
     for v in &raw {
         bytes.extend_from_slice(&v.to_be_bytes());

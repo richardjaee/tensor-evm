@@ -152,14 +152,14 @@ contract ModelRegistry {
         uint32 rows,
         uint32 cols,
         uint32 offset,
-        int32[] calldata x
-    ) external view returns (int32[] memory) {
+        int64[] calldata x
+    ) external view returns (int64[] memory) {
         Session storage s = _sessions[sessionId];
         if (s.owner == address(0)) revert NoSuchSession();
         if (s.owner != msg.sender) revert NotSessionOwner();
         if (!s.active) revert SessionInactive();
 
-        int32[] memory acts = new int32[](x.length);
+        int64[] memory acts = new int64[](x.length);
         for (uint256 i = 0; i < x.length; ++i) {
             acts[i] = x[i];
         }
@@ -167,13 +167,13 @@ contract ModelRegistry {
     }
 
     /// @notice Matmul against a registered model without a session, for reads and probing.
-    function projectStateless(uint256 modelId, uint32 rows, uint32 cols, uint32 offset, int32[] calldata x)
+    function projectStateless(uint256 modelId, uint32 rows, uint32 cols, uint32 offset, int64[] calldata x)
         external
         view
-        returns (int32[] memory)
+        returns (int64[] memory)
     {
         if (!_models[modelId].exists) revert NoSuchModel();
-        int32[] memory acts = new int32[](x.length);
+        int64[] memory acts = new int64[](x.length);
         for (uint256 i = 0; i < x.length; ++i) {
             acts[i] = x[i];
         }

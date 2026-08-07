@@ -88,13 +88,13 @@ fn forwarder(n: usize, args: &[u8]) -> Vec<u8> {
     code
 }
 
-fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i32>) {
+fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
         .collect();
     let scales = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
     let acts = (0..cols)
-        .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+        .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
         .collect();
     (scales, weights, acts)
 }

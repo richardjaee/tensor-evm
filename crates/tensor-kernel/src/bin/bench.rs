@@ -32,13 +32,13 @@ fn bench<F: FnMut()>(mut f: F) -> f64 {
     }
 }
 
-fn synth(rows: usize, cols: usize) -> (Vec<i16>, Vec<i8>, Vec<i32>) {
+fn synth(rows: usize, cols: usize) -> (Vec<i16>, Vec<i8>, Vec<i64>) {
     let w = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
         .collect();
     let scales = vec![30i8; rows];
     let x = (0..cols)
-        .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+        .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
         .collect();
     (w, scales, x)
 }
@@ -67,7 +67,7 @@ fn main() {
 
     for &(name, rows, cols) in shapes {
         let (w, scales, x) = synth(rows, cols);
-        let mut out = vec![0i32; rows];
+        let mut out = vec![0i64; rows];
         let bytes = weight_bytes(rows, cols) as f64;
 
         // Only benchmark the scalar path on shapes where it will not dominate the run.

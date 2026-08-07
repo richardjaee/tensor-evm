@@ -29,7 +29,7 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::matmul;
+use tensor_kernel::{activations_in_range, matmul};
 
 /// Address of the matmul precompile.
 ///
@@ -66,10 +66,12 @@ pub const MAX_DIM: u64 = 1 << 20;
 /// [4..8)                        cols          u32
 /// [8 ..)                        row scales    i8  x rows
 /// [.. ..)                       weights       i16 x rows*cols, row-major
-/// [.. ..)                       activations   i32 x cols
+/// [.. ..)                       activations   i64 x cols
 /// ```
 ///
-/// Output is `rows` big-endian `i32` values.
+/// Output is `rows` big-endian `i64` values. Activations and results are `i64` rather than
+/// `i32` because Q32 in 32 bits spans only [-0.5, 0.5), and a transformer's activations sit
+/// around unit scale — the narrower type would saturate on ordinary values.
 const HEADER: usize = 8;
 
 /// Gas for a matmul of the given shape, or `None` if the shape overflows.
@@ -112,7 +114,7 @@ pub fn matmul_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Precom
     let Some(weights_len) = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)) else {
         return bad_input(reservoir);
     };
-    let Some(acts_len) = cols.checked_mul(4) else {
+    let Some(acts_len) = cols.checked_mul(8) else {
         return bad_input(reservoir);
     };
     let Some(expected) = HEADER
@@ -139,15 +141,22 @@ pub fn matmul_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Precom
         .collect();
     at += weights_len;
 
-    let acts: Vec<i32> = input[at..at + acts_len]
-        .chunks_exact(4)
-        .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+    let acts: Vec<i64> = input[at..at + acts_len]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
         .collect();
 
-    let mut out = vec![0i32; rows];
+    // The kernel's soundness argument depends on this bound: within it every product fits
+    // i64, and outside it the accumulation would wrap. Rejecting is the only safe answer,
+    // and it must happen here rather than in the kernel, where a chain cannot recover.
+    if !activations_in_range(&acts) {
+        return bad_input(reservoir);
+    }
+
+    let mut out = vec![0i64; rows];
     matmul(&weights, &scales, &acts, rows, cols, &mut out);
 
-    let mut bytes = Vec::with_capacity(rows * 4);
+    let mut bytes = Vec::with_capacity(rows * 8);
     for v in out {
         bytes.extend_from_slice(&v.to_be_bytes());
     }
@@ -170,12 +179,12 @@ pub fn precompile() -> Precompile {
 
 /// Encodes a call, for tests and for anything driving the precompile directly rather
 /// than through Solidity.
-pub fn encode(rows: usize, cols: usize, scales: &[i8], weights: &[i16], acts: &[i32]) -> Vec<u8> {
+pub fn encode(rows: usize, cols: usize, scales: &[i8], weights: &[i16], acts: &[i64]) -> Vec<u8> {
     assert_eq!(scales.len(), rows, "one scale per row");
     assert_eq!(weights.len(), rows * cols, "weights must be rows*cols");
     assert_eq!(acts.len(), cols, "activations must be cols");
 
-    let mut v = Vec::with_capacity(HEADER + rows + rows * cols * 2 + cols * 4);
+    let mut v = Vec::with_capacity(HEADER + rows + rows * cols * 2 + cols * 8);
     v.extend_from_slice(&(rows as u32).to_be_bytes());
     v.extend_from_slice(&(cols as u32).to_be_bytes());
     v.extend(scales.iter().map(|&s| s as u8));
@@ -189,14 +198,14 @@ pub fn encode(rows: usize, cols: usize, scales: &[i8], weights: &[i16], acts: &[
 }
 
 /// Decodes the output.
-pub fn decode(bytes: &[u8]) -> Option<Vec<i32>> {
-    if !bytes.len().is_multiple_of(4) {
+pub fn decode(bytes: &[u8]) -> Option<Vec<i64>> {
+    if !bytes.len().is_multiple_of(8) {
         return None;
     }
     Some(
         bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .chunks_exact(8)
+            .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
             .collect(),
     )
 }
@@ -208,13 +217,13 @@ mod tests {
 
     const PLENTY: u64 = 1_000_000_000;
 
-    fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i32>) {
+    fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
         let weights = (0..rows * cols)
             .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
             .collect();
         let scales = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
         let acts = (0..cols)
-            .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+            .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
             .collect();
         (scales, weights, acts)
     }
@@ -224,7 +233,7 @@ mod tests {
         let (rows, cols) = (37, 53);
         let (scales, weights, acts) = fixture(rows, cols);
 
-        let mut expected = vec![0i32; rows];
+        let mut expected = vec![0i64; rows];
         matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
         let input = encode(rows, cols, &scales, &weights, &acts);
@@ -304,7 +313,7 @@ mod tests {
         let (rows, cols) = (11, 7);
         let (scales, weights, acts) = fixture(rows, cols);
         let input = encode(rows, cols, &scales, &weights, &acts);
-        assert_eq!(input.len(), HEADER + rows + rows * cols * 2 + cols * 4);
+        assert_eq!(input.len(), HEADER + rows + rows * cols * 2 + cols * 8);
 
         let out = matmul_precompile(&input, PLENTY, 0).unwrap();
         assert_eq!(decode(&out.bytes).unwrap().len(), rows);

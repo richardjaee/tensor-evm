@@ -20,13 +20,13 @@ use tensor_precompile::{decode, encode, gas_cost, MATMUL_ADDRESS};
 const CALLER: Address = Address::new([0x11; 20]);
 const WEIGHTS: Address = Address::new([0x33; 20]);
 
-fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i32>) {
+fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
         .collect();
     let scales = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
     let acts = (0..cols)
-        .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+        .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
         .collect();
     (scales, weights, acts)
 }
@@ -85,14 +85,14 @@ fn reads_weights_from_state() {
     let (rows, cols) = (64, 96);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     let db = db_with_weights(weight_blob(rows, cols, &scales, &weights));
     let input = encode_state(rows, cols, WEIGHTS, 0, &acts);
 
     // Calldata now carries only the activations and a 32-byte header.
-    assert_eq!(input.len(), 32 + cols * 4);
+    assert_eq!(input.len(), 32 + cols * 8);
 
     let result = run(db, MATMUL_STATE_ADDRESS, input, 10_000_000);
     let got = decode(output(&result)).expect("output must decode");
@@ -147,8 +147,14 @@ fn state_residency_collapses_the_transport_cost() {
         "state form at {state_gas} should be far below calldata's {calldata_gas}"
     );
     // The remaining cost is dominated by activations, which scale with cols rather than
-    // rows*cols. That is the asymptotic win: transport no longer grows with the model.
-    assert!(state_input.len() < calldata_input.len() / 100);
+    // rows*cols. That is the asymptotic win: transport no longer grows with the model, and
+    // the ratio widens with every row added.
+    assert!(
+        state_input.len() * 50 < calldata_input.len(),
+        "{} against {}",
+        state_input.len(),
+        calldata_input.len()
+    );
 }
 
 /// Cost must not depend on how big the weight blob is, only on the shape requested.
@@ -209,7 +215,7 @@ fn honours_an_offset_into_the_blob() {
     let (rows, cols) = (16, 24);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     // Pad the front, as a second tensor in the same blob would.
@@ -266,7 +272,7 @@ fn both_forms_coexist() {
     let (rows, cols) = (8, 8);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     let db = db_with_weights(weight_blob(rows, cols, &scales, &weights));

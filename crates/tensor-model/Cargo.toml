@@ -1,0 +1,11 @@
+[package]
+name = "tensor-model"
+description = "Deterministic integer transformer inference on top of the matmul kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tensor-kernel = { path = "../tensor-kernel" }

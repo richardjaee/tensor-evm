@@ -38,7 +38,7 @@ use revm::precompile::{
     Precompiles,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::matmul;
+use tensor_kernel::{activations_in_range, matmul};
 
 use crate::{gas_cost, BASE_GAS, MAX_DIM};
 
@@ -62,7 +62,7 @@ pub const WARM_ACCOUNT_GAS: u64 = 100;
 /// [4..8)     cols      u32
 /// [8..28)    weights   address of the contract whose code holds them
 /// [28..32)   offset    u32, byte offset within that code
-/// [32..)     acts      i32 x cols
+/// [32..)     acts      i64 x cols
 /// ```
 ///
 /// The code at `weights[offset..]` is `rows` scale bytes followed by `rows * cols`
@@ -207,16 +207,22 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
 
         // Activations arrive as calldata; only they scale with cols rather than rows*cols,
         // which is the entire reason this form is affordable.
-        let Some(acts_len) = cols_u.checked_mul(4) else {
+        let Some(acts_len) = cols_u.checked_mul(8) else {
             return Ok(Some(revert(gas_limit)));
         };
         if input.len() != HEADER + acts_len {
             return Ok(Some(revert(gas_limit)));
         }
-        let acts: Vec<i32> = input[HEADER..]
-            .chunks_exact(4)
-            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        let acts: Vec<i64> = input[HEADER..]
+            .chunks_exact(8)
+            .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
             .collect();
+
+        // Outside this bound the kernel's accumulation would wrap, so the boundary is
+        // where it has to be refused.
+        if !activations_in_range(&acts) {
+            return Ok(Some(revert(gas_limit)));
+        }
 
         // Warmth is what the access actually costs, and it is only knowable from the load
         // itself. A forward pass hits the same weights account on every call of every
@@ -264,10 +270,10 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             .map(|c| i16::from_be_bytes([c[0], c[1]]))
             .collect();
 
-        let mut out = vec![0i32; rows_u];
+        let mut out = vec![0i64; rows_u];
         matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
 
-        let mut bytes = Vec::with_capacity(rows_u * 4);
+        let mut bytes = Vec::with_capacity(rows_u * 8);
         for v in out {
             bytes.extend_from_slice(&v.to_be_bytes());
         }
@@ -302,10 +308,10 @@ pub fn encode_state(
     cols: usize,
     weights_at: Address,
     offset: u32,
-    acts: &[i32],
+    acts: &[i64],
 ) -> Vec<u8> {
     assert_eq!(acts.len(), cols, "activations must be cols");
-    let mut v = Vec::with_capacity(HEADER + cols * 4);
+    let mut v = Vec::with_capacity(HEADER + cols * 8);
     v.extend_from_slice(&(rows as u32).to_be_bytes());
     v.extend_from_slice(&(cols as u32).to_be_bytes());
     v.extend_from_slice(weights_at.as_slice());

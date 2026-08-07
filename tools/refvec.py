@@ -49,11 +49,14 @@ def main():
 
     # Deterministic, so a failure is reproducible from the seed alone.
     rng = np.random.default_rng(a.seed)
-    acts_f = rng.normal(0.0, 0.02, size=cols)
+    # Unit scale, which is what a normalised transformer actually produces. Q32 in 32 bits
+    # could not hold these — it spans only [-0.5, 0.5) — which is why activations are int64.
+    acts_f = rng.normal(0.0, 1.0, size=cols)
     acts_q = np.rint(acts_f * Q32).astype(np.int64)
-    if np.abs(acts_q).max() > np.iinfo(np.int32).max:
-        raise SystemExit("activations do not fit int32; reduce their spread")
-    acts_q = acts_q.astype(np.int32)
+    # The kernel bounds activations so each product stays inside int64; anything beyond it
+    # would be refused by the precompile rather than wrapped.
+    if np.abs(acts_q).max() > (1 << 36):
+        raise SystemExit("activations exceed the kernel's bound; reduce their spread")
 
     # What the model means: float64 against the original weights.
     truth = w @ (acts_q.astype(np.float64) / Q32)
@@ -68,7 +71,7 @@ def main():
     # same mistake and disagrees with the model by a thousand percent.
     shift = shifts.astype(np.int64)
     exact = np.where(shift >= 0, acc >> np.clip(shift, 0, 63), acc << np.clip(-shift, 0, 62))
-    exact = np.clip(exact, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
+    exact = np.clip(exact, np.iinfo(np.int64).min, np.iinfo(np.int64).max).astype(np.int64)
 
     # The integer path's answer, read back as a real number, against float64 truth.
     got = exact.astype(np.float64) / Q32

@@ -112,13 +112,13 @@ fn run(to: Address, data: Vec<u8>, gas_limit: u64) -> ExecutionResult {
     try_run(to, data, gas_limit).expect("transaction must execute")
 }
 
-fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i32>) {
+fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
         .collect();
     let scales = (0..rows).map(|r| (r % 5) as i8 + 28).collect();
     let acts = (0..cols)
-        .map(|i| (((i as i64 * 40503 + 17) % 131071) - 65535) as i32)
+        .map(|i| ((i as i64 * 40503 + 17) % 131071) - 65535)
         .collect();
     (scales, weights, acts)
 }
@@ -138,7 +138,7 @@ fn reachable_at_its_address() {
     let (rows, cols) = (16, 24);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     let result = run(
@@ -157,7 +157,7 @@ fn callable_from_contract_bytecode() {
     let (rows, cols) = (32, 48);
     let (scales, weights, acts) = fixture(rows, cols);
 
-    let mut expected = vec![0i32; rows];
+    let mut expected = vec![0i64; rows];
     matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
 
     let result = run(

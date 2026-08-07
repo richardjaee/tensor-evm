@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tensor-kernel", "crates/tensor-precompile"]
+members = ["crates/tensor-kernel", "crates/tensor-precompile", "crates/tensor-model"]
 resolver = "2"
 
 [workspace.package]
