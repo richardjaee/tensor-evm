@@ -52,11 +52,18 @@ use rayon::prelude::*;
 /// more than a thousand percent. Only checking against float64 truth exposed it.
 pub const Q: u32 = 32;
 
-/// Largest activation magnitude the kernel accepts.
+/// Largest activation magnitude **the matmul** accepts.
 ///
-/// `2^36` in Q32 is a real value of 16, comfortably above anything a normalised transformer
-/// produces — post-RMSNorm values sit near unit scale — while being small enough that a
-/// whole chunk of products can be summed in `i64`. See [`CHUNK`].
+/// `2^36` in Q32 is a real value of 16. The bound exists for one reason and applies in one
+/// place: this kernel sums products in `i64` within a chunk, and an unbounded operand would
+/// wrap. See [`CHUNK`].
+///
+/// It is emphatically not a claim that every value in a transformer is small. Queries and
+/// keys after QK-norm routinely exceed it, because Qwen3's `k_norm` scales by up to 96.5 —
+/// and the operations that consume them accumulate in `i128`, so they need no bound at all.
+/// The invariant is narrower than it first looks: whatever reaches a matmul is bounded, and
+/// that holds because matmul inputs are residual streams and normalised vectors rather than
+/// anything a norm weight has stretched.
 pub const MAX_ABS_ACTIVATION: i64 = 1 << 36;
 
 /// Products summed per `i64` accumulator before widening.

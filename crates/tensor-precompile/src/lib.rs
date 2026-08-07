@@ -325,3 +325,5 @@ pub mod state;
 pub mod activation;
 
 pub mod norm;
+
+pub mod attention;

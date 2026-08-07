@@ -119,11 +119,15 @@ pub fn norm_rope_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Pre
     at += half * 8;
     let mut vec = take(input, at, total);
 
-    // The vector is an activation and is bounded like one. The weight is not: it is a
-    // scale factor, and Qwen3's `k_norm` reaches 96.5 — six times the activation bound —
-    // so checking it as though it were an activation refuses the real model. Nothing
-    // overflows without the check, because the product is formed in `i128`: a bounded
-    // activation at 2^36 against any `i64` weight is at most 2^99.
+    // The input to this operation comes from a projection and is genuinely bounded, so the
+    // check is kept as a cheap guard against nonsense. The weight is not checked: it is a
+    // scale factor rather than an activation, and Qwen3's `k_norm` reaches 96.5 — six times
+    // the activation bound — so checking it as one would refuse the real model.
+    //
+    // Nothing here overflows either way, since every product is formed in `i128`. The bound
+    // exists for the matmul kernel alone, which sums in `i64` within a chunk. That is also
+    // why this precompile's *output* is not bounded and need not be: it feeds attention,
+    // not a matmul.
     if !activations_in_range(&vec) {
         return bad_input(reservoir);
     }

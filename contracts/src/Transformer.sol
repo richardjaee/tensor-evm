@@ -148,7 +148,7 @@ library Transformer {
     ) private view {
         Config memory c = b.c;
         uint256 g = gasleft();
-        int256[] memory normed = Ops.rmsnorm(x, b.n.input, c.rmsEps);
+        int256[] memory normed = TensorMatmul.rmsnorm(c.rmsEps, b.n.input, x);
         _mark(p, g);
 
         g = gasleft();
@@ -198,7 +198,7 @@ library Transformer {
 
     function _feedForward(Block memory b, int256[] memory x, Profile memory p) private view {
         uint256 g = gasleft();
-        int256[] memory normed = Ops.rmsnorm(x, b.n.post, b.c.rmsEps);
+        int256[] memory normed = TensorMatmul.rmsnorm(b.c.rmsEps, b.n.post, x);
         _mark(p, g);
 
         g = gasleft();
@@ -261,33 +261,24 @@ library Transformer {
     }
 
     /// @dev Grouped-query attention over every position up to and including `pos`.
+    ///
+    ///      The cache slices passed here are exactly `pos + 1` positions deep, which is
+    ///      what makes the mask causal: the precompile has no notion of position and
+    ///      attends to everything it is given.
     function _attend(Config memory c, Kv memory kv, int256[] memory q, uint256 pos)
         private
-        pure
-        returns (int256[] memory attn)
+        view
+        returns (int256[] memory)
     {
-        uint256 hs = c.headDim;
-        uint256 kvw = kvWidth(c);
-        uint256 group = c.nHeads / c.nKv;
-        int256 scale = Ops.invSqrt(hs);
-
-        attn = new int256[](qWidth(c));
-        int256[] memory scores = new int256[](pos + 1);
-
-        for (uint256 h = 0; h < c.nHeads; ++h) {
-            uint256 kvh = h / group;
-            for (uint256 t = 0; t <= pos; ++t) {
-                scores[t] = Ops.scaledDot(q, h * hs, kv.k, t * kvw + kvh * hs, hs, scale);
-            }
-            Ops.softmax(scores, pos + 1);
-
-            for (uint256 t = 0; t <= pos; ++t) {
-                uint256 base = t * kvw + kvh * hs;
-                int256 w = scores[t];
-                for (uint256 j = 0; j < hs; ++j) {
-                    attn[h * hs + j] += (w * kv.v[base + j]) >> FixedPoint.F;
-                }
-            }
+        uint256 depth = (pos + 1) * kvWidth(c);
+        int256[] memory k = new int256[](depth);
+        int256[] memory v = new int256[](depth);
+        for (uint256 i = 0; i < depth; ++i) {
+            k[i] = kv.k[i];
+            v[i] = kv.v[i];
         }
+        return TensorMatmul.attention(
+            uint32(c.nHeads), uint32(c.nKv), uint32(c.headDim), uint32(pos + 1), q, k, v
+        );
     }
 }

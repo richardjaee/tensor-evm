@@ -29,6 +29,12 @@ library TensorMatmul {
     ///      that allocates an array apiece.
     address internal constant NORM_ROPE = address(0x103);
 
+    /// @dev Grouped-query attention over a cache, at 0x104, and RMSNorm at 0x105. Both are
+    ///      cheap arithmetic that the EVM charges for by the loop rather than by the work:
+    ///      after matmul, SwiGLU, and QK-norm went native these were 19% and 14% of a layer.
+    address internal constant ATTENTION = address(0x104);
+    address internal constant RMSNORM = address(0x105);
+
     /// @dev Carries the shape, because a block issues eight of these and a bare failure
     ///      says nothing about which one.
     error PrecompileFailed(uint256 rows, uint256 cols, uint256 inputLen, uint256 retLen);
@@ -208,6 +214,96 @@ library TensorMatmul {
         if (!ok) revert PrecompileFailed(heads, headDim, input.length, ret.length);
         if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
 
+        out = new int256[](n);
+        assembly ("memory-safe") {
+            let src := add(ret, 0x20)
+            let dst := add(out, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst, shl(5, i)), sar(192, mload(add(src, mul(i, 8)))))
+            }
+        }
+    }
+
+    /// @notice Grouped-query attention over the whole cache, through the precompile
+    /// @param positions Cache depth including this one; the causal mask is the caller's
+    function attention(
+        uint32 heads,
+        uint32 nKv,
+        uint32 headDim,
+        uint32 positions,
+        int256[] memory q,
+        int256[] memory k,
+        int256[] memory v
+    ) internal view returns (int256[] memory out) {
+        uint256 n = uint256(heads) * headDim;
+        uint256 cache = uint256(positions) * nKv * headDim;
+        require(q.length == n, "q width");
+        require(k.length == cache && v.length == cache, "cache width");
+
+        uint256 want = 16 + (n + cache + cache) * 8;
+        bytes memory input = new bytes(want + 32);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            mstore(p, or(or(shl(224, heads), shl(192, nKv)), or(shl(160, headDim), shl(128, positions))))
+            let dst := add(p, 16)
+            for { let s := 0 } lt(s, 3) { s := add(s, 1) } {
+                let src := q
+                switch s
+                case 1 { src := k }
+                case 2 { src := v }
+                let len := mload(src)
+                let from := add(src, 0x20)
+                for { let i := 0 } lt(i, len) { i := add(i, 1) } {
+                    mstore(add(dst, mul(i, 8)), shl(192, mload(add(from, shl(5, i)))))
+                }
+                dst := add(dst, mul(len, 8))
+            }
+            mstore(input, want)
+        }
+
+        (bool ok, bytes memory ret) = ATTENTION.staticcall(input);
+        if (!ok) revert PrecompileFailed(heads, positions, input.length, ret.length);
+        if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
+        out = _unpack(ret, n);
+    }
+
+    /// @notice RMSNorm over one vector, through the precompile
+    function rmsnorm(int256 eps, int256[] memory weight, int256[] memory x)
+        internal
+        view
+        returns (int256[] memory out)
+    {
+        uint256 n = x.length;
+        require(weight.length == n, "weight width");
+
+        uint256 want = 12 + n * 16;
+        bytes memory input = new bytes(want + 32);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            mstore(p, shl(224, n))
+            mstore(add(p, 4), shl(192, eps))
+            let dst := add(p, 12)
+            let w := add(weight, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst, mul(i, 8)), shl(192, mload(add(w, shl(5, i)))))
+            }
+            let dst2 := add(dst, mul(n, 8))
+            let src := add(x, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst2, mul(i, 8)), shl(192, mload(add(src, shl(5, i)))))
+            }
+            mstore(input, want)
+        }
+
+        (bool ok, bytes memory ret) = RMSNORM.staticcall(input);
+        if (!ok) revert PrecompileFailed(1, n, input.length, ret.length);
+        if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
+        out = _unpack(ret, n);
+    }
+
+    /// @dev Eight-byte big-endian values into a Solidity array, sign-extended. Shared,
+    ///      because every one of these precompiles returns the same shape.
+    function _unpack(bytes memory ret, uint256 n) private pure returns (int256[] memory out) {
         out = new int256[](n);
         assembly ("memory-safe") {
             let src := add(ret, 0x20)

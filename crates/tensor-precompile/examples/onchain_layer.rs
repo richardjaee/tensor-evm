@@ -583,6 +583,35 @@ fn main() {
             total - precompiled,
             100.0 * (total - precompiled) as f64 / total as f64
         );
+
+        // What the precompiles actually charge, as opposed to what the sections cost. The
+        // difference is everything Solidity does to hand them their arguments.
+        let mm = |r: u64, c: u64| tensor_precompile::gas_cost(r, c).unwrap();
+        let d = cfg.dim as u64;
+        let qw = cfg.q_width() as u64;
+        let kvw = cfg.kv_width() as u64;
+        let hid = cfg.hidden as u64;
+        let charged: u64 = mm(qw, d)
+            + mm(kvw, d) * 2
+            + mm(d, qw)
+            + mm(hid, d) * 2
+            + mm(d, hid)
+            + tensor_precompile::activation::gas_cost(hid).unwrap()
+            + tensor_precompile::norm::gas_cost(cfg.n_heads as u64, cfg.head_dim as u64).unwrap()
+            + tensor_precompile::norm::gas_cost(cfg.n_kv as u64, cfg.head_dim as u64).unwrap()
+            + tensor_precompile::attention::attention_gas(
+                cfg.n_heads as u64,
+                cfg.head_dim as u64,
+                1,
+            )
+            .unwrap()
+            + tensor_precompile::attention::rmsnorm_gas(d).unwrap() * 2;
+
+        println!("\n  the precompiles themselves charge {charged} gas of that {total}.");
+        println!(
+            "  so {:.1}% of a layer is Solidity handing them their arguments, not arithmetic.",
+            100.0 * (total - charged) as f64 / total as f64
+        );
     }
 
     // Extrapolation, labelled as such: twenty-eight of these plus a classifier.
