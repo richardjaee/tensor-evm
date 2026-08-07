@@ -43,6 +43,10 @@ pub struct Config {
     /// Not `dim / n_heads`. See the module comment.
     pub head_dim: usize,
     pub seq_len: usize,
+    /// RMSNorm epsilon in Q32, from the model's own configuration. Qwen3 uses 1e-6 where
+    /// Llama uses 1e-5; hardcoding either is a place for a chain and its reference to hold
+    /// quietly different models.
+    pub rms_eps: i64,
 }
 
 impl Config {
@@ -184,7 +188,7 @@ pub fn forward_layer(
     debug_assert!(pos < cfg.seq_len, "position beyond the cache");
 
     // ---- attention ----
-    rmsnorm(x, w.input_norm, &mut s.normed);
+    rmsnorm(x, w.input_norm, cfg.rms_eps, &mut s.normed);
     w.q.apply(&s.normed, &mut s.q);
     w.k.apply(&s.normed, &mut s.k);
     w.v.apply(&s.normed, &mut s.v);
@@ -194,13 +198,13 @@ pub fn forward_layer(
     let (cos, sin) = rope_tab.at(pos);
     for h in 0..cfg.n_heads {
         let seg = &mut s.q[h * hs..(h + 1) * hs];
-        rmsnorm(seg, w.q_norm, &mut s.head);
+        rmsnorm(seg, w.q_norm, cfg.rms_eps, &mut s.head);
         seg.copy_from_slice(&s.head);
         rope(seg, cos, sin);
     }
     for h in 0..cfg.n_kv {
         let seg = &mut s.k[h * hs..(h + 1) * hs];
-        rmsnorm(seg, w.k_norm, &mut s.head);
+        rmsnorm(seg, w.k_norm, cfg.rms_eps, &mut s.head);
         seg.copy_from_slice(&s.head);
         rope(seg, cos, sin);
     }
@@ -237,7 +241,7 @@ pub fn forward_layer(
     add_into(x, &s.proj);
 
     // ---- feed-forward ----
-    rmsnorm(x, w.post_norm, &mut s.normed);
+    rmsnorm(x, w.post_norm, cfg.rms_eps, &mut s.normed);
     w.gate.apply(&s.normed, &mut s.gate);
     w.up.apply(&s.normed, &mut s.up);
     swiglu(&s.gate, &s.up, &mut s.ffn);
@@ -280,7 +284,7 @@ impl Model<'_> {
 
         // Normalise into scratch rather than in place: the residual stream is the caller's,
         // and a generation loop needs it intact to embed the next token against.
-        rmsnorm(x, self.final_norm, &mut s.normed);
+        rmsnorm(x, self.final_norm, self.cfg.rms_eps, &mut s.normed);
         self.lm_head.apply(&s.normed, logits);
     }
 }
@@ -467,6 +471,7 @@ mod tests {
             n_kv: 2,
             head_dim: 16, // 4 * 16 = 64 != dim, exactly as Qwen3 does it
             seq_len: 8,
+            rms_eps: tensor_kernel::fixed::RMS_EPS_LLAMA,
         };
         assert_ne!(
             cfg.head_dim,
@@ -616,6 +621,7 @@ mod tests {
                 n_kv: 2,
                 head_dim: hs,
                 seq_len: 4,
+                rms_eps: tensor_kernel::fixed::RMS_EPS_LLAMA,
             };
             let got = cfg.attn_scale() as f64 / ONE_F;
             let want = 1.0 / (hs as f64).sqrt();
@@ -635,6 +641,7 @@ mod tests {
             n_kv: 1,
             head_dim: 8,
             seq_len: 6,
+            rms_eps: tensor_kernel::fixed::RMS_EPS_LLAMA,
         };
         let kv = KvCache::new(&cfg, 1);
         // Positions are written at `slot(layer, pos)`, so distinct positions never alias.

@@ -22,6 +22,8 @@ const HIDDEN: usize = 3072;
 const HEADS: usize = 16;
 const KV: usize = 8;
 const HS: usize = 128;
+/// Qwen3 specifies 1e-6, where Llama specifies 1e-5.
+const EPS: i64 = tensor_kernel::fixed::RMS_EPS_QWEN3;
 
 fn noise(n: usize, seed: u64) -> Vec<i64> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -98,12 +100,16 @@ fn main() {
 
     // ---- everything else ----
     let mut other_us = 0.0;
-    other_us += report("rmsnorm (residual)", time(|| rmsnorm(&x, &w, &mut out)), 2);
+    other_us += report(
+        "rmsnorm (residual)",
+        time(|| rmsnorm(&x, &w, EPS, &mut out)),
+        2,
+    );
     other_us += report(
         "rmsnorm (QK-norm, per head)",
         time(|| {
             let mut o = vec![0i64; HS];
-            rmsnorm(&head, &cos.repeat(2), &mut o)
+            rmsnorm(&head, &cos.repeat(2), EPS, &mut o)
         }),
         HEADS + KV,
     );

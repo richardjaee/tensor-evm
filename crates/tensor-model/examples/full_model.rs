@@ -89,6 +89,9 @@ fn main() {
         n_kv: meta(&mj, "n_kv"),
         head_dim: meta(&mj, "head_dim"),
         seq_len: positions,
+        // From the checkpoint's own configuration. Qwen3 specifies 1e-6 where Llama
+        // specifies 1e-5, and the float64 reference reads the same field.
+        rms_eps: tensor_kernel::fixed::RMS_EPS_QWEN3,
     };
 
     println!(

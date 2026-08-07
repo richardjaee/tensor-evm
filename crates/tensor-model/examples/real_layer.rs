@@ -94,6 +94,8 @@ fn main() {
         n_kv: meta(&dir, "n_kv"),
         head_dim: meta(&dir, "head_dim"),
         seq_len: meta(&dir, "positions"),
+        // From the checkpoint's own configuration; Qwen3 specifies 1e-6, Llama 1e-5.
+        rms_eps: tensor_kernel::fixed::RMS_EPS_QWEN3,
     };
     let positions = cfg.seq_len;
 

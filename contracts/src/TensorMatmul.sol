@@ -19,6 +19,11 @@ library TensorMatmul {
     ///      the success flag.
     address internal constant MATMUL = address(0x101);
 
+    /// @dev SwiGLU, at 0x102. Present for the same reason matmul is: with matmul native, a
+    ///      layer's 3,072 SiLU calls cost 19.1M gas against 15,360 for its matmuls, so
+    ///      accelerating only matmul relocates the bottleneck rather than removing it.
+    address internal constant SWIGLU = address(0x102);
+
     error PrecompileFailed();
     error UnexpectedOutputLength(uint256 got, uint256 want);
 
@@ -30,13 +35,18 @@ library TensorMatmul {
     /// @param x         Q32 activations
     /// @return out      `rows` Q32 values
     ///
-    /// @dev `int64` rather than `int32`: Q32 in 32 bits spans only [-0.5, 0.5), and a
-    ///      transformer's activations sit around unit scale, so the narrower type would
-    ///      saturate on ordinary values everywhere and silently.
-    function matmul(uint32 rows, uint32 cols, address weights, uint32 offset, int64[] memory x)
+    /// @dev Values are Q32 and travel to the precompile as `int64`, but the Solidity type
+    ///      is `int256` because a memory array occupies a full word per element either way
+    ///      — narrowing the type would save nothing and force a conversion at every
+    ///      composition point. The wire format narrows on write and sign-extends on read.
+    ///
+    ///      `int64` on the wire rather than `int32`: Q32 in 32 bits spans only
+    ///      [-0.5, 0.5), and a transformer's activations sit around unit scale, so the
+    ///      narrower width would saturate on ordinary values everywhere and silently.
+    function matmul(uint32 rows, uint32 cols, address weights, uint32 offset, int256[] memory x)
         internal
         view
-        returns (int64[] memory out)
+        returns (int256[] memory out)
     {
         require(x.length == cols, "activations must be cols");
 
@@ -72,13 +82,49 @@ library TensorMatmul {
             revert UnexpectedOutputLength(ret.length, uint256(rows) * 8);
         }
 
-        out = new int64[](rows);
+        out = new int256[](rows);
         assembly ("memory-safe") {
             let src := add(ret, 0x20)
             let dst := add(out, 0x20)
             for { let i := 0 } lt(i, rows) { i := add(i, 1) } {
                 // Load the eight bytes into the high end of a word, then arithmetic-shift
                 // down so the sign extends across the full slot.
+                mstore(add(dst, shl(5, i)), sar(192, mload(add(src, mul(i, 8)))))
+            }
+        }
+    }
+
+    /// @notice silu(gate) * up, elementwise, through the precompile
+    function swiglu(int256[] memory gate, int256[] memory up)
+        internal
+        view
+        returns (int256[] memory out)
+    {
+        uint256 n = gate.length;
+        require(up.length == n, "gate and up must match");
+
+        bytes memory input = new bytes(4 + n * 16);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            mstore(p, shl(224, n))
+            let g := add(gate, 0x20)
+            let u := add(up, 0x20)
+            let dst := add(p, 4)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst, mul(i, 8)), shl(192, mload(add(g, shl(5, i)))))
+                mstore(add(add(dst, mul(n, 8)), mul(i, 8)), shl(192, mload(add(u, shl(5, i)))))
+            }
+        }
+
+        (bool ok, bytes memory ret) = SWIGLU.staticcall(input);
+        if (!ok) revert PrecompileFailed();
+        if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
+
+        out = new int256[](n);
+        assembly ("memory-safe") {
+            let src := add(ret, 0x20)
+            let dst := add(out, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                 mstore(add(dst, shl(5, i)), sar(192, mload(add(src, mul(i, 8)))))
             }
         }

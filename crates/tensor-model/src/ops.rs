@@ -5,14 +5,20 @@
 //! than against another integer implementation — which is the mistake that cost this
 //! project a thousand-percent error before real weights were introduced.
 
-use crate::fixed::{exp_q32, isqrt, silu, F, ONE, RMS_EPS};
+use tensor_kernel::fixed::{exp_q32, isqrt, silu, F, ONE};
 
 /// RMSNorm: `x / sqrt(mean(x^2) + eps) * weight`.
+///
+/// `eps` is Q32 and comes from the model rather than from a constant. Llama specifies 1e-5
+/// and Qwen3 specifies 1e-6, and while the difference is negligible against a mean square
+/// near unity, a fixed value is a place where a chain and its reference can quietly hold
+/// different models. Two implementations that disagree in the last place are not one model
+/// in two places.
 ///
 /// The sum of squares accumulates in `i128`. Each term is Q64 and there are `dim` of them,
 /// so at dim 8192 the worst case needs 77 bits — comfortably inside 128 but well outside
 /// the 64 that would look sufficient at a glance.
-pub fn rmsnorm(x: &[i64], weight: &[i64], out: &mut [i64]) {
+pub fn rmsnorm(x: &[i64], weight: &[i64], eps: i64, out: &mut [i64]) {
     assert_eq!(x.len(), weight.len(), "weight must match the input width");
     assert_eq!(x.len(), out.len(), "output must match the input width");
 
@@ -20,7 +26,7 @@ pub fn rmsnorm(x: &[i64], weight: &[i64], out: &mut [i64]) {
     for &v in x {
         ss += (v as i128) * (v as i128); // Q64
     }
-    let mean = ss / x.len() as i128 + ((RMS_EPS as i128) << F); // Q64
+    let mean = ss / x.len() as i128 + ((eps as i128) << F); // Q64
 
     // sqrt of a Q64 value is Q32, which is exactly the scale the divisor needs.
     let rms = isqrt(mean as u128) as i128;
@@ -146,11 +152,12 @@ mod tests {
         let x = [0.3f64, -1.2, 0.75, 2.0, -0.4, 0.9, -1.5, 0.05];
         let w = [1.0f64, 0.5, 1.5, 0.8, 1.2, 1.0, 0.9, 1.1];
 
-        let ms: f64 = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + 1e-5;
+        let eps = 1e-6f64;
+        let ms: f64 = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + eps;
         let want: Vec<f64> = x.iter().zip(&w).map(|(v, k)| v / ms.sqrt() * k).collect();
 
         let mut out = vec![0i64; x.len()];
-        rmsnorm(&to_q(&x), &to_q(&w), &mut out);
+        rmsnorm(&to_q(&x), &to_q(&w), (eps * ONE as f64) as i64, &mut out);
         close(&from_q(&out), &want, 1e-6, "rmsnorm");
     }
 

@@ -19,8 +19,15 @@ pub const F: u32 = 32;
 /// `floor(log2(e) * 2^32)`, which turns `exp` into a base-2 problem.
 pub const LOG2E: i64 = 6_196_328_018;
 
-/// RMSNorm's epsilon, 1e-5 in Q32.
-pub const RMS_EPS: i64 = 42_949;
+/// RMSNorm's epsilon for the Llama family, 1e-5 in Q32.
+///
+/// Not a universal constant. Qwen3 specifies 1e-6, and models are free to specify anything;
+/// `rmsnorm` takes it as an argument for that reason. Kept here as a named default for
+/// callers that genuinely want the Llama value.
+pub const RMS_EPS_LLAMA: i64 = 42_950;
+
+/// RMSNorm's epsilon for Qwen3, 1e-6 in Q32.
+pub const RMS_EPS_QWEN3: i64 = 4_295;
 
 /// Bits of the fractional exponent consumed by the bit-product in [`exp_q32`].
 const EXP_STEPS: usize = 32;

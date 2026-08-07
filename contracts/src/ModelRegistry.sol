@@ -159,11 +159,7 @@ contract ModelRegistry {
         if (s.owner != msg.sender) revert NotSessionOwner();
         if (!s.active) revert SessionInactive();
 
-        int64[] memory acts = new int64[](x.length);
-        for (uint256 i = 0; i < x.length; ++i) {
-            acts[i] = x[i];
-        }
-        return TensorMatmul.matmul(rows, cols, _models[s.modelId].weights, offset, acts);
+        return _narrow(TensorMatmul.matmul(rows, cols, _models[s.modelId].weights, offset, _widen(x)));
     }
 
     /// @notice Matmul against a registered model without a session, for reads and probing.
@@ -173,11 +169,24 @@ contract ModelRegistry {
         returns (int64[] memory)
     {
         if (!_models[modelId].exists) revert NoSuchModel();
-        int64[] memory acts = new int64[](x.length);
+        return _narrow(TensorMatmul.matmul(rows, cols, _models[modelId].weights, offset, _widen(x)));
+    }
+
+    /// @dev The ABI speaks int64 because that is the value's actual width; Solidity memory
+    ///      gives every element a full word regardless, so internal code uses int256 and
+    ///      converts only at this boundary.
+    function _widen(int64[] calldata x) private pure returns (int256[] memory out) {
+        out = new int256[](x.length);
         for (uint256 i = 0; i < x.length; ++i) {
-            acts[i] = x[i];
+            out[i] = x[i];
         }
-        return TensorMatmul.matmul(rows, cols, _models[modelId].weights, offset, acts);
+    }
+
+    function _narrow(int256[] memory x) private pure returns (int64[] memory out) {
+        out = new int64[](x.length);
+        for (uint256 i = 0; i < x.length; ++i) {
+            out[i] = int64(x[i]);
+        }
     }
 
     function advance(bytes32 sessionId, uint32 pos, uint16 layer, uint8 phase) external {
