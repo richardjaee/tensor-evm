@@ -57,6 +57,17 @@ library Transformer {
         int256[] post;
     }
 
+    /// @notice Optional gas attribution, recorded in place as a block runs.
+    /// @dev A profile with a zero-length array costs one comparison per section and is
+    ///      what a real caller passes. Measuring from outside instead would fold the
+    ///      transaction's own calldata into every figure — a 1024-wide activation vector
+    ///      ABI-encodes to 32KB, which is around 500k gas of transport attributed to
+    ///      whichever operation happened to be under test.
+    struct Profile {
+        uint256[] gas;
+        uint256 at;
+    }
+
     /// @notice Everything identifying one layer: its geometry, where its tensors live, and
     ///         the norm weights that are vectors rather than matrices.
     /// @dev Bundled because the EVM's stack, not gas, is what limits how a transformer
@@ -109,11 +120,20 @@ library Transformer {
         Kv memory kv,
         RopeTable memory rope,
         uint256 pos,
-        int256[] memory x
+        int256[] memory x,
+        Profile memory p
     ) internal view returns (int256[] memory) {
-        _attention(b, kv, rope, pos, x);
-        _feedForward(b, x);
+        _attention(b, kv, rope, pos, x, p);
+        _feedForward(b, x, p);
         return x;
+    }
+
+    /// @dev Records what has been spent since the last mark. `gasleft()` is itself two gas,
+    ///      which is below the resolution of anything being measured here.
+    function _mark(Profile memory p, uint256 before) private view {
+        if (p.gas.length == 0) return;
+        p.gas[p.at] = before - gasleft();
+        p.at += 1;
     }
 
     /// @dev Writes its projection back into `x`, so the residual add happens here rather
@@ -123,20 +143,38 @@ library Transformer {
         Kv memory kv,
         RopeTable memory rope,
         uint256 pos,
-        int256[] memory x
+        int256[] memory x,
+        Profile memory p
     ) private view {
         Config memory c = b.c;
+        uint256 g = gasleft();
         int256[] memory normed = Ops.rmsnorm(x, b.n.input, c.rmsEps);
-        _extendCache(b, kv, rope, pos, normed);
+        _mark(p, g);
 
+        g = gasleft();
+        _extendCache(b, kv, rope, pos, normed);
+        _mark(p, g);
+
+        g = gasleft();
         int256[] memory q =
             TensorMatmul.matmul(uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
+        _mark(p, g);
+
         // QK-norm before rotary, not after. Normalising a rotated vector rescales its
         // components unequally and destroys the angle the embedding encodes.
-        _normAndRotate(q, c.nHeads, c.headDim, b.n.qNorm, rope, pos, c.rmsEps);
+        g = gasleft();
+        q = _normAndRotate(q, c.nHeads, c.headDim, b.n.qNorm, rope, pos, c.rmsEps);
+        _mark(p, g);
 
+        g = gasleft();
+        int256[] memory attn = _attend(c, kv, q, pos);
+        _mark(p, g);
+
+        g = gasleft();
         int256[] memory proj =
-            TensorMatmul.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, _attend(c, kv, q, pos));
+            TensorMatmul.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, attn);
+        _mark(p, g);
+
         for (uint256 i = 0; i < c.dim; ++i) {
             x[i] += proj[i];
         }
@@ -154,25 +192,40 @@ library Transformer {
     ) private view {
         uint32 kvw = uint32(kvWidth(b.c));
         int256[] memory k = TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.k, normed);
-        _normAndRotate(k, b.c.nKv, b.c.headDim, b.n.kNorm, rope, pos, b.c.rmsEps);
+        k = _normAndRotate(k, b.c.nKv, b.c.headDim, b.n.kNorm, rope, pos, b.c.rmsEps);
         _store(kv, kvw, pos, k, TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.v, normed));
     }
 
-    function _feedForward(Block memory b, int256[] memory x) private view {
+    function _feedForward(Block memory b, int256[] memory x, Profile memory p) private view {
+        uint256 g = gasleft();
         int256[] memory normed = Ops.rmsnorm(x, b.n.post, b.c.rmsEps);
-        int256[] memory gated = TensorMatmul.swiglu(
-            TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.gate, normed),
-            TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.up, normed)
-        );
+        _mark(p, g);
+
+        g = gasleft();
+        int256[] memory gate = TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.gate, normed);
+        int256[] memory up = TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.up, normed);
+        _mark(p, g);
+
+        g = gasleft();
+        int256[] memory gated = TensorMatmul.swiglu(gate, up);
+        _mark(p, g);
+
+        g = gasleft();
         int256[] memory proj =
             TensorMatmul.matmul(b.c.dim, b.c.hidden, b.weights, b.l.down, gated);
+        _mark(p, g);
+
         for (uint256 i = 0; i < b.c.dim; ++i) {
             x[i] += proj[i];
         }
     }
 
-    /// @dev The per-head slice is normalised into a temporary and copied back, since
-    ///      RMSNorm reads every element before writing any.
+    /// @dev One precompile call for every head at once. Written as a Solidity loop this
+    ///      was 43% of a layer's gas — trivial arithmetic on 128 values, made expensive by
+    ///      being performed sixteen times with an allocation apiece.
+    ///
+    ///      The rotary table is sliced to this position before the call rather than passing
+    ///      the whole table and an index, so the precompile needs no notion of position.
     function _normAndRotate(
         int256[] memory vec,
         uint256 heads,
@@ -181,20 +234,19 @@ library Transformer {
         RopeTable memory rope,
         uint256 pos,
         int256 eps
-    ) private pure {
+    ) private view returns (int256[] memory) {
         uint256 half = hs / 2;
-        int256[] memory head = new int256[](hs);
-        for (uint256 h = 0; h < heads; ++h) {
-            uint256 off = h * hs;
-            for (uint256 j = 0; j < hs; ++j) {
-                head[j] = vec[off + j];
-            }
-            int256[] memory nrm = Ops.rmsnorm(head, weight, eps);
-            for (uint256 j = 0; j < hs; ++j) {
-                vec[off + j] = nrm[j];
-            }
-            Ops.rope(vec, off, hs, rope.cos, rope.sin, pos * half);
+        TensorMatmul.NormRope memory a = TensorMatmul.NormRope({
+            weight: weight,
+            cos: new int256[](half),
+            sin: new int256[](half),
+            vec: vec
+        });
+        for (uint256 j = 0; j < half; ++j) {
+            a.cos[j] = rope.cos[pos * half + j];
+            a.sin[j] = rope.sin[pos * half + j];
         }
+        return TensorMatmul.normRope(uint32(heads), uint32(hs), eps, a);
     }
 
     function _store(Kv memory kv, uint256 kvw, uint256 pos, int256[] memory k, int256[] memory v)

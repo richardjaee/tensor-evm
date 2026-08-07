@@ -24,9 +24,24 @@ library TensorMatmul {
     ///      accelerating only matmul relocates the bottleneck rather than removing it.
     address internal constant SWIGLU = address(0x102);
 
+    /// @dev Fused QK-norm and rotary, at 0x103. With matmul and SwiGLU already native, a
+    ///      real layer spent 43% of its gas here — sixteen heads through a Solidity loop
+    ///      that allocates an array apiece.
+    address internal constant NORM_ROPE = address(0x103);
+
     /// @dev Carries the shape, because a block issues eight of these and a bare failure
     ///      says nothing about which one.
     error PrecompileFailed(uint256 rows, uint256 cols, uint256 inputLen, uint256 retLen);
+
+    /// @notice Arguments to `normRope`, bundled.
+    /// @dev Field order is load-bearing: the encoder walks these four pointers in sequence,
+    ///      and the precompile expects weight, cos, sin, vec in exactly this order.
+    struct NormRope {
+        int256[] weight;
+        int256[] cos;
+        int256[] sin;
+        int256[] vec;
+    }
     error UnexpectedOutputLength(uint256 got, uint256 want);
 
     /// @notice out[i] = sum_j W[i][j] * x[j], with W read from `weights` at `offset`
@@ -136,6 +151,61 @@ library TensorMatmul {
 
         (bool ok, bytes memory ret) = SWIGLU.staticcall(input);
         if (!ok) revert PrecompileFailed(0, n, input.length, ret.length);
+        if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
+
+        out = new int256[](n);
+        assembly ("memory-safe") {
+            let src := add(ret, 0x20)
+            let dst := add(out, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst, shl(5, i)), sar(192, mload(add(src, mul(i, 8)))))
+            }
+        }
+    }
+
+    /// @notice RMS-normalise each head and rotate it, through the precompile
+    /// @dev Fused because the two are always adjacent and always in this order:
+    ///      normalising a rotated vector rescales its components unequally and destroys the
+    ///      angle the embedding encodes.
+    function normRope(uint32 heads, uint32 headDim, int256 eps, NormRope memory a)
+        internal
+        view
+        returns (int256[] memory out)
+    {
+        uint256 half = headDim / 2;
+        uint256 n = uint256(heads) * headDim;
+        require(a.weight.length == headDim, "weight width");
+        require(a.cos.length == half && a.sin.length == half, "table width");
+        require(a.vec.length == n, "vector width");
+
+        uint256 want = 16 + (uint256(headDim) + half + half + n) * 8;
+        // Over-allocated and trimmed, as elsewhere: `mstore` writes thirty-two bytes, so
+        // the last eight-byte value of the last vector overruns by twenty-four.
+        bytes memory input = new bytes(want + 32);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            // Ascending, so no field lands on top of one already written.
+            mstore(p, or(shl(224, heads), shl(192, headDim)))
+            mstore(add(p, 8), shl(192, eps))
+            let dst := add(p, 16)
+            for { let s := 0 } lt(s, 4) { s := add(s, 1) } {
+                // weight, cos, sin, vec in order; each argument is at a fixed stack slot
+                // The struct's four array pointers sit in consecutive words, so the
+                // fields are walked rather than named — naming them would put four more
+                // live values on a stack that has none to spare.
+                let src := mload(add(a, mul(s, 0x20)))
+                let len := mload(src)
+                let from := add(src, 0x20)
+                for { let i := 0 } lt(i, len) { i := add(i, 1) } {
+                    mstore(add(dst, mul(i, 8)), shl(192, mload(add(from, shl(5, i)))))
+                }
+                dst := add(dst, mul(len, 8))
+            }
+            mstore(input, want)
+        }
+
+        (bool ok, bytes memory ret) = NORM_ROPE.staticcall(input);
+        if (!ok) revert PrecompileFailed(heads, headDim, input.length, ret.length);
         if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
 
         out = new int256[](n);

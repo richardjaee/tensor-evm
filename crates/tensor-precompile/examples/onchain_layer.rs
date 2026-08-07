@@ -436,6 +436,7 @@ fn main() {
         println!();
     }
 
+    let db2 = db.clone();
     let evm = Context::mainnet()
         .with_db(db)
         .modify_cfg_chained(|c| c.tx_gas_limit_cap = Some(GAS_CAP))
@@ -446,7 +447,7 @@ fn main() {
         .transact(TxEnv {
             caller: CALLER,
             kind: TxKind::Call(RUNNER),
-            data: data.into(),
+            data: data.clone().into(),
             gas_limit: GAS_CAP,
             gas_price: 0,
             ..Default::default()
@@ -500,6 +501,90 @@ fn main() {
     }
 
     // Extrapolation, clearly labelled as such: 28 of these plus a classifier.
+    // ---- where the gas went ----
+    // Measured inside the contract, so the transaction's own calldata is excluded. A
+    // 1024-wide activation vector ABI-encodes to 32KB, which is about 500k gas of transport
+    // that would otherwise be attributed to whichever operation happened to be under test.
+    {
+        let mut d = keccak256(
+            b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,int256),\
+(uint32,uint32,uint32,uint32,uint32,uint32,uint32),address,uint256,\
+(int256[],int256[],int256[],int256[],int256[],int256[],int256[]))",
+        )[..4]
+            .to_vec();
+        d.extend_from_slice(&data[4..]);
+
+        let evm = Context::mainnet()
+            .with_db(db2)
+            .modify_cfg_chained(|c| c.tx_gas_limit_cap = Some(GAS_CAP))
+            .build_mainnet();
+        let mut evm = evm.with_precompiles(TensorPrecompiles::default());
+        let r = evm
+            .transact(TxEnv {
+                caller: CALLER,
+                kind: TxKind::Call(RUNNER),
+                data: d.into(),
+                gas_limit: GAS_CAP,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .expect("profile must execute")
+            .result;
+        let out = match &r {
+            ExecutionResult::Success { output, .. } => match output {
+                Output::Call(b) => b.to_vec(),
+                Output::Create(b, _) => b.to_vec(),
+            },
+            other => panic!("profile failed: {other:?}"),
+        };
+        let n = u64::from_be_bytes(out[56..64].try_into().unwrap()) as usize;
+        let vals: Vec<u64> = (0..n)
+            .map(|i| {
+                let a = 64 + i * 32 + 24;
+                u64::from_be_bytes(out[a..a + 8].try_into().unwrap())
+            })
+            .collect();
+
+        let names = [
+            "rmsnorm (attn)",
+            "k/v proj + QK-norm + rope + cache",
+            "q proj",
+            "QK-norm + rope (q)",
+            "attention",
+            "o proj",
+            "rmsnorm (ffn)",
+            "gate + up proj",
+            "swiglu",
+            "down proj",
+        ];
+        let total: u64 = vals.iter().sum();
+        println!("\nwhere a layer's gas goes\n");
+        println!("{:<38} {:>12} {:>7}", "section", "gas", "share");
+        println!("{}", "-".repeat(60));
+        let mut precompiled = 0u64;
+        for (name, v) in names.iter().zip(&vals) {
+            println!(
+                "{name:<38} {v:>12} {:>6.1}%",
+                100.0 * *v as f64 / total as f64
+            );
+            if name.contains("proj") || *name == "swiglu" {
+                precompiled += *v;
+            }
+        }
+        println!("{}", "-".repeat(60));
+        println!("{:<38} {total:>12}", "measured inside the contract");
+        println!(
+            "\n  through precompiles {:>12} ({:.0}%)",
+            precompiled,
+            100.0 * precompiled as f64 / total as f64
+        );
+        println!(
+            "  still in the EVM    {:>12} ({:.0}%)",
+            total - precompiled,
+            100.0 * (total - precompiled) as f64 / total as f64
+        );
+    }
+
     // Extrapolation, labelled as such: twenty-eight of these plus a classifier.
     println!(
         "\na 28-layer token is about {:.0}M gas at this cost.",

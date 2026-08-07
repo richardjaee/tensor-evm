@@ -67,6 +67,31 @@ contract LayerRunner {
         uint256 pos,
         Inputs calldata i
     ) external view returns (int256[] memory) {
+        return _run(c, l, weights, pos, i, new uint256[](0));
+    }
+
+    /// @notice The same block, returning where its gas went
+    /// @dev Ten sections, in the order a block performs them.
+    function profileLayer(
+        Transformer.Config calldata c,
+        Transformer.Layer calldata l,
+        address weights,
+        uint256 pos,
+        Inputs calldata i
+    ) external view returns (uint256[] memory) {
+        uint256[] memory gas = new uint256[](10);
+        _run(c, l, weights, pos, i, gas);
+        return gas;
+    }
+
+    function _run(
+        Transformer.Config calldata c,
+        Transformer.Layer calldata l,
+        address weights,
+        uint256 pos,
+        Inputs calldata i,
+        uint256[] memory gas
+    ) private view returns (int256[] memory) {
         Transformer.Norms memory n = Transformer.Norms({
             input: i.inputNorm,
             qNorm: i.qNorm,
@@ -86,7 +111,8 @@ contract LayerRunner {
             kv,
             Transformer.RopeTable({cos: i.cos, sin: i.sin}),
             pos,
-            i.x
+            i.x,
+            Transformer.Profile({gas: gas, at: 0})
         );
     }
 }
