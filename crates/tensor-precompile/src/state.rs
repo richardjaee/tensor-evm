@@ -139,6 +139,7 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
         let mut p = Precompiles::new(PrecompileSpecId::from_spec_id(spec)).clone();
         p.extend([
             crate::precompile(),
+            crate::activation::precompile(),
             Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,

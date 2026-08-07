@@ -10,6 +10,10 @@
 //! its reference generator shared a requantisation mistake, agreed with each other on every
 //! test, and were wrong by more than a thousand percent.
 
-pub mod fixed;
+/// The fixed-point primitives live beside the matmul, in `tensor-kernel`: they are the
+/// same layer of the stack, and a chain exposing one as a precompile has to expose the
+/// others for the same reason.
+pub use tensor_kernel::fixed;
+
 pub mod ops;
 pub mod qwen3;

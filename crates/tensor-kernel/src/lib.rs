@@ -32,6 +32,8 @@
 //! This mirrors the representation used by the Solidity implementation it is meant to
 //! replace, so outputs can be compared directly rather than approximately.
 
+pub mod fixed;
+
 use rayon::prelude::*;
 
 /// Fractional bits carried by an activation.
@@ -184,6 +186,27 @@ pub fn matmul(w: &[i16], scales: &[i8], x: &[i64], rows: usize, cols: usize, out
 /// be read, not by how fast products can be formed.
 pub fn weight_bytes(rows: usize, cols: usize) -> usize {
     rows * cols * core::mem::size_of::<i16>()
+}
+
+/// SiLU applied across a vector, in place.
+///
+/// Vectorised because the cost that matters is per call, not per element. In the EVM a
+/// single SiLU is 6,235 gas, so a layer's 3,072 of them come to 19M — against 15,360 for
+/// the same layer's matmuls once those are a precompile. Exposing this one element at a
+/// time would keep the calling overhead and leave the bottleneck where it was.
+pub fn silu_vec(x: &mut [i64]) {
+    for v in x.iter_mut() {
+        *v = fixed::silu(*v);
+    }
+}
+
+/// `silu(gate) * up`, the SwiGLU pairing, written into `gate`.
+pub fn swiglu_vec(gate: &mut [i64], up: &[i64]) {
+    assert_eq!(gate.len(), up.len(), "gate and up must match");
+    for i in 0..gate.len() {
+        let g = fixed::silu(gate[i]);
+        gate[i] = ((g as i128 * up[i] as i128) >> fixed::F) as i64;
+    }
 }
 
 #[cfg(test)]

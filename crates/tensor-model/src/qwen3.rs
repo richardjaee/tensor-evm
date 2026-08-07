@@ -14,8 +14,8 @@
 //! Everything is Q32 fixed point. Nothing here uses floating point, and none of it may:
 //! the whole design rests on every node computing identical bits.
 
-use crate::fixed::ONE;
 use crate::ops::{add_into, rmsnorm, rope, scaled_dot, softmax, swiglu};
+use tensor_kernel::fixed::ONE;
 use tensor_kernel::matmul;
 
 /// A quantised weight matrix: `int16` values with one power-of-two scale per row.
@@ -61,7 +61,7 @@ impl Config {
     /// `1/sqrt(head_dim)` in Q32, by integer square root so the constant has no float
     /// provenance and cannot differ between implementations.
     pub fn attn_scale(&self) -> i64 {
-        let root = crate::fixed::isqrt((self.head_dim as u128) << 64); // sqrt(hs) in Q32
+        let root = tensor_kernel::fixed::isqrt((self.head_dim as u128) << 64); // sqrt(hs) in Q32
         (((ONE as u128) << 32) / root) as i64
     }
 }
