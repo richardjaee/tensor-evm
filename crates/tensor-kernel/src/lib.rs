@@ -19,10 +19,20 @@
 
 use rayon::prelude::*;
 
-/// Shift applied after accumulation, before the per-row scale.
+/// Fractional bits carried by an activation.
 ///
-/// Activations are Q32, so a product of (weight x activation) carries 32 fractional bits
-/// that have to come back off. The row scale then adjusts for that row's magnitude.
+/// Recorded for callers that need to interpret results; the requantisation in [`finish`]
+/// does not reference it, for reasons worth stating because getting this wrong is silent.
+///
+/// A weight is stored as `q = w * 2^s` for that row's shift `s`, and an activation as
+/// `x = v * 2^32`. Their product therefore carries `s + 32` fractional bits, and returning
+/// to Q32 means shedding exactly `s` of them — the activation's own 32 are the ones being
+/// kept. So the requantising shift is the row scale itself, not `32 - s`.
+///
+/// The difference is invisible at `s = 32`, where the two agree, and is why an earlier
+/// version of this passed every test it had: both the kernel and the reference vector
+/// generator implemented `32 - s`, agreed with each other, and disagreed with the model by
+/// more than a thousand percent. Only checking against float64 truth exposed it.
 pub const Q: u32 = 32;
 
 /// One row's dot product against `x`.
@@ -45,12 +55,15 @@ fn dot(w_row: &[i16], x: &[i32]) -> i64 {
 
 /// Convert an accumulator back to a Q32 activation.
 ///
+/// The accumulator carries `row_scale + 32` fractional bits and a Q32 result wants 32, so
+/// the shift is `row_scale`. See [`Q`] for why that is not `32 - row_scale`.
+///
 /// Saturates rather than wrapping. A wrap here would be silent and would corrupt every
 /// downstream layer; saturation is wrong in the same place but stays bounded, and shows
 /// up as a degraded output rather than as noise.
 #[inline]
 fn finish(acc: i64, row_scale: i8) -> i32 {
-    let shift = Q as i32 - row_scale as i32;
+    let shift = row_scale as i32;
     let v = if shift >= 0 {
         acc >> shift.min(63)
     } else {
@@ -192,7 +205,7 @@ mod tests {
         // One row of maximum-magnitude products, scaled up hard enough to overflow i32.
         let (rows, cols) = (1, 64);
         let w = vec![i16::MIN; cols];
-        let scales = vec![32i8; rows]; // shift of zero, so the raw accumulator survives
+        let scales = vec![0i8; rows]; // no requantising shift, so the raw accumulator survives
         let x = vec![i32::MAX; cols];
 
         let mut out = vec![0i32; rows];
@@ -206,9 +219,9 @@ mod tests {
 
     #[test]
     fn known_value() {
-        // Hand-checkable: 2x3, scale 32 means shift of zero.
+        // Hand-checkable: 2x3 with no requantising shift.
         let w: Vec<i16> = vec![1, 2, 3, 4, 5, 6];
-        let scales = vec![32i8, 32];
+        let scales = vec![0i8, 0];
         let x: Vec<i32> = vec![10, 20, 30];
         let mut out = vec![0i32; 2];
         matmul_scalar(&w, &scales, &x, 2, 3, &mut out);

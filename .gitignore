@@ -8,6 +8,10 @@
 *.bin
 *.gguf
 
+# ...except the test fixtures, which are small row-slices of a real checkpoint and are
+# what keeps the end-to-end tests running without a 1.5 GB download
+!/testdata/*.bin
+
 # Chain data
 /datadir/
 /genesis-out/
@@ -19,3 +23,7 @@
 
 # solc artifacts
 /contracts/out/
+
+# Python
+__pycache__/
+*.pyc
