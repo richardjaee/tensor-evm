@@ -382,8 +382,8 @@ mod tests {
             let max = *sc.iter().max().unwrap();
             let e: Vec<u64> = sc.iter().map(|s| exp_q32(s - max)).collect();
             let sum: i128 = e.iter().map(|x| *x as i128).sum();
-            for t in 0..positions {
-                let w = (((e[t] as i128) << F) / sum) as i128;
+            for (t, ee) in e.iter().enumerate() {
+                let w = ((*ee as i128) << F) / sum;
                 let base = t * kvw + kvh * hs;
                 for j in 0..hs {
                     want[h * hs + j] += ((w * v[base + j] as i128) >> F) as i64;
