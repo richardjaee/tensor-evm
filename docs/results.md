@@ -429,6 +429,44 @@ matmuls and achieve far less:
 Projections built on the peak figure are optimistic by two to five times at small model
 widths. They converge as models grow, since a 32B layer's matmuls are themselves large.
 
+## Phase 6 — the whole model
+
+**Verdict: it reproduces the model, and picks the same token.**
+
+Qwen3-0.6B end to end in integers — 28 layers, the final norm, the 151,936-row classifier —
+against float64 computed from the original bf16 checkpoint.
+
+```
+cargo run --release --example full_model -- models/full
+```
+
+| | |
+|---|---|
+| logits vs float64 | 1.70e-03 mean relative, 9.59e-03 max |
+| top-1 token | **agrees** |
+| top-5 set | **agrees** |
+| throughput | 46 ms/token, **21.6 tokens/sec** |
+
+### Depth compounds error, by about two orders of magnitude
+
+One layer matched float64 to 2e-05. Twenty-eight and a classifier come to 1.70e-03. That
+stays far below what changes an answer, but it settles a question that could not be settled
+by assumption: **a layer being right does not make a stack of them right**, and the only way
+to know the margin was to run the whole thing.
+
+### Numerical agreement is necessary and not sufficient
+
+A language model emits a token, not a vector, so the check that gates this phase is the
+argmax rather than the error. Ranks six and seven do swap — their float64 logits differ by
+0.004, inside the measured error — which is the honest boundary of what this precision buys.
+Reported rather than tuned away.
+
+### Where the time goes at model scale
+
+46 ms/token for 0.6B, of which 393 ms was a one-time load of 1.2 GB. The classifier is a
+single 151,936 x 1024 matmul — 155M multiply-accumulates, more than a third of the model's
+parameters — so at this size a vocabulary is not a detail.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

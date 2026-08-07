@@ -74,7 +74,7 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | 3 | Model registry, session-keyed state, arch flags | **done** |
 | 4 | Real weights, verified against float64 | **done** |
 | 5 | A real Qwen3 layer, verified against float64 | **done** |
-| 6 | Full 28-layer forward pass and logits | next |
+| 6 | Full 28-layer forward pass and logits | **done** |
 | 5 | Mixture-of-experts support | |
 
 ### Phase 0 headline
@@ -107,6 +107,16 @@ execution begins. The computation is not cheap relative to transport — it is u
 
 So weights cannot travel as arguments. They must already be on chain, with the caller
 passing a reference and the precompile reading from state.
+
+### Phase 6 headline
+
+The whole of Qwen3-0.6B, in integers, reproduces the model: **top-1 and top-5 both agree
+with float64**, logits match to 1.7e-03, and it runs at **21.6 tokens/sec** on a laptop with
+every value reproducible bit for bit.
+
+Depth was worth testing rather than assuming — one layer matched to 2e-05, twenty-eight and
+a classifier to 1.7e-03, so error compounds with depth by about two orders of magnitude. It
+stays well below what changes an answer, and now that is measured rather than hoped.
 
 ### Phase 2 headline
 
