@@ -31,9 +31,11 @@ hardware — just ordinary consensus over a VM that can do arithmetic at memory 
 - **A standalone L1, not a rollup.** Rollups must post their data to Ethereum, and the
   data here is tens to thousands of gigabytes of weights. On an L1 weights are ordinary
   state, distributed by the same peer-to-peer sync every chain already uses.
-- **One narrow precompile.** `matmul(weights, activations)` and nothing more. A precompile
-  that ran whole transformer blocks would need revising for every architecture variant; one
-  that only multiplies matrices serves all of them, including mixture-of-experts models.
+- **A small set of vectorised precompiles.** `matmul` and `swiglu`, not one and not a whole
+  transformer block. Matmul alone was the original design and measurement rejected it: once
+  matrix multiplication is native, a layer's SwiGLU is **1,247x** its matmul, so accelerating
+  only matmul relocates the bottleneck rather than removing it. Each precompile stays a
+  primitive, so a new architecture adds a sibling rather than forcing a revision.
 - **Integer arithmetic throughout.** `int16` weights, Q32 activations. Not a workaround —
   it is the reason consensus is possible at all. See below.
 - **Every validator holds every weight.** Sharding the model across nodes would be cheaper
@@ -71,7 +73,8 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | ~~2.5~~ | ~~Activations in state too~~ | dropped — measured unnecessary |
 | 3 | Model registry, session-keyed state, arch flags | **done** |
 | 4 | Real weights, verified against float64 | **done** |
-| 5 | Full forward pass — attention, RoPE, QK-norm | next |
+| 5 | A real Qwen3 layer, verified against float64 | **done** |
+| 6 | Full 28-layer forward pass and logits | next |
 | 5 | Mixture-of-experts support | |
 
 ### Phase 0 headline

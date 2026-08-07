@@ -337,6 +337,98 @@ The companion project's exporter targets Llama and would have produced fluent no
 Each is silent when unhandled, so `tools/quantize.py` reports them rather than proceeding
 quietly.
 
+## Phase 5 — a real layer, and the finding that changed the design
+
+**Verdict: the layer works, and a matmul-only precompile does not.**
+
+### The layer
+
+One block of the published Qwen3-0.6B checkpoint, in integers, against float64:
+
+| position | mean relative error | max |
+|---|---|---|
+| 0 | 4.37e-06 | 3.50e-05 |
+| 1 | 5.33e-06 | 6.12e-05 |
+| 2 | 2.04e-05 | 1.01e-04 |
+| 3 | 1.02e-05 | 5.38e-05 |
+
+Attention with a KV cache, QK-norm before rotary, grouped queries, real rotary tables at
+theta 1e6, SwiGLU, both residual paths. The error does not grow with position, so nothing
+accumulates through attention or the cache.
+
+`cargo run --release --example real_layer -- models/layer0` — an example rather than a test,
+because it needs a 31 MB export that cannot be committed and a test that silently skips is
+worse than none.
+
+### Matmul is not where a chain's time goes
+
+Attributing a layer natively gives 83% matmul and 17% everything else. That looks like
+vindication for a narrow precompile. It is not, because the question is what remains *after*
+matmul is accelerated.
+
+Measured in the EVM (`forge test --match-contract OpsCost` in the companion repository):
+
+| | gas |
+|---|---|
+| `exp`, one call | 6,309 |
+| `silu`, one call | 6,235 |
+| `isqrt`, one call | 3,905 |
+
+Applied to one Qwen3-0.6B layer:
+
+| | gas |
+|---|---|
+| matmul in the EVM | 990,904,320 |
+| matmul via precompile | 15,360 |
+| SwiGLU (3,072 × SiLU) | 19,153,920 |
+| RMSNorm (26 × isqrt) | 101,530 |
+
+**A layer goes from 99% matmul to 99% SwiGLU, and what is left behind is 1,247× the thing
+that was fixed.** Accelerating only matrix multiplication does not remove the bottleneck; it
+relocates it three orders of magnitude in the wrong direction.
+
+### What that changes
+
+A SwiGLU precompile at `0x102`, vectorised — one call per layer rather than one per element,
+because at 3,072 elements the calling overhead would otherwise be the entire cost of what it
+replaced. Priced at 4 elements per gas, so a layer's SwiGLU falls from 19.1M gas to 768.
+
+The original argument was right about interface *shape* and wrong about *sufficiency*. A
+precompile running a whole transformer block would still need revising for every
+architecture variant — that objection stands. But no amount of narrowing makes matmul enough
+on its own.
+
+SwiGLU rather than the more general `exp` is a real trade. `exp` is universal, serving
+softmax and GELU-through-tanh as well, but leaving the surrounding division and multiply in
+the EVM keeps the operation an order of magnitude above the matmul beside it. SwiGLU covers
+the Llama, Qwen, and Mistral families as they stand; GeGLU models need a sibling, and adding
+one is additive rather than a revision — which is the property the narrow-interface argument
+was actually protecting.
+
+### A stale constant, found by chasing a timing gap
+
+The layer took 2 ms where its 30 MB of weights should stream in 0.3 ms. Part of the answer:
+`PARALLEL_THRESHOLD` had been calibrated when activations were `i32`, and widening them to
+`i64` slowed the kernel without changing dispatch cost, so the crossover moved.
+Qwen3-0.6B's `k_proj` is exactly 1024 × 1024, which sat just under the old value — **every
+key projection of every layer was running single-threaded.** A sweep put the crossover at
+2^19; 2^18 regresses a 576-wide projection to 0.7× scalar, 2^21 denies `k_proj` a 1.8× gain.
+
+### Peak throughput is not layer throughput
+
+The 196 GB/s in phase 0 was measured on a 250 MB slab. Real layers issue much smaller
+matmuls and achieve far less:
+
+| shape | MiB | GB/s |
+|---|---|---|
+| Qwen3-32B ffn | 250.0 | 106.8 |
+| Qwen3-0.6B down | 6.0 | 43.7 |
+| Qwen3-0.6B q_proj | 4.0 | 32.7 |
+| Qwen3-0.6B k_proj | 2.0 | 20.6 |
+
+Projections built on the peak figure are optimistic by two to five times at small model
+widths. They converge as models grow, since a 32B layer's matmuls are themselves large.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,
