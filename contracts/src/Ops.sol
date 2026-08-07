@@ -20,7 +20,8 @@ library Ops {
     /// @dev The sum of squares is Q64 and accumulates over `dim` terms; int256 leaves
     ///      ample headroom. The square root of a Q64 value is Q32, which is exactly the
     ///      scale the divisor needs, so no rescaling is required between the two.
-    function rmsnorm(int256[] memory x, int256[] memory weight)
+    /// @param eps Q32, from the model's own configuration rather than a constant
+    function rmsnorm(int256[] memory x, int256[] memory weight, int256 eps)
         internal
         pure
         returns (int256[] memory out)
@@ -34,7 +35,7 @@ library Ops {
                 ss += x[i] * x[i];
             }
         }
-        int256 mean = ss / int256(n) + (FixedPoint.RMS_EPS << FixedPoint.F);
+        int256 mean = ss / int256(n) + (eps << FixedPoint.F);
         int256 rms = int256(FixedPoint.isqrt(uint256(mean)));
         if (rms == 0) rms = 1;
 

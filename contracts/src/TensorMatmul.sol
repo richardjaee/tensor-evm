@@ -24,7 +24,9 @@ library TensorMatmul {
     ///      accelerating only matmul relocates the bottleneck rather than removing it.
     address internal constant SWIGLU = address(0x102);
 
-    error PrecompileFailed();
+    /// @dev Carries the shape, because a block issues eight of these and a bare failure
+    ///      says nothing about which one.
+    error PrecompileFailed(uint256 rows, uint256 cols, uint256 inputLen, uint256 retLen);
     error UnexpectedOutputLength(uint256 got, uint256 want);
 
     /// @notice out[i] = sum_j W[i][j] * x[j], with W read from `weights` at `offset`
@@ -53,29 +55,35 @@ library TensorMatmul {
         // Layout: rows | cols | weights | offset | activations, big-endian throughout.
         // Built by hand rather than with abi.encodePacked so the activation loop writes
         // four bytes per element instead of allocating an intermediate per value.
-        bytes memory input = new bytes(32 + uint256(cols) * 8);
+        uint256 want = 32 + uint256(cols) * 8;
+        // Over-allocated by a word, then trimmed. Each activation is written with `mstore`,
+        // which stores thirty-two bytes, so writing an eight-byte value at a time zeroes the
+        // twenty-four bytes after it. Ascending order means every clobber is repaired by the
+        // next write except the last, whose overrun needs somewhere harmless to land — and
+        // without the slack that somewhere is whatever the allocator hands out next.
+        bytes memory input = new bytes(want + 32);
         assembly ("memory-safe") {
             let p := add(input, 0x20)
+            // Strictly ascending, because every `mstore` writes thirty-two bytes and so
+            // zeroes whatever follows the field being set. Writing `offset` before
+            // `weights` puts the address on top of it and sends every matmul to offset
+            // zero — which fails silently, since reading the wrong tensor is still a
+            // well-formed matmul.
             mstore(p, or(shl(224, rows), shl(192, cols)))
-            // address occupies [8..28); shifting it left by 32 bits places it there when
-            // written at p+8 as a full word, so write offset first and overlay the address
-            mstore(add(p, 28), shl(224, offset))
             mstore(add(p, 8), shl(96, weights))
-        }
-        // Written a word at a time through assembly rather than byte by byte: at these
-        // widths the loop runs once per activation and a contract does this on every
-        // projection of every layer.
-        assembly ("memory-safe") {
-            let dst := add(add(input, 0x20), 32)
+            mstore(add(p, 28), shl(224, offset))
+
+            let dst := add(p, 32)
             let src := add(x, 0x20)
             let n := mload(x)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                 mstore(add(dst, mul(i, 8)), shl(192, mload(add(src, shl(5, i)))))
             }
+            mstore(input, want)
         }
 
         (bool ok, bytes memory ret) = MATMUL.staticcall(input);
-        if (!ok) revert PrecompileFailed();
+        if (!ok) revert PrecompileFailed(rows, cols, input.length, ret.length);
         // A chain lacking the precompile returns success with empty data. Checking the
         // length turns that into a revert instead of a silently wrong forward pass.
         if (ret.length != uint256(rows) * 8) {
@@ -103,21 +111,31 @@ library TensorMatmul {
         uint256 n = gate.length;
         require(up.length == n, "gate and up must match");
 
-        bytes memory input = new bytes(4 + n * 16);
+        uint256 want = 4 + n * 16;
+        // Same over-allocate-and-trim as `matmul`, and here the hazard is sharper: the two
+        // vectors are adjacent, so an interleaved loop would have the last `gate` write land
+        // on the first three `up` values and zero them. Writing `gate` to completion first
+        // and `up` second means `up` repairs whatever `gate` overran, and only `up`'s own
+        // final overrun needs the slack.
+        bytes memory input = new bytes(want + 32);
         assembly ("memory-safe") {
             let p := add(input, 0x20)
             mstore(p, shl(224, n))
-            let g := add(gate, 0x20)
-            let u := add(up, 0x20)
             let dst := add(p, 4)
+            let g := add(gate, 0x20)
             for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                 mstore(add(dst, mul(i, 8)), shl(192, mload(add(g, shl(5, i)))))
-                mstore(add(add(dst, mul(n, 8)), mul(i, 8)), shl(192, mload(add(u, shl(5, i)))))
             }
+            let dst2 := add(dst, mul(n, 8))
+            let u := add(up, 0x20)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(add(dst2, mul(i, 8)), shl(192, mload(add(u, shl(5, i)))))
+            }
+            mstore(input, want)
         }
 
         (bool ok, bytes memory ret) = SWIGLU.staticcall(input);
-        if (!ok) revert PrecompileFailed();
+        if (!ok) revert PrecompileFailed(0, n, input.length, ret.length);
         if (ret.length != n * 8) revert UnexpectedOutputLength(ret.length, n * 8);
 
         out = new int256[](n);

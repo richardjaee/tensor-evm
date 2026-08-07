@@ -23,7 +23,13 @@ library FixedPoint {
     int256 internal constant LOG2E = 6196328018;
 
     /// @notice 1e-5 in Q32 — the RMSNorm epsilon used by llama2.c
-    int256 internal constant EPS = 42950;
+    int256 internal constant EPS_LLAMA = 42950;
+
+    /// @notice 1e-6 in Q32 — Qwen3's RMSNorm epsilon
+    /// @dev Not a universal constant. Models specify it, and Ops.rmsnorm takes it as an
+    ///      argument for that reason: a hardcoded value is where a chain and its reference
+    ///      quietly become two different models.
+    int256 internal constant EPS_QWEN3 = 4295;
 
     /// @notice Fractional bits consumed by the exp bit-product
     uint256 internal constant EXP_STEPS = 32;

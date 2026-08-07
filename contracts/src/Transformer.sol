@@ -31,6 +31,8 @@ library Transformer {
         uint32 nKv;
         uint32 headDim;
         uint32 seqLen;
+        /// @dev Q32, from the checkpoint. Qwen3 specifies 1e-6 where Llama specifies 1e-5.
+        int256 rmsEps;
     }
 
     /// @notice Byte offsets of one layer's tensors within the weight contract's code.
@@ -55,6 +57,28 @@ library Transformer {
         int256[] post;
     }
 
+    /// @notice Everything identifying one layer: its geometry, where its tensors live, and
+    ///         the norm weights that are vectors rather than matrices.
+    /// @dev Bundled because the EVM's stack, not gas, is what limits how a transformer
+    ///      block can be written. Passing these separately leaves `_attention` with eight
+    ///      parameters and no room for the values it computes, and `--via-ir` would compile
+    ///      it at a measured 2.2x the gas.
+    struct Block {
+        Config c;
+        Layer l;
+        Norms n;
+        address weights;
+    }
+
+    /// @notice Precomputed rotary tables, `seqLen * headDim/2` entries each.
+    /// @dev Bundled because the EVM's stack is the binding constraint on how a transformer
+    ///      block can be written: passing `cos` and `sin` separately costs two slots that
+    ///      `_attention` does not have.
+    struct RopeTable {
+        int256[] cos;
+        int256[] sin;
+    }
+
     /// @notice Keys and values for every position seen so far, for one layer.
     /// @dev Flat, indexed `[pos][kvWidth]`. This is the state that grows with generation
     ///      and dominates everything else at long context.
@@ -72,65 +96,91 @@ library Transformer {
     }
 
     /// @notice One transformer block, applied to the residual stream
-    /// @param weights Contract whose code holds this layer's quantised tensors
-    /// @param pos     Position in the sequence; the causal mask and the cache follow from it
-    /// @return x      The residual stream after the block
+    /// @param b   Geometry, tensor offsets, norm weights, and the weight contract
+    /// @param pos Position in the sequence; the causal mask and the cache follow from it
+    /// @param x   Residual stream in, Q32
+    /// @return    The residual stream after the block
+    ///
+    /// @dev Split into two halves not for tidiness but because the EVM's stack cannot hold
+    ///      a whole block at once. Nine parameters and a dozen live values exhaust it, and
+    ///      `--via-ir` would compile it at a measured 2.2x the gas.
     function forwardLayer(
-        Config memory c,
-        Layer memory l,
-        Norms memory n,
-        address weights,
+        Block memory b,
         Kv memory kv,
-        int256[] memory cos,
-        int256[] memory sin,
+        RopeTable memory rope,
         uint256 pos,
         int256[] memory x
     ) internal view returns (int256[] memory) {
-        uint256 hs = c.headDim;
-        uint256 qw = qWidth(c);
-        uint256 kvw = kvWidth(c);
-
-        // ---- attention ----
-        int256[] memory normed = Ops.rmsnorm(x, n.input);
-        int256[] memory q = TensorMatmul.matmul(uint32(qw), c.dim, weights, l.q, normed);
-        int256[] memory k = TensorMatmul.matmul(uint32(kvw), c.dim, weights, l.k, normed);
-        int256[] memory v = TensorMatmul.matmul(uint32(kvw), c.dim, weights, l.v, normed);
-
-        // QK-norm before rotary, not after. Normalising a rotated vector rescales its
-        // components unequally and destroys the angle the embedding encodes.
-        _normAndRotate(q, c.nHeads, hs, n.qNorm, cos, sin, pos);
-        _normAndRotate(k, c.nKv, hs, n.kNorm, cos, sin, pos);
-
-        _store(kv, kvw, pos, k, v);
-
-        int256[] memory attn = _attend(c, kv, q, pos);
-        int256[] memory proj = TensorMatmul.matmul(c.dim, uint32(qw), weights, l.o, attn);
-        for (uint256 i = 0; i < c.dim; ++i) {
-            x[i] += proj[i];
-        }
-
-        // ---- feed-forward ----
-        normed = Ops.rmsnorm(x, n.post);
-        int256[] memory g = TensorMatmul.matmul(c.hidden, c.dim, weights, l.gate, normed);
-        int256[] memory u = TensorMatmul.matmul(c.hidden, c.dim, weights, l.up, normed);
-        proj = TensorMatmul.matmul(c.dim, c.hidden, weights, l.down, TensorMatmul.swiglu(g, u));
-        for (uint256 i = 0; i < c.dim; ++i) {
-            x[i] += proj[i];
-        }
+        _attention(b, kv, rope, pos, x);
+        _feedForward(b, x);
         return x;
     }
 
-    /// @dev Split out because Solidity's stack cannot hold the whole block at once. The
-    ///      per-head slice is normalised into a temporary and copied back, since RMSNorm
-    ///      reads every element before writing any.
+    /// @dev Writes its projection back into `x`, so the residual add happens here rather
+    ///      than returning a vector the caller has to fold in.
+    function _attention(
+        Block memory b,
+        Kv memory kv,
+        RopeTable memory rope,
+        uint256 pos,
+        int256[] memory x
+    ) private view {
+        Config memory c = b.c;
+        int256[] memory normed = Ops.rmsnorm(x, b.n.input, c.rmsEps);
+        _extendCache(b, kv, rope, pos, normed);
+
+        int256[] memory q =
+            TensorMatmul.matmul(uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
+        // QK-norm before rotary, not after. Normalising a rotated vector rescales its
+        // components unequally and destroys the angle the embedding encodes.
+        _normAndRotate(q, c.nHeads, c.headDim, b.n.qNorm, rope, pos, c.rmsEps);
+
+        int256[] memory proj =
+            TensorMatmul.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, _attend(c, kv, q, pos));
+        for (uint256 i = 0; i < c.dim; ++i) {
+            x[i] += proj[i];
+        }
+    }
+
+    /// @dev Keys and values, normalised, rotated, and appended to the cache. Its own
+    ///      function because holding `k` and `v` alive alongside the rest of a block
+    ///      exhausts the EVM's stack.
+    function _extendCache(
+        Block memory b,
+        Kv memory kv,
+        RopeTable memory rope,
+        uint256 pos,
+        int256[] memory normed
+    ) private view {
+        uint32 kvw = uint32(kvWidth(b.c));
+        int256[] memory k = TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.k, normed);
+        _normAndRotate(k, b.c.nKv, b.c.headDim, b.n.kNorm, rope, pos, b.c.rmsEps);
+        _store(kv, kvw, pos, k, TensorMatmul.matmul(kvw, b.c.dim, b.weights, b.l.v, normed));
+    }
+
+    function _feedForward(Block memory b, int256[] memory x) private view {
+        int256[] memory normed = Ops.rmsnorm(x, b.n.post, b.c.rmsEps);
+        int256[] memory gated = TensorMatmul.swiglu(
+            TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.gate, normed),
+            TensorMatmul.matmul(b.c.hidden, b.c.dim, b.weights, b.l.up, normed)
+        );
+        int256[] memory proj =
+            TensorMatmul.matmul(b.c.dim, b.c.hidden, b.weights, b.l.down, gated);
+        for (uint256 i = 0; i < b.c.dim; ++i) {
+            x[i] += proj[i];
+        }
+    }
+
+    /// @dev The per-head slice is normalised into a temporary and copied back, since
+    ///      RMSNorm reads every element before writing any.
     function _normAndRotate(
         int256[] memory vec,
         uint256 heads,
         uint256 hs,
         int256[] memory weight,
-        int256[] memory cos,
-        int256[] memory sin,
-        uint256 pos
+        RopeTable memory rope,
+        uint256 pos,
+        int256 eps
     ) private pure {
         uint256 half = hs / 2;
         int256[] memory head = new int256[](hs);
@@ -139,11 +189,11 @@ library Transformer {
             for (uint256 j = 0; j < hs; ++j) {
                 head[j] = vec[off + j];
             }
-            int256[] memory nrm = Ops.rmsnorm(head, weight);
+            int256[] memory nrm = Ops.rmsnorm(head, weight, eps);
             for (uint256 j = 0; j < hs; ++j) {
                 vec[off + j] = nrm[j];
             }
-            Ops.rope(vec, off, hs, cos, sin, pos * half);
+            Ops.rope(vec, off, hs, rope.cos, rope.sin, pos * half);
         }
     }
 
