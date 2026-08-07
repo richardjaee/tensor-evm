@@ -245,6 +245,46 @@ pub fn forward_layer(
     add_into(x, &s.proj);
 }
 
+/// A whole model: the layers, the final norm, and the classifier.
+///
+/// The embedding is not here. It is a lookup rather than a multiply — a token id selects a
+/// row — so it carries no weight matrix for the quantiser's row scales to ride along with,
+/// and callers supply the row directly.
+pub struct Model<'a> {
+    pub cfg: Config,
+    pub layers: Vec<LayerWeights<'a>>,
+    pub final_norm: &'a [i64],
+    pub lm_head: QTensor<'a>,
+}
+
+impl Model<'_> {
+    /// Runs one token and returns logits over the vocabulary.
+    ///
+    /// `x` is the embedding row for this token, in Q32, consumed as the initial residual
+    /// stream. The caller advances `pos`; the cache and the causal mask follow from it.
+    pub fn forward(
+        &self,
+        rope: &Rope,
+        kv: &mut KvCache,
+        s: &mut Scratch,
+        pos: usize,
+        x: &mut [i64],
+        logits: &mut [i64],
+    ) {
+        assert_eq!(x.len(), self.cfg.dim, "residual width");
+        assert_eq!(logits.len(), self.lm_head.rows, "logit width");
+
+        for (l, w) in self.layers.iter().enumerate() {
+            forward_layer(&self.cfg, w, rope, kv, s, l, pos, x);
+        }
+
+        // Normalise into scratch rather than in place: the residual stream is the caller's,
+        // and a generation loop needs it intact to embed the next token against.
+        rmsnorm(x, self.final_norm, &mut s.normed);
+        self.lm_head.apply(&s.normed, logits);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
