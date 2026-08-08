@@ -61,13 +61,6 @@ contract LayerRunner {
         Inputs calldata i,
         uint256[] memory gas
     ) private view returns (bytes memory) {
-        Transformer.Norms memory n = Transformer.Norms({
-            input: Tensor.pack(_copy(i.inputNorm)),
-            qNorm: Tensor.pack(_copy(i.qNorm)),
-            kNorm: Tensor.pack(_copy(i.kNorm)),
-            post: Tensor.pack(_copy(i.postNorm))
-        });
-
         // The cache holds exactly the positions this call writes. A generation loop carries
         // it between calls; measuring one block does not need to, and pretending otherwise
         // would hide the cache's cost rather than reveal it.
@@ -84,7 +77,6 @@ contract LayerRunner {
             Transformer.Block({
                 c: c,
                 l: l,
-                n: n,
                 s: scratch,
                 p: Transformer.Profile({gas: gas, at: 0})
             }),

@@ -51,14 +51,14 @@ library Transformer {
         uint32 gate;
         uint32 up;
         uint32 down;
-    }
-
-    /// @notice Norm weights, packed once by the caller rather than per layer.
-    struct Norms {
-        bytes input;
-        bytes qNorm;
-        bytes kNorm;
-        bytes post;
+        /// @dev Norm weights live in the same blob as the tensors. They were calldata until
+        ///      measurement showed twenty-eight layers' worth is 523KB a call — about 21M
+        ///      gas of a 116M token, spent re-sending values that never change. They are
+        ///      model weights and belong where the rest of the model is.
+        uint32 inputNorm;
+        uint32 qNorm;
+        uint32 kNorm;
+        uint32 postNorm;
     }
 
     /// @notice Rotary tables for this position only, sliced by the caller so that nothing
@@ -80,7 +80,6 @@ library Transformer {
     struct Block {
         Config c;
         Layer l;
-        Norms n;
         /// @dev One buffer, reused for every call's input. Memory is never freed and is
         ///      priced quadratically, so a fresh allocation per call cost 662,544 gas of
         ///      expansion for buffers dead the moment they were read.
@@ -110,6 +109,38 @@ library Transformer {
     ///      values on a stack that has no room for them.
     function scratchBytes(Config memory c, uint256 cacheDepth) internal pure returns (uint256) {
         return Tensor.scratchFor(c.dim, c.hidden, qWidth(c), cacheDepth);
+    }
+
+    /// @dev Its own function because assembling the argument bundle alongside everything
+    ///      `_attention` already holds exhausts the stack.
+    function _normRope(
+        Block memory b,
+        RopeTable memory rope,
+        bytes memory vec,
+        uint32 heads,
+        uint32 offset
+    ) private view returns (bytes memory) {
+        return Tensor.normRope(
+            b.s,
+            heads,
+            b.c.headDim,
+            b.c.rmsEps,
+            Tensor.NormRopeArgs({
+                weight: _norm(b.l.at, offset, b.c.headDim),
+                cos: rope.cos,
+                sin: rope.sin,
+                vec: vec
+            })
+        );
+    }
+
+    /// @dev A Q32 vector read straight out of contract code. Three gas a word against
+    ///      sixteen a byte for calldata, and the values are identical every call.
+    function _norm(address at, uint32 offset, uint256 n) private view returns (bytes memory out) {
+        out = new bytes(n * 8);
+        assembly ("memory-safe") {
+            extcodecopy(at, add(out, 0x20), offset, mul(n, 8))
+        }
     }
 
     function _mark(Block memory b, uint256 before) private view {
@@ -142,7 +173,7 @@ library Transformer {
         Config memory c = b.c;
 
         uint256 g = gasleft();
-        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, b.n.input, x);
+        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, _norm(b.l.at, b.l.inputNorm, b.c.dim), x);
         _mark(b, g);
 
         g = gasleft();
@@ -156,13 +187,7 @@ library Transformer {
         // QK-norm before rotary, not after. Normalising a rotated vector rescales its
         // components unequally and destroys the angle the embedding encodes.
         g = gasleft();
-        q = Tensor.normRope(
-            b.s,
-            c.nHeads,
-            c.headDim,
-            c.rmsEps,
-            Tensor.NormRopeArgs({weight: b.n.qNorm, cos: rope.cos, sin: rope.sin, vec: q})
-        );
+        q = _normRope(b, rope, q, c.nHeads, b.l.qNorm);
         _mark(b, g);
 
         _attendAndProject(b, kv, q, pos, x);
@@ -212,13 +237,7 @@ library Transformer {
         uint32 kvw = uint32(kvWidth(c));
 
         bytes memory k = Tensor.matmul(b.s, kvw, c.dim, b.l.at, b.l.k, normed);
-        k = Tensor.normRope(
-            b.s,
-            c.nKv,
-            c.headDim,
-            c.rmsEps,
-            Tensor.NormRopeArgs({weight: b.n.kNorm, cos: rope.cos, sin: rope.sin, vec: k})
-        );
+        k = _normRope(b, rope, k, b.c.nKv, b.l.kNorm);
         bytes memory v = Tensor.matmul(b.s, kvw, c.dim, b.l.at, b.l.v, normed);
 
         uint256 at = pos * uint256(kvw) * 8;
@@ -234,7 +253,7 @@ library Transformer {
         Config memory c = b.c;
 
         uint256 g = gasleft();
-        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, b.n.post, x);
+        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, _norm(b.l.at, b.l.postNorm, b.c.dim), x);
         _mark(b, g);
 
         g = gasleft();

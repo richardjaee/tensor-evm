@@ -138,19 +138,6 @@ fn bytes_tuple(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// A dynamic array of dynamic tuples: length, then one offset each, then the encodings.
-fn tuple_array(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = word(items.len() as u64).to_vec();
-    let mut at = items.len() * 32;
-    for it in items {
-        out.extend_from_slice(&word(at as u64));
-        at += it.len();
-    }
-    for it in items {
-        out.extend_from_slice(it);
-    }
-    out
-}
 
 fn main() {
     let dir: PathBuf = std::env::args()
@@ -213,8 +200,8 @@ fn main() {
         ("up", hidden, dim),
         ("down", dim, hidden),
     ];
-    let mut offsets = vec![[0u64; 7]; n_layers];
-    let mut norms = Vec::with_capacity(n_layers);
+    // Seven tensors, then four norm vectors, all in one blob per layer.
+    let mut offsets = vec![[0u64; 11]; n_layers];
     for (l, off) in offsets.iter_mut().enumerate() {
         let mut blob = Vec::new();
         for (i, (name, rows, cols)) in shapes.iter().enumerate() {
@@ -223,6 +210,17 @@ fn main() {
             off[i] = blob.len() as u64;
             blob.extend_from_slice(&raw);
         }
+        // The four norm vectors follow the seven tensors in the same blob, so a layer is
+        // one deployment and one address rather than weights on chain and norms in
+        // calldata.
+        for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
+            .iter()
+            .enumerate()
+        {
+            let v = packed(&read_i64(&dir, &format!("l{l}_{name}.bin")));
+            off[7 + j] = blob.len() as u64;
+            blob.extend_from_slice(&v);
+        }
         db.insert_account_info(
             layer_addr(l),
             AccountInfo {
@@ -230,12 +228,6 @@ fn main() {
                 ..Default::default()
             },
         );
-        norms.push(bytes_tuple(&[
-            &packed(&read_i64(&dir, &format!("l{l}_input_norm.bin"))),
-            &packed(&read_i64(&dir, &format!("l{l}_q_norm.bin"))),
-            &packed(&read_i64(&dir, &format!("l{l}_k_norm.bin"))),
-            &packed(&read_i64(&dir, &format!("l{l}_post_norm.bin"))),
-        ]));
     }
     db.insert_account_info(
         HEAD,
@@ -310,22 +302,20 @@ fn main() {
                 layers.extend_from_slice(&word(*o));
             }
         }
-        let norms_enc = tuple_array(&norms);
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
 
-        let head = 11 * 32;
+        // Config's eight words, then offsets to the layer array and the rotary tables.
+        let head = 10 * 32;
         m.extend_from_slice(&word(head as u64));
         m.extend_from_slice(&word((head + layers.len()) as u64));
-        m.extend_from_slice(&word((head + layers.len() + norms_enc.len()) as u64));
         m.extend_from_slice(&layers);
-        m.extend_from_slice(&norms_enc);
         m.extend_from_slice(&rope);
         m
     };
 
     let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes,bytes,bytes)[],\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
 (bytes,bytes)),uint16)";
 
     println!(
