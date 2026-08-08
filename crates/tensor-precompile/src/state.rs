@@ -144,6 +144,11 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
             crate::attention::attention(),
             crate::attention::rmsnorm(),
             Precompile::new(
+                PrecompileId::Custom("tensor-classify".into()),
+                crate::classify::CLASSIFY_ADDRESS,
+                unreachable_stub,
+            ),
+            Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,
                 unreachable_stub,
@@ -173,6 +178,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        if inputs.bytecode_address == crate::classify::CLASSIFY_ADDRESS {
+            return run_classify(context, inputs);
+        }
         if inputs.bytecode_address != MATMUL_STATE_ADDRESS {
             return PrecompileProvider::<CTX>::run(&mut self.inner, context, inputs);
         }
@@ -302,6 +310,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
 
     fn contains(&self, address: &Address) -> bool {
         *address == MATMUL_STATE_ADDRESS
+            || *address == crate::classify::CLASSIFY_ADDRESS
             || PrecompileProvider::<CTX>::contains(&self.inner, address)
     }
 }
@@ -336,4 +345,67 @@ pub fn weight_blob(rows: usize, cols: usize, scales: &[i8], weights: &[i16]) -> 
         v.extend_from_slice(&w.to_be_bytes());
     }
     v
+}
+
+/// The classifier reads its weights from state like the matmul does, and returns
+/// only the winning row — a 151,936-entry logit vector is 1.2MB that the caller
+/// would discard all but one of.
+fn run_classify<CTX: ContextTr>(
+    context: &mut CTX,
+    inputs: &CallInputs,
+) -> Result<Option<InterpreterResult>, String> {
+    let gas_limit = inputs.gas_limit;
+    let input = inputs.input.as_bytes(context).to_vec();
+    if input.len() < 32 {
+        return Ok(Some(revert(gas_limit)));
+    }
+    let rows = u32::from_be_bytes(input[0..4].try_into().unwrap()) as u64;
+    let cols = u32::from_be_bytes(input[4..8].try_into().unwrap()) as u64;
+    let at = Address::from_slice(&input[8..28]);
+    let offset = u32::from_be_bytes(input[28..32].try_into().unwrap()) as usize;
+
+    if rows == 0 || cols == 0 || cols > MAX_DIM || rows > (1 << 24) {
+        return Ok(Some(revert(gas_limit)));
+    }
+    let Some(compute) = crate::classify::gas_cost(rows, cols) else {
+        return Ok(Some(revert(gas_limit)));
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Some(oog(gas_limit)));
+    }
+
+    let cols_u = cols as usize;
+    if input.len() != 32 + cols_u * 8 {
+        return Ok(Some(revert(gas_limit)));
+    }
+    let x: Vec<i64> = input[32..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let loaded = context
+        .journal_mut()
+        .code(at)
+        .map_err(|_| "failed to load classifier weights".to_string())?;
+    let access = if loaded.is_cold {
+        COLD_ACCOUNT_GAS
+    } else {
+        WARM_ACCOUNT_GAS
+    };
+    let code = loaded.data;
+
+    let Some((row, logit)) = crate::classify::classify(&code, offset, rows as usize, cols_u, &x)
+    else {
+        return Ok(Some(revert(gas_limit)));
+    };
+
+    let mut gas = Gas::new(gas_limit);
+    if !gas.record_regular_cost(compute + access) {
+        return Ok(Some(oog(gas_limit)));
+    }
+    Ok(Some(InterpreterResult::new(
+        InstructionResult::Return,
+        crate::classify::pack(row, logit),
+        gas,
+    )))
 }

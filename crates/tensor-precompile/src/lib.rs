@@ -327,3 +327,5 @@ pub mod activation;
 pub mod norm;
 
 pub mod attention;
+
+pub mod classify;
