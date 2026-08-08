@@ -22,7 +22,6 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::{activations_in_range, MAX_ABS_ACTIVATION};
 
 use crate::{BASE_GAS, MACS_PER_GAS, MAX_DIM};
 
@@ -128,17 +127,9 @@ pub fn classify_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Prec
         return bad_input(reservoir);
     }
 
-    let x: Vec<i64> = input[HEADER..]
-        .chunks_exact(8)
-        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
-        .collect();
-    if !activations_in_range(&x) {
-        return bad_input(reservoir);
-    }
-
-    // The weights are read from chain state by the provider, which is the only thing that
-    // can reach it; this entry point exists so the arithmetic can be tested on its own.
-    let _ = MAX_ABS_ACTIVATION;
+    // The weights live in chain state, which only the provider can reach. This entry point
+    // exists so the address is a member of the precompile set — membership is what makes
+    // the interpreter treat it as one — and the provider intercepts it before this runs.
     bad_input(reservoir)
 }
 

@@ -29,9 +29,15 @@ library KvStore {
     ///      into memory and return it, so the payload becomes the deployed code. A leading
     ///      `00` byte is prepended so the code can never be executed as a function —
     ///      `STOP` is the first instruction anything reaching it would run.
+    ///      The prologue is twelve bytes and `CODECOPY` reads from offset twelve, which is
+    ///      where the trailing `00` sits. Those two numbers have to agree: the usual
+    ///      SSTORE2 prologue uses `PUSH4` for the length and copies from fourteen, and
+    ///      shortening it to `PUSH2` without moving the offset deploys code that begins two
+    ///      bytes early. That failure is invisible until something reads a blob back, which
+    ///      at position zero never happens — the cache is written after it is read.
     function write(bytes memory data) internal returns (address ptr) {
         bytes memory init = abi.encodePacked(
-            hex"61", uint16(data.length + 1), hex"80600a6000396000f300", data
+            hex"61", uint16(data.length + 1), hex"80600c6000396000f300", data
         );
         assembly ("memory-safe") {
             ptr := create(0, add(init, 0x20), mload(init))

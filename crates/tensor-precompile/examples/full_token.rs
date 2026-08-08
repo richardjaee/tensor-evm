@@ -54,13 +54,6 @@ fn read_i64(dir: &Path, name: &str) -> Vec<i64> {
         .collect()
 }
 
-fn read_f64(dir: &Path, name: &str) -> Vec<f64> {
-    read(dir, name)
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
-        .collect()
-}
-
 fn meta(s: &str, key: &str) -> usize {
     let at = s
         .find(&format!("\"{key}\":"))
@@ -257,13 +250,13 @@ fn main() {
     let embed = read_i64(&dir, "embed.bin");
     let cos = read_i64(&dir, "cos.bin");
     let sin = read_i64(&dir, "sin.bin");
-    let expected = read_f64(&dir, "logits.bin");
-    let want_token = expected
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite"))
-        .map(|(i, _)| i)
-        .expect("non-empty");
+    // The argmax float64 produces at every position, not only the last. A chain that
+    // reached the right final token by a wrong path would be indistinguishable otherwise.
+    let expect: Vec<u32> = read(&dir, "tokens.bin")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+        .collect();
+    assert_eq!(expect.len(), positions, "one expected token per position");
 
     // ---- driving it ----
     let mut nonce = 0u64;
@@ -317,7 +310,7 @@ fn main() {
                 layers.extend_from_slice(&word(*o));
             }
         }
-        let norms_enc = tuple_array(&vec![norms[0].clone(); n_layers]);
+        let norms_enc = tuple_array(&norms);
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
 
@@ -335,8 +328,11 @@ fn main() {
 (address,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes,bytes,bytes)[],\
 (bytes,bytes)),uint16)";
 
-    println!("{:<10} {:>14} {:>10}", "position", "gas", "token");
-    println!("{}", "-".repeat(38));
+    println!(
+        "{:<10} {:>14} {:>10} {:>10}",
+        "position", "gas", "token", "expected"
+    );
+    println!("{}", "-".repeat(48));
 
     let mut got_token = 0u32;
     for pos in 0..positions {
@@ -388,17 +384,24 @@ fn main() {
         total_gas += used;
 
         got_token = u32::from_be_bytes(ret[28..32].try_into().expect("token word"));
-        println!("{pos:<10} {used:>14} {got_token:>10}");
+        let want = expect[pos];
+        println!(
+            "{pos:<10} {used:>14} {got_token:>10} {want:>10}{}",
+            if got_token == want {
+                ""
+            } else {
+                "   <-- differs"
+            }
+        );
+        assert_eq!(got_token, want, "position {pos} produced the wrong token");
     }
 
-    println!("\n{:<26} {:>12}", "total gas, all positions", total_gas);
-    println!("{:<26} {:>12}", "token the chain emitted", got_token);
-    println!("{:<26} {:>12}", "token float64 expects", want_token);
-
-    if got_token as usize == want_token {
-        println!("\nthe chain produced the model's token");
-    } else {
-        eprintln!("\nthe chain and float64 disagree on the token");
-        std::process::exit(1);
-    }
+    println!("\n{:<30} {:>14}", "total gas, all positions", total_gas);
+    println!(
+        "{:<30} {:>14}",
+        "gas per token",
+        total_gas / positions as u64
+    );
+    println!("\nevery position matched float64's argmax");
+    let _ = got_token;
 }

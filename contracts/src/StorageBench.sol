@@ -43,4 +43,14 @@ contract StorageBench {
         KvStore.read(_ptr, len);
         used = g - gasleft();
     }
+
+    /// @notice Write then read, returning what came back
+    /// @dev The round trip, not the two halves. A prologue whose `CODECOPY` offset
+    ///      disagrees with its own length deploys code shifted by a few bytes, which no
+    ///      write-only check can see — and in a key/value cache the first read happens one
+    ///      position after the first write, so it stays hidden for a whole forward pass.
+    function roundTrip(bytes calldata data) external returns (bytes memory) {
+        _ptr = KvStore.write(data);
+        return KvStore.read(_ptr, data.length);
+    }
 }

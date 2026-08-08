@@ -26,7 +26,6 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::activations_in_range;
 use tensor_kernel::fixed::{isqrt, F};
 
 use crate::{BASE_GAS, MAX_DIM};
@@ -124,13 +123,6 @@ pub fn norm_rope_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Pre
     // scale factor rather than an activation, and Qwen3's `k_norm` reaches 96.5 — six times
     // the activation bound — so checking it as one would refuse the real model.
     //
-    // Nothing here overflows either way, since every product is formed in `i128`. The bound
-    // exists for the matmul kernel alone, which sums in `i64` within a chunk. That is also
-    // why this precompile's *output* is not bounded and need not be: it feeds attention,
-    // not a matmul.
-    if !activations_in_range(&vec) {
-        return bad_input(reservoir);
-    }
 
     for h in 0..heads {
         let seg = &mut vec[h * hs..(h + 1) * hs];
@@ -228,18 +220,16 @@ mod tests {
             .collect()
     }
 
-    /// Norm weights are scale factors rather than activations, and are deliberately not
-    /// bounded. Real ones are large — Qwen3's `k_norm` peaks at 96.5 and its `post_norm` at
-    /// 192 — and nothing here overflows regardless, because every product is formed in
-    /// `i128`. The weight is checked well past the activation bound rather than just past
-    /// any particular checkpoint's values, so raising that bound cannot quietly turn this
-    /// into a test of nothing.
+    /// Real norm weights are large — Qwen3's `k_norm` peaks at 96.5 and its `post_norm` at
+    /// 192 — and this must accept them, along with anything else a checkpoint contains.
+    /// Every product is formed in `i128`, so there is nothing to overflow and nothing to
+    /// bound. The value here is far past any plausible weight, so a future bound
+    /// reintroduced anywhere in the stack would fail this rather than pass it quietly.
     #[test]
-    fn accepts_norm_weights_beyond_the_activation_bound() {
+    fn accepts_norm_weights_of_any_magnitude() {
         let (heads, hs) = (2usize, 8usize);
         let half = hs / 2;
-        let big = tensor_kernel::MAX_ABS_ACTIVATION.saturating_mul(4);
-        assert!(big > tensor_kernel::MAX_ABS_ACTIVATION);
+        let big = 1i64 << 50;
 
         let weight = vec![big; hs];
         let out = norm_rope_precompile(

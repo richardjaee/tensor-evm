@@ -126,6 +126,7 @@ def main():
     # ---- float64 reference ----
     print("  running float64 reference...")
     group = H // KV
+    per_position = []
     kc = [[] for _ in range(L)]
     vc = [[] for _ in range(L)]
     logits = None
@@ -179,10 +180,17 @@ def main():
             up = g(pre + "mlp.up_proj.weight") @ n
             h = h + g(pre + "mlp.down_proj.weight") @ ((gt / (1.0 + np.exp(-gt))) * up)
             x = h
+        # Every position, not just the last. A chain that emits the right final token
+        # having taken a wrong path to it would look identical from the outside, and only
+        # per-position tokens distinguish the two.
+        lg = head @ rmsnorm(x, g("model.norm.weight"), eps)
+        per_position.append(int(np.argmax(lg)))
         if p_ix == P - 1:
-            logits = head @ rmsnorm(x, g("model.norm.weight"), eps)
+            logits = lg
 
     write("logits.bin", logits.astype(np.float64).tobytes())
+    write("tokens.bin", np.asarray(per_position, dtype="<u4").tobytes())
+    print(f"  argmax per position: {per_position}")
 
     top = np.argsort(logits)[::-1][:10]
     print(f"\n  top tokens by float64 logit:")

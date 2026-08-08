@@ -18,16 +18,20 @@
 //! four bytes per activation and nothing per weight, and activations are a vanishing
 //! fraction of what a forward pass reads.
 //!
-//! Products are formed in `i64` and accumulated in `i128`, which is not the same as doing
-//! both at the wider width. An unbounded `i64` activation times an `i16` weight reaches 79
-//! bits and would wrap — on a chain that is a soundness failure, not a precision one — so
-//! activations are bounded by [`MAX_ABS_ACTIVATION`] and the bound is checked once per
-//! call, in `O(cols)`, against `O(rows * cols)` of arithmetic. Within it every product fits
-//! `i64` comfortably, while the running sum still needs `i128` because `cols` of them do
-//! not.
+//! Products and sums are both formed in `i128`, and no bound is placed on activations.
 //!
-//! The split matters: forming products in `i128` costs a little over half the kernel's
-//! throughput, and the bound recovers it without giving up soundness.
+//! An earlier version formed products in `i64` and only widened the running sum, which is
+//! faster because it vectorises, and required activations to stay under a bound so the
+//! product could not wrap. That bound was wrong three times. Qwen3's `k_norm` scales keys
+//! by 96.5; its `post_norm` reaches 192; and its residual stream — the thing every matmul
+//! consumes — peaks near 7,000 by the third layer, because the model genuinely has massive
+//! activations. At that magnitude a single `i16 * i64` product already exceeds `i64`, so
+//! there is no bound that both admits the real model and permits the optimisation.
+//!
+//! `i128` throughout costs roughly a quarter of the throughput and removes the whole class
+//! of failure. It is worth it: the kernel's gas is 18,712 of a layer's 688,198, so its
+//! speed barely moves the number this project is measured by, while a wrapped accumulator
+//! would be a consensus failure rather than a slow one.
 //!
 //! This mirrors the representation used by the Solidity implementation it is meant to
 //! replace, so outputs can be compared directly rather than approximately.
@@ -52,50 +56,6 @@ use rayon::prelude::*;
 /// more than a thousand percent. Only checking against float64 truth exposed it.
 pub const Q: u32 = 32;
 
-/// Largest activation magnitude **the matmul** accepts.
-///
-/// `2^36` in Q32 is a real value of 16. The bound exists for one reason and applies in one
-/// place: this kernel sums products in `i64` within a chunk, and an unbounded operand would
-/// wrap. See [`CHUNK`].
-///
-/// It is emphatically not a claim that every value in a transformer is small — a claim this
-/// project has now had to abandon three times. Qwen3's `k_norm` scales queries and keys by
-/// up to 96.5; its `input_norm` reaches 69.5 by layer 27 and its `post_norm` reaches 192.
-/// A normalised vector multiplied by those is nowhere near unit scale, and every earlier
-/// bound here was set by looking at layer 0 and generalising.
-///
-/// `2^44` is a real value of 4096, chosen against the largest norm weight in the checkpoint
-/// times the spread of a normalised vector, with room to spare. It is deliberately loose:
-/// the bound exists to keep `i64` from wrapping, not to express a belief about magnitudes.
-pub const MAX_ABS_ACTIVATION: i64 = 1 << 44;
-
-/// Products summed per `i64` accumulator before widening.
-///
-/// Derived from [`MAX_ABS_ACTIVATION`] rather than chosen, so the two cannot drift apart. A
-/// weight is at most `2^15` and an activation at most `2^44`, so each product is at most
-/// `2^59` and `2^4` of them reach `2^63` — the chunk takes one bit less than that.
-///
-/// Chunking exists because of what the alternative costs. Accumulating every product
-/// directly into an `i128` is correct and defeats auto-vectorisation, which measured as
-/// less than half the kernel's throughput. Summing within a chunk at `i64` keeps the hot
-/// loop vectorisable, and only the chunk totals are widened.
-///
-/// Raising the activation bound narrows the chunk, which is a real cost paid for
-/// correctness on real weights: at `2^44` the chunk is sixteen rather than two thousand.
-const CHUNK: usize = {
-    let bits = 63 - 15 - MAX_ABS_ACTIVATION.trailing_zeros() as usize - 1;
-    1 << bits
-};
-
-/// Whether every activation is inside [`MAX_ABS_ACTIVATION`].
-///
-/// Checked once per call rather than per product: this is `O(cols)` against `O(rows*cols)`
-/// of arithmetic, so it does not show up in the measurements.
-pub fn activations_in_range(x: &[i64]) -> bool {
-    x.iter()
-        .all(|v| *v >= -MAX_ABS_ACTIVATION && *v <= MAX_ABS_ACTIVATION)
-}
-
 /// One row's dot product against `x`.
 ///
 /// Split out because it is the unit of parallelism. Every output row reads the same
@@ -106,16 +66,11 @@ pub fn activations_in_range(x: &[i64]) -> bool {
 fn dot(w_row: &[i16], x: &[i64]) -> i128 {
     debug_assert_eq!(w_row.len(), x.len());
     let mut acc: i128 = 0;
-    for (wc, xc) in w_row.chunks(CHUNK).zip(x.chunks(CHUNK)) {
-        let mut part: i64 = 0;
-        for i in 0..wc.len() {
-            // Both the product and this partial sum stay in `i64` by construction, which
-            // is what lets the compiler vectorise the loop. Callers guarantee the bound
-            // through `activations_in_range`.
-            debug_assert!(xc[i].unsigned_abs() <= MAX_ABS_ACTIVATION as u64);
-            part += (wc[i] as i64) * xc[i];
-        }
-        acc += part as i128;
+    for i in 0..w_row.len() {
+        // Widened before the multiply. The residual stream of a real model reaches
+        // magnitudes where an `i64` product wraps, and a wrapped accumulator on a chain is
+        // a consensus failure rather than a rounding error.
+        acc += (w_row[i] as i128) * (x[i] as i128);
     }
     acc
 }
@@ -229,11 +184,12 @@ pub fn swiglu_vec(gate: &mut [i64], up: &[i64]) {
 mod tests {
     use super::*;
 
-    /// The chunked accumulator must not depend on where the chunk boundaries fall.
+    /// Accumulation must not depend on width. This guarded chunk boundaries when the
+    /// kernel batched into `i64`; it still earns its place as a check that the reference
+    /// and the kernel agree across awkward lengths.
     #[test]
-    fn chunk_boundaries_do_not_change_the_result() {
-        // Straddling one, two, and several chunks, plus a length that is not a multiple.
-        for cols in [CHUNK - 1, CHUNK, CHUNK + 1, CHUNK * 3 + 7] {
+    fn accumulation_is_width_independent() {
+        for cols in [1usize, 2, 63, 64, 65, 2047, 2048, 6151] {
             let rows = 3usize;
             let w = fill(rows * cols, 3);
             let scales = vec![20i8; rows];
@@ -255,17 +211,25 @@ mod tests {
         }
     }
 
+    /// The magnitudes a real model actually reaches. Qwen3's residual stream peaks near
+    /// 7,000 by its third layer, which is where every bound this kernel used to impose came
+    /// apart — so the property worth testing is that no bound is left to exceed.
     #[test]
-    fn the_activation_bound_is_enforceable() {
-        assert!(activations_in_range(&[
-            0,
-            MAX_ABS_ACTIVATION,
-            -MAX_ABS_ACTIVATION
-        ]));
-        assert!(!activations_in_range(&[MAX_ABS_ACTIVATION + 1]));
-        // The bound must keep a full chunk of worst-case products inside i64.
-        let worst = (i16::MIN as i128).unsigned_abs() * MAX_ABS_ACTIVATION as u128 * CHUNK as u128;
-        assert!(worst < i64::MAX as u128, "chunk can overflow: {worst}");
+    fn survives_the_magnitudes_a_real_model_reaches() {
+        let cols = 1024usize;
+        let w = vec![i16::MAX; cols];
+        let big = (7000.0 * (1u64 << 32) as f64) as i64;
+        let x = vec![big; cols];
+        let mut out = vec![0i64; 1];
+        matmul_scalar(&w, &[40], &x, 1, cols, &mut out);
+
+        // Computed independently at full width, so this checks the specification rather
+        // than the implementation restating itself.
+        let want = ((i16::MAX as i128) * (big as i128) * (cols as i128)) >> 40;
+        assert_eq!(
+            out[0] as i128,
+            want.clamp(i64::MIN as i128, i64::MAX as i128)
+        );
     }
 
     /// Deterministic filler. Not random, so a failure is reproducible from the test name
@@ -337,7 +301,7 @@ mod tests {
         let (rows, cols) = (1, 4096);
         let w = vec![i16::MIN; cols];
         let scales = vec![-40i8; rows]; // negative shift scales the accumulator up
-        let x = vec![MAX_ABS_ACTIVATION; cols];
+        let x = vec![i64::MAX / 4; cols];
 
         let mut out = vec![0i64; rows];
         matmul_scalar(&w, &scales, &x, rows, cols, &mut out);

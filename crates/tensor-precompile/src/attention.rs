@@ -19,7 +19,6 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::activations_in_range;
 use tensor_kernel::fixed::{exp_q32, isqrt, F, ONE};
 
 use crate::{BASE_GAS, MAX_DIM};
@@ -240,11 +239,6 @@ pub fn rmsnorm_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Preco
 
     let weight = take(input, NORM_HEADER, n);
     let x = take(input, NORM_HEADER + n * 8, n);
-    // The weight is a scale factor rather than an activation and is deliberately unbounded:
-    // Qwen3's k_norm reaches 96.5. The product is formed in i128, so nothing overflows.
-    if !activations_in_range(&x) {
-        return bad_input(reservoir);
-    }
 
     let mut ss: i128 = 0;
     for &v in &x {

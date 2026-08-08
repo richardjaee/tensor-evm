@@ -29,7 +29,7 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::{activations_in_range, matmul};
+use tensor_kernel::matmul;
 
 /// Address of the matmul precompile.
 ///
@@ -145,13 +145,6 @@ pub fn matmul_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Precom
         .chunks_exact(8)
         .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
         .collect();
-
-    // The kernel's soundness argument depends on this bound: within it every product fits
-    // i64, and outside it the accumulation would wrap. Rejecting is the only safe answer,
-    // and it must happen here rather than in the kernel, where a chain cannot recover.
-    if !activations_in_range(&acts) {
-        return bad_input(reservoir);
-    }
 
     let mut out = vec![0i64; rows];
     matmul(&weights, &scales, &acts, rows, cols, &mut out);

@@ -38,7 +38,7 @@ use revm::precompile::{
     Precompiles,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::{activations_in_range, matmul};
+use tensor_kernel::matmul;
 
 use crate::{gas_cost, BASE_GAS, MAX_DIM};
 
@@ -229,12 +229,6 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             .chunks_exact(8)
             .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
             .collect();
-
-        // Outside this bound the kernel's accumulation would wrap, so the boundary is
-        // where it has to be refused.
-        if !activations_in_range(&acts) {
-            return Ok(Some(revert(gas_limit)));
-        }
 
         // Warmth is what the access actually costs, and it is only knowable from the load
         // itself. A forward pass hits the same weights account on every call of every

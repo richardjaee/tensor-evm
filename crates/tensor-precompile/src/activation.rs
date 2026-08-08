@@ -30,7 +30,7 @@ use revm::precompile::{
     u64_to_address, Precompile, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use revm::primitives::{Address, Bytes};
-use tensor_kernel::{activations_in_range, swiglu_vec};
+use tensor_kernel::swiglu_vec;
 
 use crate::{BASE_GAS, MAX_DIM};
 
@@ -100,12 +100,6 @@ pub fn swiglu_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Precom
         .chunks_exact(8)
         .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
         .collect();
-
-    // The same bound the matmul enforces, for the same reason: outside it the product in
-    // the pairing would wrap rather than saturate.
-    if !activations_in_range(&gate) || !activations_in_range(&up) {
-        return bad_input(reservoir);
-    }
 
     swiglu_vec(&mut gate, &up);
 
@@ -222,12 +216,16 @@ mod tests {
         }
     }
 
-    /// Out-of-range operands must be refused rather than wrapped, exactly as the matmul
-    /// refuses them — the pairing multiplies, and the same bound applies.
+    /// Large operands must be handled rather than refused. The residual stream of a real
+    /// model reaches magnitudes that every earlier bound in this project rejected, and the
+    /// pairing forms its product in `i128`, so there is nothing left to refuse them for.
     #[test]
-    fn rejects_operands_outside_the_bound() {
-        let big = tensor_kernel::MAX_ABS_ACTIVATION + 1;
-        let out = swiglu_precompile(&encode(&[big], &[1]), PLENTY, 0).unwrap();
-        assert!(out.status.is_revert_or_halt());
+    fn accepts_operands_of_any_magnitude() {
+        let big = 1i64 << 50;
+        let out = swiglu_precompile(&encode(&[big], &[ONE]), PLENTY, 0).unwrap();
+        assert!(
+            out.status.is_success(),
+            "refused a magnitude a real model produces"
+        );
     }
 }
