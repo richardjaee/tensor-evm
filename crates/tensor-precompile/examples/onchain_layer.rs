@@ -168,6 +168,12 @@ fn main() {
         tensors.push(split(&raw, rows, cols, name));
         blob.extend_from_slice(&raw);
     }
+    // Norm weights follow the tensors in the same blob, as they do on chain.
+    for name in ["input_norm", "q_norm", "k_norm", "post_norm"] {
+        let v = read_i64(&dir, &format!("{name}.bin"));
+        offsets.push(blob.len() as u64);
+        blob.extend(v.iter().flat_map(|x| x.to_be_bytes()));
+    }
     println!(
         "Qwen3-0.6B layer 0: dim {}, heads {}, kv {}, head_dim {}",
         cfg.dim, cfg.n_heads, cfg.n_kv, cfg.head_dim
@@ -278,8 +284,8 @@ fn main() {
 
     // runLayer((uint32 x6,int256),(uint32 x7),address,uint256,(int256[] x7))
     let sig = "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32),uint256,\
-(int256[],int256[],int256[],int256[],int256[],int256[],int256[]))";
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
+uint256,(int256[],int256[],int256[]))";
     let h = keccak256(sig.as_bytes());
     let mut data = h[..4].to_vec();
 
@@ -305,22 +311,18 @@ fn main() {
     }
     data.extend_from_slice(&word(0)); // pos
 
-    // Inputs is dynamic: a pointer, then its own head of seven pointers.
-    let head_words = 8 + 8 + 1 + 1;
+    // Inputs is dynamic: a pointer, then its own head of three pointers.
+    let head_words = 8 + 12 + 1 + 1;
     data.extend_from_slice(&word(head_words as u64 * 32));
 
     let half = cfg.head_dim / 2;
     let arrays: Vec<Vec<i64>> = vec![
-        input_norm.clone(),
-        q_norm.clone(),
-        k_norm.clone(),
-        post_norm.clone(),
         cos[..half].to_vec(),
         sin[..half].to_vec(),
         xs[..cfg.dim].to_vec(),
     ];
     let encoded: Vec<Vec<u8>> = arrays.iter().map(|a| enc_array(a)).collect();
-    let mut at = 7 * 32;
+    let mut at = 3 * 32;
     for e in &encoded {
         data.extend_from_slice(&word(at as u64));
         at += e.len();
@@ -403,8 +405,8 @@ fn main() {
     {
         let mut d = keccak256(
             b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32),uint256,\
-(int256[],int256[],int256[],int256[],int256[],int256[],int256[]))",
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
+uint256,(int256[],int256[],int256[]))",
         )[..4]
             .to_vec();
         d.extend_from_slice(&data[4..]);

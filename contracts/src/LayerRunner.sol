@@ -12,11 +12,11 @@ import {Transformer} from "./Transformer.sol";
 ///      would convert once per token and keep everything packed in between; converting per
 ///      operation is what made a layer 99.8% marshalling.
 contract LayerRunner {
+    /// @notice What a block needs that is not in the weight blob.
+    /// @dev The norm weights used to be here. They moved into the blob beside the tensors
+    ///      once measurement showed a token was re-sending 523KB of unchanging values every
+    ///      call, so a layer is now identified by one address and a set of offsets.
     struct Inputs {
-        int256[] inputNorm;
-        int256[] qNorm;
-        int256[] kNorm;
-        int256[] postNorm;
         int256[] cos;
         int256[] sin;
         int256[] x;

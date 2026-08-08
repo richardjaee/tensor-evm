@@ -171,6 +171,12 @@ fn main() {
         tensors.push(split(&raw, rows, cols));
         blob.extend_from_slice(&raw);
     }
+    // Norm weights follow the tensors in the same blob, as they do on chain.
+    for name in ["input_norm", "q_norm", "k_norm", "post_norm"] {
+        let v = read_i64(&dir, &format!("{name}.bin"));
+        offsets.push(blob.len() as u64);
+        blob.extend(v.iter().flat_map(|x| x.to_be_bytes()));
+    }
 
     let input_norm = read_i64(&dir, "input_norm.bin");
     let q_norm = read_i64(&dir, "q_norm.bin");
@@ -311,7 +317,7 @@ fn main() {
     // step(bytes32, Model, uint16). Model's members are a static Config, a Layer array, and
     // two tuples of bytes, so the tuple is dynamic and encodes behind an offset.
     let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes,bytes,bytes),(bytes,bytes)),uint16)";
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes)),uint16)";
     let mut d = keccak256(sig.as_bytes())[..4].to_vec();
     d.extend_from_slice(&ID);
     d.extend_from_slice(&word(3 * 32)); // offset to Model
@@ -339,20 +345,13 @@ fn main() {
     for o in &offsets {
         layers.extend_from_slice(&word(*o));
     }
-    let norms = bytes_tuple(&[
-        &packed(&input_norm),
-        &packed(&q_norm),
-        &packed(&k_norm),
-        &packed(&post_norm),
-    ]);
     let ropes = bytes_tuple(&[&packed(&cos[..half]), &packed(&sin[..half])]);
 
-    let head = 11 * 32;
+    // Config's eight words, then offsets to the layer array and the rotary tables.
+    let head = 10 * 32;
     model.extend_from_slice(&word(head as u64));
     model.extend_from_slice(&word((head + layers.len()) as u64));
-    model.extend_from_slice(&word((head + layers.len() + norms.len()) as u64));
     model.extend_from_slice(&layers);
-    model.extend_from_slice(&norms);
     model.extend_from_slice(&ropes);
     d.extend_from_slice(&model);
 

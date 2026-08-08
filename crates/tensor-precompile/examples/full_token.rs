@@ -138,7 +138,6 @@ fn bytes_tuple(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-
 fn main() {
     let dir: PathBuf = std::env::args()
         .nth(1)
