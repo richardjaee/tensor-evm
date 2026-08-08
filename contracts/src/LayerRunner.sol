@@ -25,11 +25,10 @@ contract LayerRunner {
     function runLayer(
         Transformer.Config calldata c,
         Transformer.Layer calldata l,
-        address weights,
         uint256 pos,
         Inputs calldata i
     ) external view returns (int256[] memory) {
-        return Tensor.unpack(_run(c, l, weights, pos, i, new uint256[](0)));
+        return Tensor.unpack(_run(c, l, pos, i, new uint256[](0)));
     }
 
     /// @notice The same block, returning where its gas went
@@ -37,7 +36,6 @@ contract LayerRunner {
     function profileLayer(
         Transformer.Config calldata c,
         Transformer.Layer calldata l,
-        address weights,
         uint256 pos,
         Inputs calldata i
     ) external view returns (uint256[] memory) {
@@ -46,7 +44,7 @@ contract LayerRunner {
         // its own right — and one that no per-section timing would attribute anywhere.
         // `prof` rather than `gas`, which shadows a Yul builtin.
         uint256[] memory prof = new uint256[](11);
-        _run(c, l, weights, pos, i, prof);
+        _run(c, l, pos, i, prof);
         assembly ("memory-safe") {
             // The free memory pointer rather than `msize`, which cannot be used alongside
             // the Yul optimiser because optimisation can change what it reports. For
@@ -59,7 +57,6 @@ contract LayerRunner {
     function _run(
         Transformer.Config calldata c,
         Transformer.Layer calldata l,
-        address weights,
         uint256 pos,
         Inputs calldata i,
         uint256[] memory gas
@@ -88,7 +85,6 @@ contract LayerRunner {
                 c: c,
                 l: l,
                 n: n,
-                weights: weights,
                 s: scratch,
                 p: Transformer.Profile({gas: gas, at: 0})
             }),

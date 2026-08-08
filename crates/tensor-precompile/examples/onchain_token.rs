@@ -298,12 +298,9 @@ fn main() {
     println!("Qwen3-0.6B layer 0, resumable, state in storage\n");
 
     // ---- start ----
-    let mut d = keccak256(b"start(bytes32,address,bytes)")[..4].to_vec();
+    let mut d = keccak256(b"start(bytes32,bytes)")[..4].to_vec();
     d.extend_from_slice(&ID);
-    let mut a = [0u8; 32];
-    a[12..].copy_from_slice(WEIGHTS.as_slice());
-    d.extend_from_slice(&a);
-    d.extend_from_slice(&word(3 * 32));
+    d.extend_from_slice(&word(2 * 32));
     d.extend_from_slice(&dyn_bytes(&packed(&xs[..cfg.dim])));
     let r = send(&mut db, d);
     assert!(r.is_success(), "start failed: {r:?}");
@@ -314,7 +311,7 @@ fn main() {
     // step(bytes32, Model, uint16). Model's members are a static Config, a Layer array, and
     // two tuples of bytes, so the tuple is dynamic and encodes behind an offset.
     let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes,bytes,bytes),(bytes,bytes)),uint16)";
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes,bytes,bytes),(bytes,bytes)),uint16)";
     let mut d = keccak256(sig.as_bytes())[..4].to_vec();
     d.extend_from_slice(&ID);
     d.extend_from_slice(&word(3 * 32)); // offset to Model
@@ -336,6 +333,9 @@ fn main() {
     model.extend_from_slice(&signed(cfg.rms_eps));
 
     let mut layers = word(1).to_vec(); // one Layer
+    let mut la = [0u8; 32];
+    la[12..].copy_from_slice(WEIGHTS.as_slice());
+    layers.extend_from_slice(&la);
     for o in &offsets {
         layers.extend_from_slice(&word(*o));
     }

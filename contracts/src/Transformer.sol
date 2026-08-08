@@ -37,8 +37,13 @@ library Transformer {
         int256 rmsEps;
     }
 
-    /// @notice Byte offsets of one layer's tensors within the weight contract's code.
+    /// @notice Where one layer's tensors live: which contract, and at what offsets.
+    /// @dev The address is per layer rather than per model because a layer of Qwen3-0.6B is
+    ///      31.5MB and twenty-eight of them will not share one deployment under any code
+    ///      size limit worth setting. It also means a model can be uploaded incrementally,
+    ///      which matters when uploading is itself thousands of transactions.
     struct Layer {
+        address at;
         uint32 q;
         uint32 k;
         uint32 v;
@@ -76,7 +81,6 @@ library Transformer {
         Config c;
         Layer l;
         Norms n;
-        address weights;
         /// @dev One buffer, reused for every call's input. Memory is never freed and is
         ///      priced quadratically, so a fresh allocation per call cost 662,544 gas of
         ///      expansion for buffers dead the moment they were read.
@@ -146,7 +150,7 @@ library Transformer {
         _mark(b, g);
 
         g = gasleft();
-        bytes memory q = Tensor.matmul(b.s, uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
+        bytes memory q = Tensor.matmul(b.s, uint32(qWidth(c)), c.dim, b.l.at, b.l.q, normed);
         _mark(b, g);
 
         // QK-norm before rotary, not after. Normalising a rotated vector rescales its
@@ -187,7 +191,7 @@ library Transformer {
 
         g = gasleft();
         Tensor.addInto(
-            x, Tensor.matmul(b.s, b.c.dim, uint32(qWidth(b.c)), b.weights, b.l.o, attn)
+            x, Tensor.matmul(b.s, b.c.dim, uint32(qWidth(b.c)), b.l.at, b.l.o, attn)
         );
         _mark(b, g);
     }
@@ -207,7 +211,7 @@ library Transformer {
         Config memory c = b.c;
         uint32 kvw = uint32(kvWidth(c));
 
-        bytes memory k = Tensor.matmul(b.s, kvw, c.dim, b.weights, b.l.k, normed);
+        bytes memory k = Tensor.matmul(b.s, kvw, c.dim, b.l.at, b.l.k, normed);
         k = Tensor.normRope(
             b.s,
             c.nKv,
@@ -215,7 +219,7 @@ library Transformer {
             c.rmsEps,
             Tensor.NormRopeArgs({weight: b.n.kNorm, cos: rope.cos, sin: rope.sin, vec: k})
         );
-        bytes memory v = Tensor.matmul(b.s, kvw, c.dim, b.weights, b.l.v, normed);
+        bytes memory v = Tensor.matmul(b.s, kvw, c.dim, b.l.at, b.l.v, normed);
 
         uint256 at = pos * uint256(kvw) * 8;
         bytes memory kc = kv.k;
@@ -234,8 +238,8 @@ library Transformer {
         _mark(b, g);
 
         g = gasleft();
-        bytes memory gate = Tensor.matmul(b.s, c.hidden, c.dim, b.weights, b.l.gate, normed);
-        bytes memory up = Tensor.matmul(b.s, c.hidden, c.dim, b.weights, b.l.up, normed);
+        bytes memory gate = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.gate, normed);
+        bytes memory up = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.up, normed);
         _mark(b, g);
 
         g = gasleft();
@@ -243,7 +247,7 @@ library Transformer {
         _mark(b, g);
 
         g = gasleft();
-        Tensor.addInto(x, Tensor.matmul(b.s, c.dim, c.hidden, b.weights, b.l.down, gated));
+        Tensor.addInto(x, Tensor.matmul(b.s, c.dim, c.hidden, b.l.at, b.l.down, gated));
         _mark(b, g);
     }
 }

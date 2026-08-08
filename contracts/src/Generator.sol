@@ -24,7 +24,6 @@ contract Generator {
         uint32 pos;
         uint16 layer;
         bool active;
-        address weights;
     }
 
     mapping(bytes32 => Meta) public meta;
@@ -43,6 +42,9 @@ contract Generator {
     ///      and code cannot be appended to. The granularity has to match what a
     ///      transaction can finish.
     mapping(bytes32 => mapping(uint256 => address)) private _kvPtr;
+    /// @dev What the generation has produced. The point of the whole exercise, and cheap:
+    ///      one slot per token against millions for the state that produced it.
+    mapping(bytes32 => uint32[]) private tokens;
 
     /// @notice Everything about the model a step needs, bundled.
     /// @dev Passed per call rather than stored: these are tens of kilobytes and storing
@@ -57,7 +59,7 @@ contract Generator {
 
     event Started(bytes32 indexed id, address indexed owner);
     event Advanced(bytes32 indexed id, uint32 pos, uint16 fromLayer, uint16 toLayer, uint256 gas);
-    event Emitted(bytes32 indexed id, uint32 pos);
+    event Emitted(bytes32 indexed id, uint32 pos, uint32 token, int256 logit);
 
     error NotOwner();
     error Inactive();
@@ -66,15 +68,9 @@ contract Generator {
     /// @notice Begin a generation, seeding the residual stream with a token's embedding
     /// @dev The embedding is supplied rather than looked up: it is a row of a table, not a
     ///      matrix multiply, and the row is the only part of a 311MB table a step reads.
-    function start(bytes32 id, address weights, bytes calldata embedding) external {
+    function start(bytes32 id, bytes calldata embedding) external {
         if (meta[id].owner != address(0)) revert Exists();
-        meta[id] = Meta({
-            owner: msg.sender,
-            pos: 0,
-            layer: 0,
-            active: true,
-            weights: weights
-        });
+        meta[id] = Meta({owner: msg.sender, pos: 0, layer: 0, active: true});
         Session.store(_resid[id], 0, embedding);
         emit Started(id, msg.sender);
     }
@@ -125,7 +121,6 @@ contract Generator {
                     c: w.c,
                     l: w.layers[l],
                     n: w.norms,
-                    weights: m.weights,
                     s: scratch,
                     p: Transformer.Profile({gas: new uint256[](0), at: 0})
                 }),
@@ -190,6 +185,52 @@ contract Generator {
             mcopy(add(add(blob, 0x20), width), add(add(v, 0x20), from), width)
         }
         _kvPtr[id][uint256(layer) * c.seqLen + pos] = KvStore.write(blob);
+    }
+
+    /// @notice Finish a position: normalise, classify, and record the token
+    /// @dev Separate from `step` because it is the only part that touches the vocabulary,
+    ///      and because a caller pacing itself against a gas limit needs to know whether
+    ///      the next call is a layer or the classifier.
+    function emitToken(
+        bytes32 id,
+        Transformer.Config calldata c,
+        bytes calldata finalNorm,
+        address classifier,
+        uint32 offset,
+        uint32 vocab
+    ) external returns (uint32 token, int256 logit) {
+        Meta memory m = meta[id];
+        if (m.owner != msg.sender) revert NotOwner();
+        if (!m.active) revert Inactive();
+        require(m.layer == c.nLayers, "layers incomplete");
+
+        bytes memory x = Session.load(_resid[id], 0, c.dim);
+        Tensor.Scratch memory s = Tensor.Scratch({buf: "", cap: 0});
+        bytes memory normed = Tensor.rmsnorm(s, c.rmsEps, finalNorm, x);
+        (token, logit) = Tensor.classify(vocab, c.dim, classifier, offset, normed);
+
+        tokens[id].push(token);
+        // Ready for the next position: the cache keeps everything, the layer counter
+        // restarts, and the residual stream will be overwritten by the next embedding.
+        meta[id].pos = m.pos + 1;
+        meta[id].layer = 0;
+        emit Emitted(id, m.pos, token, logit);
+    }
+
+    /// @notice Seed the next position with its embedding
+    /// @dev The embedding is a table lookup rather than a multiply, so the row is supplied.
+    ///      Only this row of a 311MB table is read, which is why it is not on chain.
+    function feed(bytes32 id, bytes calldata embedding) external {
+        Meta memory m = meta[id];
+        if (m.owner != msg.sender) revert NotOwner();
+        if (!m.active) revert Inactive();
+        require(m.layer == 0, "position in progress");
+        Session.store(_resid[id], 0, embedding);
+    }
+
+    /// @notice Tokens produced so far
+    function generated(bytes32 id) external view returns (uint32[] memory) {
+        return tokens[id];
     }
 
     /// @notice The residual stream as it stands, for inspection between steps

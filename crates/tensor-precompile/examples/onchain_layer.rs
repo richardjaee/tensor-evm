@@ -278,7 +278,7 @@ fn main() {
 
     // runLayer((uint32 x6,int256),(uint32 x7),address,uint256,(int256[] x7))
     let sig = "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(uint32,uint32,uint32,uint32,uint32,uint32,uint32),address,uint256,\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32),uint256,\
 (int256[],int256[],int256[],int256[],int256[],int256[],int256[]))";
     let h = keccak256(sig.as_bytes());
     let mut data = h[..4].to_vec();
@@ -296,16 +296,17 @@ fn main() {
         data.extend_from_slice(&word(f));
     }
     data.extend_from_slice(&signed_word(cfg.rms_eps));
-    for o in &offsets {
-        data.extend_from_slice(&word(*o));
-    }
+    // Layer: the weight contract, then the seven tensor offsets within it.
     let mut addr = [0u8; 32];
     addr[12..].copy_from_slice(WEIGHTS.as_slice());
     data.extend_from_slice(&addr);
+    for o in &offsets {
+        data.extend_from_slice(&word(*o));
+    }
     data.extend_from_slice(&word(0)); // pos
 
     // Inputs is dynamic: a pointer, then its own head of seven pointers.
-    let head_words = 8 + 7 + 1 + 1 + 1;
+    let head_words = 8 + 8 + 1 + 1;
     data.extend_from_slice(&word(head_words as u64 * 32));
 
     let half = cfg.head_dim / 2;
@@ -402,7 +403,7 @@ fn main() {
     {
         let mut d = keccak256(
             b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(uint32,uint32,uint32,uint32,uint32,uint32,uint32),address,uint256,\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32),uint256,\
 (int256[],int256[],int256[],int256[],int256[],int256[],int256[]))",
         )[..4]
             .to_vec();

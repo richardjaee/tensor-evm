@@ -23,6 +23,10 @@ library Tensor {
     address internal constant NORM_ROPE = address(0x103);
     address internal constant ATTENTION = address(0x104);
     address internal constant RMSNORM = address(0x105);
+    /// @dev Classifier fused with its argmax. Fused because the intermediate is enormous
+    ///      and nobody wants it: a 151,936-entry logit vector is 1.2MB, and the caller's
+    ///      next act is always to discard all but one.
+    address internal constant CLASSIFY = address(0x106);
 
     /// @notice Operand bundles.
     /// @dev Not tidiness: the EVM's stack is what limits how a transformer block can be
@@ -295,5 +299,34 @@ library Tensor {
         require(weight.length == x.length, "weight width");
         bytes32 head = bytes32((n << 224) | (uint256(uint64(int64(eps))) << 160));
         return _call(RMSNORM, _build(s, 12, head, two(weight, x)), n * W);
+    }
+
+    /// @notice The classifier and its argmax, in one call
+    /// @return token The winning row
+    /// @return logit Its value, so a caller can judge how close the decision was
+    function classify(uint32 rows, uint32 cols, address weights, uint32 offset, bytes memory x)
+        internal
+        view
+        returns (uint32 token, int256 logit)
+    {
+        require(x.length == uint256(cols) * W, "activation width");
+        bytes memory input = new bytes(32 + x.length);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            // Ascending, so no field lands on top of one already written.
+            mstore(p, or(shl(224, rows), shl(192, cols)))
+            mstore(add(p, 8), shl(96, weights))
+            mstore(add(p, 28), shl(224, offset))
+            mcopy(add(p, 32), add(x, 0x20), mload(x))
+        }
+
+        bytes memory ret = _call(CLASSIFY, input, 12);
+        assembly ("memory-safe") {
+            let word := mload(add(ret, 0x20))
+            token := shr(224, word)
+            // The logit occupies bytes 4..12; shift it to the top of a word, then down
+            // arithmetically so the sign extends.
+            logit := sar(192, shl(32, word))
+        }
     }
 }
