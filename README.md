@@ -151,8 +151,24 @@ docs/results.md             every measurement, with the command that produces it
 ## Building
 
 ```sh
-cargo test  --release            # correctness, including the determinism guarantees
-cargo run   --release --bin bench   # bandwidth measurement and per-model projections
+cargo test --release                # everything, including the generation loop end to end
+cargo run  --release --bin bench    # bandwidth measurement and per-model projections
+```
+
+`cargo test` covers the whole path — seed, every layer, classifier, argmax — against a
+model small enough to live in the repository, and asserts the tokens float64 says it emits.
+The fixture is tiny but not simplified: `head_dim` independent of `dim / n_heads` so the
+projections are not square, grouped attention, per-layer norm weights well above unit
+scale, and several positions so the causal mask and the key/value cache are exercised.
+Every one of those has caused a bug here.
+
+The real checkpoint runs as examples, since 1.2 GB cannot be committed:
+
+```sh
+python3 tools/export_model.py --model models/qwen3-0.6b.safetensors \
+    --config models/config.json --out models/full
+cargo run --release --example full_token -- models/full   # real Qwen3-0.6B, real tokens
+cargo run --release --example onchain_layer -- models/layer0   # one block, gas attributed
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`.
