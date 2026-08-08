@@ -438,6 +438,8 @@ fn main() {
             })
             .collect();
 
+        let msize = *vals.last().expect("msize slot");
+        let vals = &vals[..vals.len() - 1];
         let names = [
             "rmsnorm (attn)",
             "k/v proj + QK-norm + rope + cache",
@@ -455,7 +457,7 @@ fn main() {
         println!("{:<38} {:>12} {:>7}", "section", "gas", "share");
         println!("{}", "-".repeat(60));
         let mut precompiled = 0u64;
-        for (name, v) in names.iter().zip(&vals) {
+        for (name, v) in names.iter().zip(vals) {
             println!(
                 "{name:<38} {v:>12} {:>6.1}%",
                 100.0 * *v as f64 / total as f64
@@ -500,7 +502,16 @@ fn main() {
             .unwrap()
             + tensor_precompile::attention::rmsnorm_gas(d).unwrap() * 2;
 
-        println!("\n  the precompiles themselves charge {charged} gas of that {total}.");
+        // Memory expansion is 3 gas a word plus words^2/512, so its share is worth naming.
+        let words = msize.div_ceil(32);
+        let mem = 3 * words + words * words / 512;
+        println!(
+            "\n  memory touched     {:>12} bytes ({} words), which costs {mem} gas ({:.0}%)",
+            msize,
+            words,
+            100.0 * mem as f64 / total as f64
+        );
+        println!("  the precompiles themselves charge {charged} gas of that {total}.");
         println!(
             "  so {:.1}% of a layer is Solidity handing them their arguments, not arithmetic.",
             100.0 * (total - charged) as f64 / total as f64

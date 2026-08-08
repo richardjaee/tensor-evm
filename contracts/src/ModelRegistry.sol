@@ -159,9 +159,13 @@ contract ModelRegistry {
         if (s.owner != msg.sender) revert NotSessionOwner();
         if (!s.active) revert SessionInactive();
 
-        return _narrow(Tensor.unpack(
-            Tensor.matmul(rows, cols, _models[s.modelId].weights, offset, Tensor.pack(_widen(x)))
-        ));
+        return _narrow(
+            Tensor.unpack(
+                Tensor.matmul(
+                    _noScratch(), rows, cols, _models[s.modelId].weights, offset, Tensor.pack(_widen(x))
+                )
+            )
+        );
     }
 
     /// @notice Matmul against a registered model without a session, for reads and probing.
@@ -171,9 +175,20 @@ contract ModelRegistry {
         returns (int64[] memory)
     {
         if (!_models[modelId].exists) revert NoSuchModel();
-        return _narrow(Tensor.unpack(
-            Tensor.matmul(rows, cols, _models[modelId].weights, offset, Tensor.pack(_widen(x)))
-        ));
+        return _narrow(
+            Tensor.unpack(
+                Tensor.matmul(
+                    _noScratch(), rows, cols, _models[modelId].weights, offset, Tensor.pack(_widen(x))
+                )
+            )
+        );
+    }
+
+    /// @dev A zero-capacity scratch, which makes `Tensor` allocate per call. These entry
+    ///      points perform one matmul apiece, so there is nothing to reuse a buffer across
+    ///      — reuse pays inside a block, where a dozen calls follow one another.
+    function _noScratch() private pure returns (Tensor.Scratch memory) {
+        return Tensor.Scratch({buf: "", cap: 0});
     }
 
     /// @dev The ABI speaks int64 because that is the value's actual width; Solidity memory

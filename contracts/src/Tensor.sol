@@ -42,6 +42,41 @@ library Tensor {
         bytes v;
     }
 
+    /// @notice A buffer reused for every call's input.
+    ///
+    /// @dev Memory in the EVM is never freed and is priced quadratically, so what matters
+    ///      is not how much is live but how much has ever been allocated. A layer that
+    ///      allocated a fresh input buffer per call touched 565KB and paid 662,544 gas for
+    ///      it — sixty percent of the block, for buffers that were dead the instant the
+    ///      call returned.
+    ///
+    ///      Allocated once at the largest size any call needs, then resized downward per
+    ///      use. The alias is deliberate and the constraint that comes with it is real: the
+    ///      value returned by `_build` is only valid until the next `_build`, which holds
+    ///      because `_call` consumes it immediately.
+    struct Scratch {
+        bytes buf;
+        /// @dev Capacity, tracked separately because resizing writes the length field and
+        ///      would otherwise shrink the buffer permanently — each call would then be
+        ///      bounded by whatever the previous one happened to need.
+        uint256 cap;
+    }
+
+    /// @notice Bytes of scratch a layer of this shape needs.
+    /// @dev The largest input any single call assembles, which is SwiGLU's: a four-byte
+    ///      header and two vectors of `hidden` values.
+    function scratchFor(uint256 dim, uint256 hidden, uint256 qw, uint256 cacheDepth)
+        internal
+        pure
+        returns (uint256 n)
+    {
+        n = 4 + hidden * 2 * W; // swiglu
+        uint256 attn = 16 + (qw + cacheDepth * 2) * W;
+        if (attn > n) n = attn;
+        uint256 mm = 32 + (hidden > dim ? hidden : dim) * W;
+        if (mm > n) n = mm;
+    }
+
     error PrecompileFailed(address at, uint256 inputLen);
     error UnexpectedOutputLength(address at, uint256 got, uint256 want);
 
@@ -132,7 +167,7 @@ library Tensor {
 
     /// @dev Header bytes followed by packed payloads, assembled with `mcopy`. This is what
     ///      replaced the per-element packing loops: 32 bytes a step and no shifting.
-    function _build(uint256 headLen, bytes32 head, bytes[] memory parts)
+    function _build(Scratch memory s, uint256 headLen, bytes32 head, bytes[] memory parts)
         private
         pure
         returns (bytes memory input)
@@ -141,7 +176,15 @@ library Tensor {
         for (uint256 i = 0; i < parts.length; ++i) {
             total += parts[i].length;
         }
-        input = new bytes(total);
+        input = s.buf;
+        if (s.cap == 0) {
+            input = new bytes(total);
+        } else {
+            require(total <= s.cap, "scratch too small");
+            assembly ("memory-safe") {
+                mstore(input, total)
+            }
+        }
         assembly ("memory-safe") {
             let p := add(input, 0x20)
             mstore(p, head)
@@ -167,7 +210,14 @@ library Tensor {
     }
 
     /// @notice out[i] = sum_j W[i][j] * x[j], with W read from chain state
-    function matmul(uint32 rows, uint32 cols, address weights, uint32 offset, bytes memory x)
+    function matmul(
+        Scratch memory s,
+        uint32 rows,
+        uint32 cols,
+        address weights,
+        uint32 offset,
+        bytes memory x
+    )
         internal
         view
         returns (bytes memory)
@@ -177,18 +227,28 @@ library Tensor {
             (uint256(rows) << 224) | (uint256(cols) << 192) | (uint256(uint160(weights)) << 32)
                 | uint256(offset)
         );
-        return _call(MATMUL, _build(32, head, one(x)), uint256(rows) * W);
+        return _call(MATMUL, _build(s, 32, head, one(x)), uint256(rows) * W);
     }
 
     /// @notice silu(gate) * up, elementwise
-    function swiglu(bytes memory gate, bytes memory up) internal view returns (bytes memory) {
+    function swiglu(Scratch memory s, bytes memory gate, bytes memory up)
+        internal
+        view
+        returns (bytes memory)
+    {
         uint256 n = gate.length / W;
         require(up.length == gate.length, "gate and up must match");
-        return _call(SWIGLU, _build(4, bytes32(n << 224), two(gate, up)), n * W);
+        return _call(SWIGLU, _build(s, 4, bytes32(n << 224), two(gate, up)), n * W);
     }
 
     /// @notice RMS-normalise each head and rotate it
-    function normRope(uint32 heads, uint32 headDim, int256 eps, NormRopeArgs memory a)
+    function normRope(
+        Scratch memory s,
+        uint32 heads,
+        uint32 headDim,
+        int256 eps,
+        NormRopeArgs memory a
+    )
         internal
         view
         returns (bytes memory)
@@ -202,11 +262,12 @@ library Tensor {
             (uint256(heads) << 224) | (uint256(headDim) << 192)
                 | (uint256(uint64(int64(eps))) << 128)
         );
-        return _call(NORM_ROPE, _build(16, head, parts), uint256(heads) * headDim * W);
+        return _call(NORM_ROPE, _build(s, 16, head, parts), uint256(heads) * headDim * W);
     }
 
     /// @notice Grouped-query attention over the whole cache
     function attention(
+        Scratch memory s,
         uint32 heads,
         uint32 nKv,
         uint32 headDim,
@@ -221,11 +282,11 @@ library Tensor {
             (uint256(heads) << 224) | (uint256(nKv) << 192) | (uint256(headDim) << 160)
                 | (uint256(positions) << 128)
         );
-        return _call(ATTENTION, _build(16, head, parts), uint256(heads) * headDim * W);
+        return _call(ATTENTION, _build(s, 16, head, parts), uint256(heads) * headDim * W);
     }
 
     /// @notice RMSNorm over one vector
-    function rmsnorm(int256 eps, bytes memory weight, bytes memory x)
+    function rmsnorm(Scratch memory s, int256 eps, bytes memory weight, bytes memory x)
         internal
         view
         returns (bytes memory)
@@ -233,6 +294,6 @@ library Tensor {
         uint256 n = x.length / W;
         require(weight.length == x.length, "weight width");
         bytes32 head = bytes32((n << 224) | (uint256(uint64(int64(eps))) << 160));
-        return _call(RMSNORM, _build(12, head, two(weight, x)), n * W);
+        return _call(RMSNORM, _build(s, 12, head, two(weight, x)), n * W);
     }
 }

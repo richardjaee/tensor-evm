@@ -41,9 +41,19 @@ contract LayerRunner {
         uint256 pos,
         Inputs calldata i
     ) external view returns (uint256[] memory) {
-        uint256[] memory gas = new uint256[](10);
-        _run(c, l, weights, pos, i, gas);
-        return gas;
+        // Eleven slots: ten sections, then the memory the layer ended up touching.
+        // Memory is priced quadratically and never freed, so total allocation is a cost in
+        // its own right — and one that no per-section timing would attribute anywhere.
+        // `prof` rather than `gas`, which shadows a Yul builtin.
+        uint256[] memory prof = new uint256[](11);
+        _run(c, l, weights, pos, i, prof);
+        assembly ("memory-safe") {
+            // The free memory pointer rather than `msize`, which cannot be used alongside
+            // the Yul optimiser because optimisation can change what it reports. For
+            // allocation totals the two agree to within a word.
+            mstore(add(prof, mul(32, 11)), mload(0x40))
+        }
+        return prof;
     }
 
     function _run(
@@ -68,12 +78,18 @@ contract LayerRunner {
         Transformer.Kv memory kv =
             Transformer.Kv({k: Tensor.alloc(depth), v: Tensor.alloc(depth)});
 
+        // Sized before the block is assembled, so the expression does not have to live on
+        // the stack alongside everything else the constructor needs.
+        uint256 cap = Transformer.scratchBytes(c, depth);
+        Tensor.Scratch memory scratch = Tensor.Scratch({buf: new bytes(cap), cap: cap});
+
         return Transformer.forwardLayer(
             Transformer.Block({
                 c: c,
                 l: l,
                 n: n,
                 weights: weights,
+                s: scratch,
                 p: Transformer.Profile({gas: gas, at: 0})
             }),
             kv,

@@ -74,6 +74,10 @@ library Transformer {
         Layer l;
         Norms n;
         address weights;
+        /// @dev One buffer, reused for every call's input. Memory is never freed and is
+        ///      priced quadratically, so a fresh allocation per call cost 662,544 gas of
+        ///      expansion for buffers dead the moment they were read.
+        Tensor.Scratch s;
         /// @dev Carried here rather than passed alongside, because a memory struct is a
         ///      reference and a separate parameter is a stack slot the caller does not
         ///      have. The stack, not gas, is what limits how a block can be written.
@@ -92,6 +96,13 @@ library Transformer {
 
     function kvWidth(Config memory c) internal pure returns (uint256) {
         return uint256(c.nKv) * c.headDim;
+    }
+
+    /// @notice Bytes of reusable scratch a block of this shape needs
+    /// @dev Here rather than at the call site so that sizing it does not put four separate
+    ///      values on a stack that has no room for them.
+    function scratchBytes(Config memory c, uint256 cacheDepth) internal pure returns (uint256) {
+        return Tensor.scratchFor(c.dim, c.hidden, qWidth(c), cacheDepth);
     }
 
     function _mark(Block memory b, uint256 before) private view {
@@ -124,7 +135,7 @@ library Transformer {
         Config memory c = b.c;
 
         uint256 g = gasleft();
-        bytes memory normed = Tensor.rmsnorm(c.rmsEps, b.n.input, x);
+        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, b.n.input, x);
         _mark(b, g);
 
         g = gasleft();
@@ -132,13 +143,14 @@ library Transformer {
         _mark(b, g);
 
         g = gasleft();
-        bytes memory q = Tensor.matmul(uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
+        bytes memory q = Tensor.matmul(b.s, uint32(qWidth(c)), c.dim, b.weights, b.l.q, normed);
         _mark(b, g);
 
         // QK-norm before rotary, not after. Normalising a rotated vector rescales its
         // components unequally and destroys the angle the embedding encodes.
         g = gasleft();
         q = Tensor.normRope(
+            b.s,
             c.nHeads,
             c.headDim,
             c.rmsEps,
@@ -146,18 +158,34 @@ library Transformer {
         );
         _mark(b, g);
 
-        g = gasleft();
+        _attendAndProject(b, kv, q, pos, x);
+    }
+
+    /// @dev Split off because the stack cannot hold the query, the cache, the residual
+    ///      stream, and the scratch buffer at once. Attention and its output projection
+    ///      belong together anyway: nothing else ever consumes the attention result.
+    function _attendAndProject(
+        Block memory b,
+        Kv memory kv,
+        bytes memory q,
+        uint256 pos,
+        bytes memory x
+    ) private view {
+        uint256 g = gasleft();
         bytes memory attn = Tensor.attention(
-            c.nHeads,
-            c.nKv,
-            c.headDim,
+            b.s,
+            b.c.nHeads,
+            b.c.nKv,
+            b.c.headDim,
             uint32(pos + 1),
             Tensor.AttnArgs({q: q, k: kv.k, v: kv.v})
         );
         _mark(b, g);
 
         g = gasleft();
-        Tensor.addInto(x, Tensor.matmul(c.dim, uint32(qWidth(c)), b.weights, b.l.o, attn));
+        Tensor.addInto(
+            x, Tensor.matmul(b.s, b.c.dim, uint32(qWidth(b.c)), b.weights, b.l.o, attn)
+        );
         _mark(b, g);
     }
 
@@ -176,14 +204,15 @@ library Transformer {
         Config memory c = b.c;
         uint32 kvw = uint32(kvWidth(c));
 
-        bytes memory k = Tensor.matmul(kvw, c.dim, b.weights, b.l.k, normed);
+        bytes memory k = Tensor.matmul(b.s, kvw, c.dim, b.weights, b.l.k, normed);
         k = Tensor.normRope(
+            b.s,
             c.nKv,
             c.headDim,
             c.rmsEps,
             Tensor.NormRopeArgs({weight: b.n.kNorm, cos: rope.cos, sin: rope.sin, vec: k})
         );
-        bytes memory v = Tensor.matmul(kvw, c.dim, b.weights, b.l.v, normed);
+        bytes memory v = Tensor.matmul(b.s, kvw, c.dim, b.weights, b.l.v, normed);
 
         uint256 at = pos * uint256(kvw) * 8;
         bytes memory kc = kv.k;
@@ -198,20 +227,20 @@ library Transformer {
         Config memory c = b.c;
 
         uint256 g = gasleft();
-        bytes memory normed = Tensor.rmsnorm(c.rmsEps, b.n.post, x);
+        bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, b.n.post, x);
         _mark(b, g);
 
         g = gasleft();
-        bytes memory gate = Tensor.matmul(c.hidden, c.dim, b.weights, b.l.gate, normed);
-        bytes memory up = Tensor.matmul(c.hidden, c.dim, b.weights, b.l.up, normed);
+        bytes memory gate = Tensor.matmul(b.s, c.hidden, c.dim, b.weights, b.l.gate, normed);
+        bytes memory up = Tensor.matmul(b.s, c.hidden, c.dim, b.weights, b.l.up, normed);
         _mark(b, g);
 
         g = gasleft();
-        bytes memory gated = Tensor.swiglu(gate, up);
+        bytes memory gated = Tensor.swiglu(b.s, gate, up);
         _mark(b, g);
 
         g = gasleft();
-        Tensor.addInto(x, Tensor.matmul(c.dim, c.hidden, b.weights, b.l.down, gated));
+        Tensor.addInto(x, Tensor.matmul(b.s, c.dim, c.hidden, b.weights, b.l.down, gated));
         _mark(b, g);
     }
 }
