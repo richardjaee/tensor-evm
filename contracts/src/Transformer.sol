@@ -30,6 +30,9 @@ library Transformer {
         uint32 nKv;
         uint32 headDim;
         uint32 seqLen;
+        /// @dev Needed once a caller drives more than one block, which is what makes a
+        ///      forward pass resumable rather than a single library call.
+        uint32 nLayers;
         /// @dev Q32, from the checkpoint. Qwen3 specifies 1e-6 where Llama specifies 1e-5.
         int256 rmsEps;
     }

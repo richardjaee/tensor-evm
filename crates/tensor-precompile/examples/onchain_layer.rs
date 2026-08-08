@@ -277,7 +277,7 @@ fn main() {
     );
 
     // runLayer((uint32 x6,int256),(uint32 x7),address,uint256,(int256[] x7))
-    let sig = "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,int256),\
+    let sig = "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
 (uint32,uint32,uint32,uint32,uint32,uint32,uint32),address,uint256,\
 (int256[],int256[],int256[],int256[],int256[],int256[],int256[]))";
     let h = keccak256(sig.as_bytes());
@@ -291,6 +291,7 @@ fn main() {
         cfg.n_kv as u64,
         cfg.head_dim as u64,
         cfg.seq_len as u64,
+        1, // one layer here; the generator drives the full stack
     ] {
         data.extend_from_slice(&word(f));
     }
@@ -304,7 +305,7 @@ fn main() {
     data.extend_from_slice(&word(0)); // pos
 
     // Inputs is dynamic: a pointer, then its own head of seven pointers.
-    let head_words = 7 + 7 + 1 + 1 + 1;
+    let head_words = 8 + 7 + 1 + 1 + 1;
     data.extend_from_slice(&word(head_words as u64 * 32));
 
     let half = cfg.head_dim / 2;
@@ -400,7 +401,7 @@ fn main() {
     // that would otherwise be attributed to whichever operation happened to be under test.
     {
         let mut d = keccak256(
-            b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,int256),\
+            b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
 (uint32,uint32,uint32,uint32,uint32,uint32,uint32),address,uint256,\
 (int256[],int256[],int256[],int256[],int256[],int256[],int256[]))",
         )[..4]
