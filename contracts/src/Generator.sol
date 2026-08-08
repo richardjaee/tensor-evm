@@ -119,6 +119,17 @@ contract Generator {
         Tensor.Scratch memory scratch = Tensor.Scratch({buf: new bytes(cap), cap: cap});
 
         for (uint16 l = m.layer; l < last; ++l) {
+            // Memory in the EVM is never freed and is priced quadratically, so a call
+            // covering twenty-eight layers pays for twenty-eight layers' worth of high
+            // water mark. Nothing a layer allocates outlives it — the cache is re-read
+            // each time, the scratch buffer is allocated before this loop, and the
+            // residual stream came from before it — so the allocator is rewound after
+            // each one and the peak stays at a single layer.
+            uint256 mark;
+            assembly ("memory-safe") {
+                mark := mload(0x40)
+            }
+
             Transformer.Kv memory kv = _cacheFor(id, w.c, l, m.pos, kvw);
             Transformer.forwardLayer(
                 Transformer.Block({
@@ -134,6 +145,10 @@ contract Generator {
                 x
             );
             _writeCache(id, w.c, l, m.pos, kvw, kv);
+
+            assembly ("memory-safe") {
+                mstore(0x40, mark)
+            }
         }
     }
 
