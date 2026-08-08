@@ -58,25 +58,34 @@ pub const Q: u32 = 32;
 /// place: this kernel sums products in `i64` within a chunk, and an unbounded operand would
 /// wrap. See [`CHUNK`].
 ///
-/// It is emphatically not a claim that every value in a transformer is small. Queries and
-/// keys after QK-norm routinely exceed it, because Qwen3's `k_norm` scales by up to 96.5 —
-/// and the operations that consume them accumulate in `i128`, so they need no bound at all.
-/// The invariant is narrower than it first looks: whatever reaches a matmul is bounded, and
-/// that holds because matmul inputs are residual streams and normalised vectors rather than
-/// anything a norm weight has stretched.
-pub const MAX_ABS_ACTIVATION: i64 = 1 << 36;
+/// It is emphatically not a claim that every value in a transformer is small — a claim this
+/// project has now had to abandon three times. Qwen3's `k_norm` scales queries and keys by
+/// up to 96.5; its `input_norm` reaches 69.5 by layer 27 and its `post_norm` reaches 192.
+/// A normalised vector multiplied by those is nowhere near unit scale, and every earlier
+/// bound here was set by looking at layer 0 and generalising.
+///
+/// `2^44` is a real value of 4096, chosen against the largest norm weight in the checkpoint
+/// times the spread of a normalised vector, with room to spare. It is deliberately loose:
+/// the bound exists to keep `i64` from wrapping, not to express a belief about magnitudes.
+pub const MAX_ABS_ACTIVATION: i64 = 1 << 44;
 
 /// Products summed per `i64` accumulator before widening.
 ///
-/// The bound is arithmetic, not taste: a weight is at most `2^15`, an activation at most
-/// [`MAX_ABS_ACTIVATION`] = `2^36`, so each product is at most `2^51` and `2^11` of them
-/// reach `2^62` — one bit inside `i64`.
+/// Derived from [`MAX_ABS_ACTIVATION`] rather than chosen, so the two cannot drift apart. A
+/// weight is at most `2^15` and an activation at most `2^44`, so each product is at most
+/// `2^59` and `2^4` of them reach `2^63` — the chunk takes one bit less than that.
 ///
 /// Chunking exists because of what the alternative costs. Accumulating every product
 /// directly into an `i128` is correct and defeats auto-vectorisation, which measured as
 /// less than half the kernel's throughput. Summing within a chunk at `i64` keeps the hot
-/// loop vectorisable, and only the chunk totals — `cols/2048` of them — are widened.
-const CHUNK: usize = 1 << 11;
+/// loop vectorisable, and only the chunk totals are widened.
+///
+/// Raising the activation bound narrows the chunk, which is a real cost paid for
+/// correctness on real weights: at `2^44` the chunk is sixteen rather than two thousand.
+const CHUNK: usize = {
+    let bits = 63 - 15 - MAX_ABS_ACTIVATION.trailing_zeros() as usize - 1;
+    1 << bits
+};
 
 /// Whether every activation is inside [`MAX_ABS_ACTIVATION`].
 ///

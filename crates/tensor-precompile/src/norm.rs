@@ -228,15 +228,17 @@ mod tests {
             .collect()
     }
 
-    /// Norm weights are scale factors rather than activations, and real ones are large:
-    /// Qwen3's `k_norm` peaks at 96.5, well outside the bound that applies to activations.
-    /// Refusing those would refuse the model.
+    /// Norm weights are scale factors rather than activations, and are deliberately not
+    /// bounded. Real ones are large — Qwen3's `k_norm` peaks at 96.5 and its `post_norm` at
+    /// 192 — and nothing here overflows regardless, because every product is formed in
+    /// `i128`. The weight is checked well past the activation bound rather than just past
+    /// any particular checkpoint's values, so raising that bound cannot quietly turn this
+    /// into a test of nothing.
     #[test]
     fn accepts_norm_weights_beyond_the_activation_bound() {
         let (heads, hs) = (2usize, 8usize);
         let half = hs / 2;
-        // 96.5 in Q32, as k_norm actually contains.
-        let big = (96.5 * (1u64 << 32) as f64) as i64;
+        let big = tensor_kernel::MAX_ABS_ACTIVATION.saturating_mul(4);
         assert!(big > tensor_kernel::MAX_ABS_ACTIVATION);
 
         let weight = vec![big; hs];

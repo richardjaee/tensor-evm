@@ -53,7 +53,11 @@ contract Generator {
     struct Model {
         Transformer.Config c;
         Transformer.Layer[] layers;
-        Transformer.Norms norms;
+        /// @dev One set per layer. Norm weights are not shared — every block has its own
+        ///      input and post-attention norms, and its own per-head query and key norms —
+        ///      and reusing one set across twenty-eight layers would produce a fluent
+        ///      model that is not the one that was published.
+        Transformer.Norms[] norms;
         Transformer.RopeTable rope;
     }
 
@@ -120,7 +124,7 @@ contract Generator {
                 Transformer.Block({
                     c: w.c,
                     l: w.layers[l],
-                    n: w.norms,
+                    n: w.norms[l],
                     s: scratch,
                     p: Transformer.Profile({gas: new uint256[](0), at: 0})
                 }),
