@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.24;
 
+import {KvStore} from "./KvStore.sol";
 import {Session} from "./Session.sol";
 import {Tensor} from "./Tensor.sol";
 import {Transformer} from "./Transformer.sol";
@@ -29,11 +30,19 @@ contract Generator {
     mapping(bytes32 => Meta) public meta;
     /// @dev Residual stream, four Q32 values a slot.
     mapping(bytes32 => mapping(uint256 => uint256)) private _resid;
-    /// @dev Keys and values, indexed `(layer * seqLen + pos) * slots + i`, with values
-    ///      offset by a constant so both share one map without a second mapping's overhead.
-    mapping(bytes32 => mapping(uint256 => uint256)) private _kv;
-
-    uint256 private constant KV_VALUES = 1 << 128;
+    /// @dev Keys and values live in contract code, one deployment per layer per position,
+    ///      addressed by `layer * seqLen + pos`. Only the pointer is a storage slot.
+    ///
+    ///      Measured: 8KB of cache costs 5,716,966 gas as storage slots and 1,697,337 as
+    ///      code, and reading it back costs 600,539 against 7,378. Code is immutable, which
+    ///      would be fatal for the residual stream — rewritten every layer — and costs
+    ///      nothing here, because a cache entry is produced once at one position and read
+    ///      unchanged forever after.
+    ///
+    ///      Per layer rather than per position, because a step may cover only some layers
+    ///      and code cannot be appended to. The granularity has to match what a
+    ///      transaction can finish.
+    mapping(bytes32 => mapping(uint256 => address)) private _kvPtr;
 
     /// @notice Everything about the model a step needs, bundled.
     /// @dev Passed per call rather than stored: these are tens of kilobytes and storing
@@ -138,12 +147,25 @@ contract Generator {
         uint32 pos,
         uint256 kvw
     ) private view returns (Transformer.Kv memory kv) {
-        uint256 depth = (uint256(pos) + 1) * kvw;
-        uint256 base = (uint256(layer) * c.seqLen) * Session.slotsFor(kvw);
+        uint256 width = kvw * 8;
         kv = Transformer.Kv({
-            k: Session.load(_kv[id], base, depth),
-            v: Session.load(_kv[id], KV_VALUES + base, depth)
+            k: Tensor.alloc((uint256(pos) + 1) * kvw),
+            v: Tensor.alloc((uint256(pos) + 1) * kvw)
         });
+        // One deployment per earlier position, read whole. The account access dominates
+        // the copy — 2,600 against 3 gas a word — so this grows with context in account
+        // touches rather than in bytes.
+        for (uint256 t = 0; t <= pos; ++t) {
+            address ptr = _kvPtr[id][uint256(layer) * c.seqLen + t];
+            if (ptr == address(0)) continue; // this position is being written now
+            bytes memory k = kv.k;
+            bytes memory v = kv.v;
+            uint256 at = t * width;
+            assembly ("memory-safe") {
+                extcodecopy(ptr, add(add(k, 0x20), at), 1, width)
+                extcodecopy(ptr, add(add(v, 0x20), at), add(1, width), width)
+            }
+        }
     }
 
     /// @dev Only this position's slice is written back. Earlier positions are unchanged, and
@@ -156,20 +178,18 @@ contract Generator {
         uint256 kvw,
         Transformer.Kv memory kv
     ) private {
-        uint256 slots = Session.slotsFor(kvw);
-        uint256 base = (uint256(layer) * c.seqLen) * slots + uint256(pos) * slots;
-        bytes memory k = _tail(kv.k, pos, kvw);
-        bytes memory v = _tail(kv.v, pos, kvw);
-        Session.store(_kv[id], base, k);
-        Session.store(_kv[id], KV_VALUES + base, v);
-    }
-
-    function _tail(bytes memory a, uint32 pos, uint256 kvw) private pure returns (bytes memory out) {
-        out = Tensor.alloc(kvw);
-        uint256 from = uint256(pos) * kvw * 8;
+        // This position's slice only. Keys and values go into one deployment so a read
+        // costs one account access rather than two.
+        uint256 width = kvw * 8;
+        bytes memory blob = new bytes(width * 2);
+        uint256 from = uint256(pos) * width;
+        bytes memory k = kv.k;
+        bytes memory v = kv.v;
         assembly ("memory-safe") {
-            mcopy(add(out, 0x20), add(add(a, 0x20), from), mul(kvw, 8))
+            mcopy(add(blob, 0x20), add(add(k, 0x20), from), width)
+            mcopy(add(add(blob, 0x20), width), add(add(v, 0x20), from), width)
         }
+        _kvPtr[id][uint256(layer) * c.seqLen + pos] = KvStore.write(blob);
     }
 
     /// @notice The residual stream as it stands, for inspection between steps
