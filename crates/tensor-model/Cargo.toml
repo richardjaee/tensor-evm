@@ -9,6 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 tensor-kernel = { path = "../tensor-kernel" }
+# Only the determinism report uses this, to turn "these outputs are identical" into a
+# single line two machines can compare over a chat window.
+sha2 = "0.10"
+# The determinism report varies the thread count on purpose, to show the digest does not
+# follow it. That needs the pool the kernel is already parallelised over.
+rayon = "1"
 
 [dev-dependencies]
 tensor-kernel = { path = "../tensor-kernel" }

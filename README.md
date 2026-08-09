@@ -60,6 +60,22 @@ independent of the partitioning itself, not merely reproducible for one fixed pa
 `thread_count_does_not_change_result` is the regression test. If it fails, nodes with
 different core counts would fork the chain.
 
+That argument has now been measured rather than asserted. `determinism` hashes the kernel,
+the fixed-point primitives and a whole four-layer forward pass, and the digest is identical
+on an Apple M4, an Intel Xeon Platinum 8481C and an AMD EPYC 7B13 — two instruction sets,
+three vendors, two operating systems, and twelve thread configurations including counts
+that do not divide the work evenly:
+
+```sh
+cargo run --release -p tensor-model --bin determinism
+# OVERALL  0146f1d1cee7ad530188c43169bafdfe260fdc644c018810f8eddc6e18edcc14
+```
+
+It needs neither revm nor solc nor a network, so anyone can reproduce it on any machine in
+about a minute. What it shows is that the *arithmetic* is portable. It does not yet show
+that two nodes agree, which additionally covers block execution and gas accounting — see
+[`docs/results.md`](docs/results.md).
+
 ## Status
 
 Phase 0 complete and the premise holds. See [`docs/results.md`](docs/results.md) for the
@@ -146,6 +162,8 @@ activations stay in memory.
 
 ```
 crates/tensor-kernel/       deterministic integer matmul, plus the bandwidth benchmark
+crates/tensor-model/        the transformer, and the cross-machine determinism report
+crates/tensor-node/         a development chain carrying the precompiles, over JSON-RPC
 crates/tensor-precompile/   the EVM precompile, and its end-to-end tests
 contracts/src/              Solidity: the matmul library and the model registry
 tools/                      safetensors -> int16 conversion, and reference vectors

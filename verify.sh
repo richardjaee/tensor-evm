@@ -45,6 +45,19 @@ step "unit and integration tests" cargo test --release --quiet
 EXPECT="0 warnings|^$" step "lint" cargo clippy --all-targets --release --quiet -- -D warnings
 step "formatting" cargo fmt --all --check
 
+# The digest is pinned rather than merely recomputed. Any change to the arithmetic — a
+# rounding rule, a shift, an accumulator width — moves it, and moving it is exactly the
+# event that would fork a chain, so it should require someone to consciously update a
+# constant rather than pass quietly. This value is the one measured on aarch64/macOS,
+# x86_64 Intel and x86_64 AMD alike; see docs/results.md.
+DIGEST=0146f1d1cee7ad530188c43169bafdfe260fdc644c018810f8eddc6e18edcc14
+EXPECT="$DIGEST" step "determinism digest" \
+  cargo run --release --quiet -p tensor-model --bin determinism
+# Three threads, because a count that divides the work evenly would hide the bug this is
+# looking for.
+EXPECT="$DIGEST" step "determinism, 3 threads" \
+  cargo run --release --quiet -p tensor-model --bin determinism -- --threads 3
+
 if [ "$FULL" = 1 ]; then
   echo
   echo "tier two — needs models/, see README"

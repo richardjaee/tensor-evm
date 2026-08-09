@@ -509,3 +509,45 @@ experts variants need a router that does not exist yet.
 - The gas-to-time conversion uses Ethereum's throughput. A purpose-built chain would set a
   different gas schedule, which is the point — but the EVM figures are what a general chain
   charges today.
+
+## Cross-architecture determinism — the premise, finally measured
+
+Every claim in this repository rests on one property: two honest nodes on different
+hardware compute identical bits. Until now that was an argument from the design — integers
+have no reduction-order or FMA hazards, and the kernel partitions output rows without ever
+splitting an accumulator — backed by a single-machine regression test. The argument was
+never wrong, but it had never been run anywhere but one laptop, which is exactly the kind
+of assumption that turns out to be false in the one place it matters.
+
+`cargo run --release -p tensor-model --bin determinism` hashes three stages: the kernel
+across seven shapes straddling the parallel threshold, the fixed-point primitives swept
+rather than spot-checked, and the whole four-layer model over every position — logits *and*
+residual stream, so a drift too small to change a token is still caught. It needs neither
+revm nor solc nor a network, because determinism is a property of the arithmetic rather
+than of the EVM around it, which is what makes it runnable on a machine you were handed
+five minutes ago.
+
+| machine | arch | OS | threads | OVERALL |
+|---|---|---|---|---|
+| Apple M4 | aarch64 | macOS | 1, 2, 3, 5, 8, 14 | `0146f1d1…dcc14` |
+| Intel Xeon Platinum 8481C (c3) | x86_64 | Debian 12 | 1, 3, 4 | `0146f1d1…dcc14` |
+| AMD EPYC 7B13 (n2d) | x86_64 | Debian 12 | 1, 3, 4 | `0146f1d1…dcc14` |
+
+```
+matmul     4424 values  ae138fc81759bf09829ddf7f5878b1402a092261c728bb7423ff771c96a406ee
+fixed     16448 values  bd67b028a88362e2e2897c41ef3b72194005eee6fa82389e45951a2ef42bf750
+model       480 values  05acb9b13248d6cab6e405f9ea23f0cac56e14af1fc1535aedb1051f1a4e779b
+OVERALL                 0146f1d1cee7ad530188c43169bafdfe260fdc644c018810f8eddc6e18edcc14
+tokens generated        [124, 124, 42]
+```
+
+Three vendors, two instruction sets, two operating systems, twelve thread configurations:
+one digest. Thread counts include 3 and 5 deliberately, since a count that divides the work
+evenly would hide precisely the bug this is looking for.
+
+What it establishes is narrower than it looks, and worth stating exactly. It shows the
+arithmetic is portable — the property floating point cannot offer and the reason this
+design is integer-only. It does not show that two *nodes* agree, because agreement between
+nodes also covers block execution, state ordering and gas accounting, none of which this
+binary touches. That remains the next thing to measure, and it is now the only part of
+"verifiable" still resting on an argument rather than a number.
