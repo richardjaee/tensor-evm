@@ -154,6 +154,24 @@ docs/design.md              architecture, scaling analysis, non-goals, limitatio
 docs/results.md             every measurement, with the command that produces it
 ```
 
+## Running a chain
+
+```sh
+cargo run --release -p tensor-node    # JSON-RPC on 127.0.0.1:8545
+./demo.sh                             # upload a tensor, multiply by it, over RPC
+```
+
+The node seals a block per transaction and answers Ethereum's JSON-RPC, so `cast`, `forge`,
+MetaMask and a block explorer work against it unchanged — only the precompile set differs
+from any other EVM chain. It raises two of Ethereum's limits, and says so on startup: the
+transaction gas cap, because a token exceeds EIP-7825's 2^24, and the contract code size,
+because a layer of Qwen3-0.6B is 31.5MB against EIP-170's 24KB.
+
+It is not a client. There is no peer-to-peer, no consensus and no sync, so nobody can join
+it — a real deployment means these precompiles inside reth. What it does establish is that a
+model runs under an ordinary Ethereum interface, and that what it did is a matter of record
+afterwards rather than something that happened inside one process.
+
 ## Checking it works
 
 ```sh
