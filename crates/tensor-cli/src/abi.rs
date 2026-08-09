@@ -64,3 +64,19 @@ pub fn bytes_tuple(parts: &[&[u8]]) -> Vec<u8> {
 pub fn selector(sig: &str) -> Vec<u8> {
     keccak256(sig.as_bytes())[..4].to_vec()
 }
+
+/// A `bytes[]` argument: the array's length, then one offset per member relative to the
+/// start of the array, then the members themselves.
+pub fn bytes_array(parts: &[&[u8]]) -> Vec<u8> {
+    let tails: Vec<Vec<u8>> = parts.iter().map(|p| dyn_bytes(p)).collect();
+    let mut out = word(parts.len() as u64).to_vec();
+    let mut at = parts.len() * 32;
+    for t in &tails {
+        out.extend_from_slice(&word(at as u64));
+        at += t.len();
+    }
+    for t in tails {
+        out.extend_from_slice(&t);
+    }
+    out
+}

@@ -34,7 +34,10 @@ for _ in $(seq 1 50); do
 done
 printf '  pid %s on port %s\n' "$NODE_PID" "$PORT"
 
-RPC="http://127.0.0.1:$PORT" ./target/release/tensor-cli "${1:-testdata/tiny}"
+# Small chunks on purpose for the fixture: tensors straddle boundaries, so the directory
+# path a real model always takes is exercised rather than skipped.
+RPC="http://127.0.0.1:$PORT" CHUNK_BYTES=${CHUNK_BYTES:-8192} \
+  ./target/release/tensor-cli "${1:-testdata/tiny}"
 
 # The claim the chain exists to support: somebody else can check the work. The journal holds
 # the signed transactions, so replaying it verifies each signature and re-runs every token.

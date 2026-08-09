@@ -682,3 +682,74 @@ which generates at four chunk sizes chosen to split tensors mid-row and leave a 
 chunk; it was confirmed to fail against the old code before being kept. The precompile's own
 directory handling turned out to be correct at every offset and chunk size — that is now
 tested too, rather than assumed, since it had never been.
+
+## The real Qwen3-0.6B, on a live chain
+
+1.19 GB of weights uploaded to a running node as contract code, then five tokens generated
+by signed transactions over JSON-RPC, checked against float64.
+
+```
+layer 0 … 27   31,488,000 bytes each, 1,337 chunks each
+lm_head       311,316,864 bytes, 13,219 chunks
+total       1,192,980,864 bytes on chain
+
+position 0: token 21806    326,732,122 gas
+position 1: token   358    322,660,807 gas
+position 2: token   829    323,053,187 gas
+position 3: token   374    323,446,399 gas
+position 4: token   444    323,842,735 gas
+
+expected    [21806, 358, 829, 374, 444]
+chain       [21806, 358, 829, 374, 444]
+```
+
+1,215 transactions, 1,215 blocks, 270.7 billion gas. The upload took about three minutes.
+
+### The bug this found, which no fixture could
+
+The first attempt failed at `emitToken`, after all 28 layers had run. The classifier's
+directory listed **111 chunks where it should have listed 13,219**.
+
+`WeightStore._deploy` wrote the code length into the SSTORE2 prologue as a `uint16`. A chunk
+is capped at 24,000 bytes so it always fitted; a directory has no cap and grows with the
+model. Qwen3-0.6B's classifier needs 13,219 chunks, so its directory is 264,381 bytes, and
+264,381 mod 65,536 is 2,237 — the size actually deployed.
+
+Nothing reverted. The deploy succeeded and returned an address. Twenty-eight layers, whose
+directories are 26,741 bytes and fit, ran correctly. Only the classifier read weights that
+were not there.
+
+The prologue now uses a four-byte length and reverts past it rather than wrapping. `PUSH4`
+costs three gas more than `PUSH2`, once per upload; being unable to express a length is not
+a saving worth making.
+
+Two things are worth recording. The comment above `_deploy` warned about exactly this family
+of bug — it had shipped once already, as an offset that disagreed with a length — and it
+guarded the offset while leaving the length to wrap. And no fixture could have caught it: a
+directory only exceeds 65,536 bytes past about 3,277 chunks, which is 77 MB of weights. The
+test now brackets that boundary directly, at 3,276 and 3,277 entries, rather than through a
+model large enough to reach it.
+
+### Directory resolution is O(chunks), and it dominates
+
+| | gas |
+|---|---|
+| seed a position | 1,448,190 |
+| 28 layers | 286,749,930 |
+| classifier | 35,248,279 |
+| **per token** | **~323,800,000** |
+
+That is 10.2M gas a layer, against **648K measured earlier** for the same layer. The earlier
+figure was not wrong; it was measured with the layer in a single chunk, which no real model
+can be. The difference is the directory.
+
+`resolve` loads each chunk's code in order to learn its size, including the chunks it is
+about to skip, so reading a tensor near the end of a blob touches every chunk before it.
+A 31.5MB layer at 23,552-byte chunks is 1,337 accounts, and each of a layer's seven
+projections walks them again. The cost is O(chunks) per tensor read where it should be
+O(chunks actually read).
+
+This is a fixable property of the format rather than of the design: if each directory entry
+carried its chunk's cumulative offset, resolution could seek to the first relevant chunk
+instead of walking to it. That is the next thing to do, and it is worth roughly an order of
+magnitude on the dominant cost.

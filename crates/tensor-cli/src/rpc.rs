@@ -192,6 +192,32 @@ pub fn first_topic(receipt: &Value) -> Result<Address, String> {
     Ok(Address::from_slice(&b[12..]))
 }
 
+/// Every log's first indexed topic, as addresses, in the order they were emitted.
+///
+/// `storeMany` reports one `ChunkStored` per chunk, so a batched upload learns where all of
+/// its chunks landed from a single receipt.
+pub fn all_topics(receipt: &Value) -> Result<Vec<Address>, String> {
+    receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .ok_or("receipt has no logs")?
+        .iter()
+        .map(|l| {
+            let t = l
+                .get("topics")
+                .and_then(Value::as_array)
+                .and_then(|t| t.get(1))
+                .and_then(Value::as_str)
+                .ok_or("log has no indexed topic")?;
+            let b = unhex(t).ok_or("topic is not hex")?;
+            if b.len() != 32 {
+                return Err("topic is not a word".to_string());
+            }
+            Ok(Address::from_slice(&b[12..]))
+        })
+        .collect()
+}
+
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

@@ -30,8 +30,14 @@ library WeightStore {
     ///      value is what the uploader targets.
     uint256 internal constant MAX_CHUNK = 24_000;
 
+    /// @dev The largest body the prologue below can describe. Four bytes of length, so the
+    ///      bound is enormous and the check is cheap — the point is that exceeding it must
+    ///      revert rather than wrap.
+    uint256 internal constant MAX_BLOB = type(uint32).max - 1;
+
     error DeployFailed();
     error ChunkTooLarge(uint256 size);
+    error BlobTooLarge(uint256 size);
 
     /// @notice Deploy `data` as a chunk and return its address
     function storeChunk(bytes memory data) internal returns (address ptr) {
@@ -55,13 +61,24 @@ library WeightStore {
     }
 
     /// @dev The standard SSTORE2 prologue with a chosen leading byte. Length field and
-    ///      `CODECOPY` offset must agree: the prologue below is twelve bytes and the copy
-    ///      starts at twelve, where the tag sits. Shortening one without moving the other
+    ///      `CODECOPY` offset must agree: the prologue below is fourteen bytes and the copy
+    ///      starts at fourteen, where the tag sits. Shortening one without moving the other
     ///      deploys code that begins early, which nothing detects at write time — a bug
     ///      this project has already shipped once.
+    ///
+    ///      The length is four bytes rather than two. Two was enough for a chunk, which is
+    ///      capped at 24,000, and it silently wrapped for anything larger: a directory for
+    ///      Qwen3-0.6B's classifier is 264,381 bytes, and `uint16` turned that into 2,237.
+    ///      The deploy succeeded, the address came back, and the stored directory listed 111
+    ///      of its 13,219 chunks. Nothing reverted — the classifier simply read weights that
+    ///      were not there.
+    ///
+    ///      `PUSH4` costs three gas more than `PUSH2` once per upload. Being unable to
+    ///      express a length is not a saving worth making.
     function _deploy(uint8 tag, bytes memory data) private returns (address ptr) {
+        if (data.length > MAX_BLOB) revert BlobTooLarge(data.length);
         bytes memory init =
-            abi.encodePacked(hex"61", uint16(data.length + 1), hex"80600c6000396000f3", tag, data);
+            abi.encodePacked(hex"63", uint32(data.length + 1), hex"80600e6000396000f3", tag, data);
         assembly ("memory-safe") {
             ptr := create(0, add(init, 0x20), mload(init))
         }

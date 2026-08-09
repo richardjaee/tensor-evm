@@ -19,7 +19,7 @@
 mod abi;
 mod rpc;
 
-use abi::{addr_word, bytes_tuple, dyn_bytes, packed, selector, signed, word};
+use abi::{addr_word, bytes_array, bytes_tuple, dyn_bytes, packed, selector, signed, word};
 use alloy_primitives::Address;
 use rpc::Client;
 use std::path::{Path, PathBuf};
@@ -77,29 +77,60 @@ fn solc_bin(src: &Path, name: &str) -> Result<Vec<u8>, String> {
     rpc::unhex(hex).ok_or_else(|| "bytecode is not hex".to_string())
 }
 
-/// Bytes per chunk. Well under `WeightStore`'s 24,000 limit on purpose: a real layer is
-/// 31.5MB and spans hundreds of chunks, so uploading even a small fixture as several
-/// deliberately makes tensors cross chunk boundaries. A size that let each layer fit in one
-/// chunk would leave the directory path — the one every real model takes — unexercised.
-const CHUNK: usize = 8_192;
+/// Bytes per chunk, below `WeightStore`'s 24,000-byte limit.
+///
+/// Overridable because the two useful settings are opposite. A real model wants chunks as
+/// large as the contract allows, since a Qwen3-0.6B layer is 31.5MB and every chunk is an
+/// account. A fixture wants them small, so tensors straddle chunk boundaries and the
+/// directory path is genuinely exercised — that path is the one every real model takes, and
+/// leaving it unexercised is how it came to be broken.
+fn chunk_bytes() -> usize {
+    std::env::var("CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(23_552)
+}
+
+/// Bytes of chunk payload to put in one `storeMany` transaction.
+///
+/// Batching matters more than it looks. Every chunk becomes an account, and the node
+/// recomputes the state root over every account each block — measured at 0.53µs an account —
+/// so uploading a gigabyte one chunk per block spends hours inside the trie rather than the
+/// upload. Batching cuts the block count by the batch size and the trie work with it.
+const BATCH_BYTES: usize = 1 << 20;
 
 /// Stores a blob as contract code and returns the address to address it by.
 ///
 /// One chunk is stored directly; anything larger becomes several chunks and a directory
-/// that lists them. The precompile resolves either, so a caller holds one address whichever
+/// listing them. The precompile resolves either, so a caller holds one address whichever
 /// happened.
 fn upload(c: &mut Client, uploader: Address, blob: &[u8], what: &str) -> Result<Address, String> {
-    let store = selector("store(bytes)");
-    let mut chunks = Vec::new();
-    for (i, part) in blob.chunks(CHUNK).enumerate() {
-        let mut d = store.clone();
+    let size = chunk_bytes();
+    let parts: Vec<&[u8]> = blob.chunks(size).collect();
+
+    if parts.len() == 1 {
+        let mut d = selector("store(bytes)");
         d.extend_from_slice(&word(32));
-        d.extend_from_slice(&dyn_bytes(part));
-        let r = c.send(Some(uploader), d, &format!("{what} chunk {i}"))?;
-        chunks.push(rpc::first_topic(&r)?);
+        d.extend_from_slice(&dyn_bytes(parts[0]));
+        return rpc::first_topic(&c.send(Some(uploader), d, what)?);
     }
-    if chunks.len() == 1 {
-        return Ok(chunks[0]);
+
+    let mut chunks = Vec::with_capacity(parts.len());
+    let per_batch = (BATCH_BYTES / size).max(1);
+    for (i, batch) in parts.chunks(per_batch).enumerate() {
+        let mut d = selector("storeMany(bytes[])");
+        d.extend_from_slice(&word(32));
+        d.extend_from_slice(&bytes_array(batch));
+        let r = c.send(Some(uploader), d, &format!("{what} batch {i}"))?;
+        let got = rpc::all_topics(&r)?;
+        if got.len() != batch.len() {
+            return Err(format!(
+                "{what} batch {i}: stored {} chunks but heard about {}",
+                batch.len(),
+                got.len()
+            ));
+        }
+        chunks.extend(got);
     }
 
     let mut d = selector("finish(address[])");
@@ -108,8 +139,7 @@ fn upload(c: &mut Client, uploader: Address, blob: &[u8], what: &str) -> Result<
     for a in &chunks {
         d.extend_from_slice(&addr_word(*a));
     }
-    let r = c.send(Some(uploader), d, &format!("{what} directory"))?;
-    rpc::first_topic(&r)
+    rpc::first_topic(&c.send(Some(uploader), d, &format!("{what} directory"))?)
 }
 
 fn say(s: &str) {
@@ -216,7 +246,7 @@ fn run() -> Result<(), String> {
         }
         uploaded += blob.len();
 
-        let parts = blob.len().div_ceil(CHUNK);
+        let parts = blob.len().div_ceil(chunk_bytes());
         let at = upload(&mut c, uploader, &blob, &format!("layer {l}"))?;
         println!(
             "  layer {l}     {at:#x}  {} bytes in {parts} chunk{}",
@@ -232,7 +262,7 @@ fn run() -> Result<(), String> {
     println!(
         "  lm_head     {head:#x}  {} bytes in {} chunks",
         head_blob.len(),
-        head_blob.len().div_ceil(CHUNK)
+        head_blob.len().div_ceil(chunk_bytes())
     );
     println!("  total       {uploaded} bytes on chain");
 

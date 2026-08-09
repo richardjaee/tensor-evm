@@ -90,6 +90,35 @@ mod tests {
         assert_ne!(one, two, "a second account did not change the root");
     }
 
+    /// How the cost of a root scales with the number of accounts.
+    ///
+    /// Not an assertion about speed — it prints. Uploading a real model creates one account
+    /// per chunk, and Qwen3-0.6B is about 46,000 of them, so a root recomputed from scratch
+    /// every block is the thing that decides whether a real upload is minutes or hours.
+    #[test]
+    #[ignore = "a measurement, not a check; run with --ignored"]
+    fn root_cost_by_account_count() {
+        use revm::state::AccountInfo;
+        use std::time::Instant;
+        for n in [1_000usize, 5_000, 20_000, 50_000] {
+            let mut chain = Chain::new(&[]);
+            for i in 0..n {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                chain.db.insert_account_info(
+                    Address::new(a),
+                    AccountInfo {
+                        nonce: 1,
+                        ..Default::default()
+                    },
+                );
+            }
+            let t = Instant::now();
+            let _ = chain.state_root();
+            println!("{n:>7} accounts  {:?} per root", t.elapsed());
+        }
+    }
+
     /// Order of prefunding must not matter. It is the obvious way for two nodes to disagree
     /// while both being right, and the sort inside `state_root_unhashed` is what prevents
     /// it — this is the test that would catch its removal.
