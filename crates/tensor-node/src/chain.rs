@@ -30,6 +30,10 @@ pub struct Receipt {
     pub created: Option<Address>,
     pub gas_used: u64,
     pub success: bool,
+    /// The signed transaction exactly as it arrived. Kept because every honest answer about
+    /// a transaction — its nonce, its input, who signed it — is derivable from these bytes
+    /// and from nothing else a receipt happens to remember.
+    pub raw: Bytes,
     /// @dev What the transaction returned. A receipt does not carry this on Ethereum —
     ///      callers use `eth_call` for return values — but a chain whose whole point is
     ///      auditing should keep what a transaction produced next to the record that it
@@ -42,6 +46,14 @@ pub struct Block {
     pub number: u64,
     pub hash: B256,
     pub parent: B256,
+    /// The state root after this block. Recorded per block rather than only at the tip so
+    /// two nodes that diverge can be compared at the block where they first differed,
+    /// which is the difference between knowing there is a bug and knowing where it is.
+    pub state_root: B256,
+    /// The Merkle root over this block's transactions, computed rather than asserted. A
+    /// header that claims the empty root while carrying transactions is lying in a field
+    /// clients are entitled to check.
+    pub tx_root: B256,
     pub timestamp: u64,
     pub gas_used: u64,
     pub transactions: Vec<B256>,
@@ -51,6 +63,10 @@ pub struct Chain {
     pub db: CacheDB<EmptyDB>,
     pub blocks: Vec<Block>,
     pub receipts: Vec<Receipt>,
+    /// Where to append the raw signed transactions this node accepted, if it is recording.
+    /// A journal is what lets somebody else re-execute the chain without having to trust
+    /// this node's account of what happened.
+    pub journal: Option<std::path::PathBuf>,
 }
 
 impl Chain {
@@ -66,19 +82,26 @@ impl Chain {
                 },
             );
         }
-        let genesis = Block {
+        let mut chain = Self {
+            db,
+            blocks: Vec::new(),
+            receipts: Vec::new(),
+            journal: None,
+        };
+        chain.blocks.push(Block {
             number: 0,
             hash: B256::with_last_byte(1),
             parent: B256::ZERO,
+            state_root: chain.state_root(),
+            tx_root: alloy_trie::root::ordered_trie_root_with_encoder(
+                &[] as &[&Bytes],
+                |item: &&Bytes, buf: &mut Vec<u8>| buf.extend_from_slice(item),
+            ),
             timestamp: 0,
             gas_used: 0,
             transactions: Vec::new(),
-        };
-        Self {
-            db,
-            blocks: vec![genesis],
-            receipts: Vec::new(),
-        }
+        });
+        chain
     }
 
     pub fn head(&self) -> &Block {
@@ -112,7 +135,7 @@ impl Chain {
     }
 
     /// Executes a transaction, commits it, and seals a block around it.
-    pub fn apply(&mut self, tx: TxEnv, hash: B256) -> Result<usize, String> {
+    pub fn apply(&mut self, tx: TxEnv, hash: B256, raw: Bytes) -> Result<usize, String> {
         let from = tx.caller;
         let to = match tx.kind {
             TxKind::Call(a) => Some(a),
@@ -149,10 +172,17 @@ impl Chain {
 
         let number = self.head().number + 1;
         let parent = self.head().hash;
+        // After the commit above, so this is the state the block leaves behind rather than
+        // the one it started from.
+        let state_root = self.state_root();
         self.blocks.push(Block {
             number,
             hash: block_hash(number),
             parent,
+            state_root,
+            tx_root: alloy_trie::root::ordered_trie_root_with_encoder(&[&raw], |item, buf| {
+                buf.extend_from_slice(item)
+            }),
             timestamp: 1_700_000_000 + number * 2,
             gas_used: result.tx_gas_used(),
             transactions: vec![hash],
@@ -165,6 +195,7 @@ impl Chain {
             created,
             gas_used: result.tx_gas_used(),
             success: result.is_success(),
+            raw,
             output: output_of(&result),
             logs,
         });

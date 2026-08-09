@@ -18,6 +18,8 @@
 //! ```
 
 mod chain;
+mod replay;
+mod root;
 mod rpc;
 
 use chain::{Chain, CHAIN_ID, GAS_LIMIT, MAX_CODE_SIZE};
@@ -33,12 +35,31 @@ const DEV_ACCOUNT: [u8; 20] = [
 ];
 
 fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(8545);
+    let mut args = std::env::args().skip(1);
+    let mut port: u16 = 8545;
+    let mut journal = None;
+    let mut replay_from = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--journal" => journal = args.next().map(std::path::PathBuf::from),
+            "--replay" => replay_from = args.next().map(std::path::PathBuf::from),
+            other => port = other.parse().unwrap_or(port),
+        }
+    }
 
-    let chain = Arc::new(Mutex::new(Chain::new(&[Address::from(DEV_ACCOUNT)])));
+    // Replay is a whole mode rather than a flag on the server: it must not bind a port, so
+    // that re-executing a chain never depends on being able to serve one.
+    if let Some(path) = replay_from {
+        if let Err(e) = replay::replay(&path, &[Address::from(DEV_ACCOUNT)]) {
+            eprintln!("replay failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let mut c = Chain::new(&[Address::from(DEV_ACCOUNT)]);
+    c.journal = journal.clone();
+    let chain = Arc::new(Mutex::new(c));
     let server = tiny_http::Server::http(("127.0.0.1", port)).expect("could not bind");
 
     println!("tensor-node on http://127.0.0.1:{port}");
@@ -46,6 +67,9 @@ fn main() {
     println!("  gas limit          {GAS_LIMIT}");
     println!("  max code size      {} MB", MAX_CODE_SIZE / (1024 * 1024));
     println!("  prefunded          {:#x}", Address::from(DEV_ACCOUNT));
+    if let Some(j) = &journal {
+        println!("  journal            {}", j.display());
+    }
     println!("  precompiles        0x101 matmul   0x102 swiglu   0x103 norm+rope");
     println!("                     0x104 attention 0x105 rmsnorm 0x106 classify");
     println!(

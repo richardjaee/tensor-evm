@@ -190,6 +190,26 @@ it — a real deployment means these precompiles inside reth. What it does estab
 model runs under an ordinary Ethereum interface, and that what it did is a matter of record
 afterwards rather than something that happened inside one process.
 
+### Verification by re-execution
+
+The node journals the raw signed transactions it accepted, and any other machine can
+re-execute them from genesis and check it reaches the same state:
+
+```sh
+cargo run --release -p tensor-node -- --journal run.txt    # record while serving
+cargo run --release -p tensor-node -- --replay  run.txt    # re-execute anywhere
+```
+
+Replaying `testdata/demo.journal` gives byte-identical state roots — and identical gas — on
+an Apple M4, an Intel Xeon Platinum 8481C and an AMD EPYC 7B13, matching the roots the live
+node had already published over `eth_getBlockByNumber`. The roots are real Merkle-Patricia
+roots, so the comparison means something outside this program.
+
+That is the design's central claim, and it is now measured rather than argued: a wrong
+answer is not a matter of trust but of arithmetic anyone can redo. What it does not yet
+cover is a second independent client, and ordering — nodes agree here because they were
+handed the same journal, not because they gossiped. See [`docs/results.md`](docs/results.md).
+
 ## Checking it works
 
 ```sh

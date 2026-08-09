@@ -6,7 +6,7 @@
 //! chain presents is where compatibility lives, not the interpreter behind it.
 
 use crate::chain::{Chain, CHAIN_ID, GAS_LIMIT};
-use alloy_consensus::{transaction::SignerRecoverable, Transaction, TxEnvelope};
+use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_rlp::Decodable;
 use revm::context::TxEnv;
 use revm::primitives::{Address, Bytes, TxKind, B256, U256};
@@ -84,24 +84,62 @@ fn call_env(o: &Value) -> TxEnv {
     }
 }
 
+/// A transaction as JSON-RPC describes it, read back out of the signed bytes.
+///
+/// Derived from the envelope rather than from what the receipt happened to record. The
+/// earlier version invented a nonce of zero and an empty input, which every client believed
+/// because nothing about a JSON object says it is wrong — the bytes are the only account of
+/// a transaction that cannot drift from the truth.
+fn tx_json(chain: &Chain, hash: B256) -> Value {
+    let Some(r) = chain.receipts.iter().find(|r| r.hash == hash) else {
+        return Value::Null;
+    };
+    let Ok(env) = TxEnvelope::decode(&mut r.raw.as_ref()) else {
+        return Value::Null;
+    };
+    let sig = env.signature();
+    json!({
+        "hash": format!("{hash:#x}"),
+        "blockNumber": hex_u64(r.block),
+        "blockHash": format!("{:#x}", chain.blocks[r.block as usize].hash),
+        "transactionIndex": "0x0",
+        "from": format!("{:#x}", r.from),
+        "to": r.to.map(|a| format!("{a:#x}")),
+        "value": format!("{:#x}", env.value()),
+        "nonce": hex_u64(env.nonce()),
+        "gas": hex_u64(env.gas_limit()),
+        "gasPrice": "0x0",
+        "maxFeePerGas": "0x0",
+        "maxPriorityFeePerGas": "0x0",
+        "input": format!("0x{}", hex::encode(env.input())),
+        "type": hex_u64(env.tx_type() as u64),
+        "chainId": hex_u64(CHAIN_ID),
+        "accessList": [],
+        "v": hex_u64(sig.v() as u64),
+        "r": format!("{:#x}", sig.r()),
+        "s": format!("{:#x}", sig.s()),
+        "yParity": hex_u64(sig.v() as u64),
+    })
+}
+
 fn block_json(chain: &Chain, n: u64, full: bool) -> Value {
     let b = &chain.blocks[n as usize];
     let txs: Vec<Value> = if full {
-        b.transactions
-            .iter()
-            .map(|h| json!({"hash": format!("{h:#x}")}))
-            .collect()
+        b.transactions.iter().map(|h| tx_json(chain, *h)).collect()
     } else {
         b.transactions
             .iter()
             .map(|h| json!(format!("{h:#x}")))
             .collect()
     };
-    // The whole header, including the roots. A client deserialises a block into a typed
-    // struct and refuses one with fields missing, so an incomplete header reads as a
-    // malformed node rather than as a simplified one. The roots are zero because nothing
-    // here builds tries — which is exactly the kind of shortcut that makes this a
-    // development chain rather than a client.
+    // The whole header. A client deserialises a block into a typed struct and refuses one
+    // with fields missing, so an incomplete header reads as a malformed node rather than as
+    // a simplified one.
+    //
+    // `stateRoot` and `transactionsRoot` are computed for real. `receiptsRoot` is not: it
+    // would need the full receipt RLP with its bloom, and nothing here consumes it. It is
+    // reported as the empty root and named here as the shortcut it is, rather than left to
+    // look like a result.
     const EMPTY_ROOT: &str = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
     json!({
         "number": hex_u64(b.number),
@@ -109,8 +147,8 @@ fn block_json(chain: &Chain, n: u64, full: bool) -> Value {
         "parentHash": format!("{:#x}", b.parent),
         "nonce": "0x0000000000000000",
         "mixHash": format!("0x{}", "0".repeat(64)),
-        "stateRoot": format!("0x{}", "0".repeat(64)),
-        "transactionsRoot": EMPTY_ROOT,
+        "stateRoot": format!("{:#x}", b.state_root),
+        "transactionsRoot": format!("{:#x}", b.tx_root),
         "receiptsRoot": EMPTY_ROOT,
         "timestamp": hex_u64(b.timestamp),
         "gasUsed": hex_u64(b.gas_used),
@@ -222,28 +260,8 @@ pub fn handle(chain: &mut Chain, req: &Value) -> Value {
             let Some(raw) = params.first().and_then(|v| v.as_str()).and_then(hex_bytes) else {
                 return err(&id, -32602, "expected raw transaction bytes");
             };
-            let Ok(env) = TxEnvelope::decode(&mut raw.as_slice()) else {
-                return err(&id, -32602, "could not decode the transaction");
-            };
-            let Ok(from) = env.recover_signer() else {
-                return err(&id, -32000, "could not recover the sender");
-            };
-            let hash = *env.hash();
-            // The envelope implements `Transaction` across all of its variants, so a
-            // legacy, 2930, 1559 or 4844 transaction is read the same way.
-            let tx = TxEnv {
-                caller: from,
-                kind: env.kind(),
-                data: env.input().clone(),
-                value: env.value(),
-                gas_limit: env.gas_limit(),
-                gas_price: 0,
-                nonce: env.nonce(),
-                chain_id: Some(CHAIN_ID),
-                ..Default::default()
-            };
-            match chain.apply(tx, hash) {
-                Ok(_) => ok(&id, json!(format!("{hash:#x}"))),
+            match crate::replay::apply_raw(chain, &raw) {
+                Ok(hash) => ok(&id, json!(format!("{hash:#x}"))),
                 Err(e) => err(&id, -32000, &e),
             }
         }
@@ -258,26 +276,7 @@ pub fn handle(chain: &mut Chain, req: &Value) -> Value {
             else {
                 return err(&id, -32602, "expected a transaction hash");
             };
-            match chain.receipts.iter().find(|r| r.hash == h) {
-                Some(r) => ok(
-                    &id,
-                    json!({
-                        "hash": format!("{:#x}", r.hash),
-                        "blockNumber": hex_u64(r.block),
-                        "blockHash": format!("{:#x}", chain.blocks[r.block as usize].hash),
-                        "from": format!("{:#x}", r.from),
-                        "to": r.to.map(|a| format!("{a:#x}")),
-                        "gas": hex_u64(r.gas_used),
-                        "gasPrice": "0x0",
-                        "value": "0x0",
-                        "nonce": "0x0",
-                        "input": "0x",
-                        "transactionIndex": "0x0",
-                        "type": "0x2",
-                    }),
-                ),
-                None => ok(&id, Value::Null),
-            }
+            ok(&id, tx_json(chain, h))
         }
 
         "eth_getTransactionReceipt" => {

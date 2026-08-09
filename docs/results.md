@@ -551,3 +551,75 @@ design is integer-only. It does not show that two *nodes* agree, because agreeme
 nodes also covers block execution, state ordering and gas accounting, none of which this
 binary touches. That remains the next thing to measure, and it is now the only part of
 "verifiable" still resting on an argument rather than a number.
+
+## Two nodes agreeing — verification by re-execution, measured
+
+Cross-architecture determinism showed the *arithmetic* is portable. That is necessary and
+not sufficient: agreeing on a matmul is not agreeing on a chain, which also requires nodes
+to agree on which accounts exist, what code they hold, what every storage slot contains,
+how many times each account has sent, and what everything cost. A state root covers all of
+it in 32 bytes, so two nodes either produce the same hash or they have forked.
+
+The node now records the raw signed transactions it accepted, and `--replay` executes such
+a journal from genesis on a machine that never spoke to the original node. The journal
+carries signatures, so a replaying node recovers each sender rather than being told who
+they were — it is checking the transactions, not trusting a report about them.
+
+`testdata/demo.journal` is the recording of `demo.sh`: deploy an uploader, store a weight
+tensor as contract code, deploy the registry, register the model under its hash.
+
+| machine | arch | block 1 | block 4 (FINAL) |
+|---|---|---|---|
+| Apple M4 | aarch64 | `0x6df3b9ee…` | `0x5618b7f8…` |
+| Intel Xeon Platinum 8481C | x86_64 | `0x6df3b9ee…` | `0x5618b7f8…` |
+| AMD EPYC 7B13 | x86_64 | `0x6df3b9ee…` | `0x5618b7f8…` |
+
+```
+block           gas  state root
+    0             0  0x03e3b4afc4c929aba6511949b48be3d78a51b9c96757bff7e5ed398acbab210d
+    1        471234  0x6df3b9ee7b8b49e6becfeed95048ee55f3cd960cf97c849b40b605afb8c1da70
+    2         85334  0x63ae551d55fb314fd99cfbca8996fbfc5faf2503bfb0120a6c1d68c1307f1209
+    3       1322369  0xb9ca365d01527196e68a71c320ca0ba72e2b261de894cbbd31036e8b725f57d2
+    4        143157  0x5618b7f89cf47864ee58611808c9263d2d2d006b1df06aadd574c586c2810839
+```
+
+The gas column matches too, which the root does not cover and which would diverge first if
+pricing depended on anything machine-specific. And the roots the replaying machines
+computed are the roots the live node had already served over `eth_getBlockByNumber` — so
+the agreement is with what the chain published, not merely between two replays.
+
+The root is a real Merkle-Patricia root, computed as Ethereum computes it, verified against
+the known empty-trie constant. A sorted digest would have detected divergence just as well
+and been far easier, but it would have meant serving a field called `stateRoot` that no
+Ethereum tool could check — and a number that looks standard while meaning something else
+is worse than an obviously custom one.
+
+### What this closes, and what it does not
+
+Verification by re-execution now works end to end: transactions in, independent execution
+on unrelated hardware, agreement on a published commitment. That was the premise the whole
+design rests on, and it is no longer an argument.
+
+It is still one implementation. Three machines running the same binary agreeing rules out
+hardware, thread count, and OS — it does not rule out a bug in that binary, which a second
+independent client would. That is the honest remaining gap, and it is the same gap every
+young chain has; Ethereum's answer was multiple clients, and nothing here can substitute
+for one.
+
+There is also still no peer-to-peer and no consensus. Nodes agree here because a journal
+was handed to them, not because they gossiped and settled on an ordering. Ordering is the
+part a real deployment inside reth brings, and it is the last structural piece missing.
+
+### A correction the state root forced
+
+Making the header honest exposed that it was not. `transactionsRoot` was being reported as
+the empty root on blocks that contained transactions, and `eth_getTransactionByHash` was
+serving a nonce of zero and an empty input for every transaction — fabrications no client
+could detect, since nothing about a well-formed JSON object says it is false. Transactions
+are now serialised out of the signed bytes themselves, which is the only account of a
+transaction that cannot drift from the truth, and `transactionsRoot` is computed. This also
+fixed `cast block <n>`, which had been failing to deserialise every block but genesis.
+
+`receiptsRoot` is still the empty root. It would need full receipt RLP with blooms and
+nothing here consumes it — it is named as a shortcut in the code rather than left looking
+like a result.
