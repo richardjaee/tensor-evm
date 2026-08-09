@@ -623,3 +623,62 @@ fixed `cast block <n>`, which had been failing to deserialise every block but ge
 `receiptsRoot` is still the empty root. It would need full receipt RLP with blooms and
 nothing here consumes it — it is named as a shortcut in the code rather than left looking
 like a result.
+
+## A model generating tokens on a live chain, and the bug that found
+
+Until now the model always ran in the same process that held the state. That proves the
+arithmetic and the contracts, and it cannot prove the chain: a mistake shared between the
+executor and the state it executes against is invisible from inside.
+
+`tensor-cli` is a client and nothing else. It signs its own transactions, speaks only
+JSON-RPC over HTTP, and encodes every call by hand rather than importing the encoder the
+tests use — sharing that code would quietly reintroduce the shared assumption the client
+exists to remove. It uploads a transformer to a running node as contract code, drives
+`start`, `step` and `emitToken`, and compares what the chain emits against float64.
+
+```
+uploading weights as contract code
+  layer 0     0x603e1bd7…  25664 bytes in 4 chunks
+  …
+  total       110976 bytes on chain
+
+generating
+  position 0: token   124   3 transactions   1377684 gas
+  position 1: token   124   3 transactions   1208563 gas
+  position 2: token    42   3 transactions   1232173 gas
+
+expected    [124, 124, 42]
+chain       [124, 124, 42]
+```
+
+34 transactions, 34 blocks, 31.9M gas. Replaying the node's journal from genesis reaches
+`0xd89f39ad…`, the same root the live node published — so the tokens are not merely correct
+once, they are reproducible by anyone holding the transactions.
+
+### The bug: every real model would have produced wrong tokens
+
+A blob larger than 24,000 bytes is stored as several chunks behind a directory. Every test
+in this repository used a single chunk, and no real model can: a Qwen3-0.6B layer is 31.5MB,
+so **every layer of every real model is a directory**. The one configuration that mattered
+was the one never exercised.
+
+`Transformer._norm` read norm vectors with a direct `extcodecopy`, the only place a contract
+touches weights without going through a precompile. It understood single chunks only. Given
+a directory it copied the address table and used it as norm weights.
+
+Nothing reverted. The chain produced `[110, 15, 14]` where the model produces
+`[124, 124, 42]` — fluent, well-formed, wrong. On a chain whose purpose is auditability
+that is the worst failure mode available: an answer that looks like an answer.
+
+Two things are worth recording about how it was found. It was not found by testing, but by
+building a client that had to store weights the way a real deployment would, and the size
+limit forced the directory path into use. And the code carried a comment noting the
+single-chunk assumption — it identified the constraint as being about the *norms'* size,
+when the real constraint was the *layer's*, which is thirty times larger and never
+satisfiable.
+
+`_norm` now resolves both forms. The regression is `chunked_storage_generates_the_same_tokens`,
+which generates at four chunk sizes chosen to split tensors mid-row and leave a short final
+chunk; it was confirmed to fail against the old code before being kept. The precompile's own
+directory handling turned out to be correct at every offset and chunk size — that is now
+tested too, rather than assumed, since it had never been.

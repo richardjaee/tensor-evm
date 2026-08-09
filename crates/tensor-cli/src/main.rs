@@ -1,0 +1,354 @@
+//! Generating tokens on a running chain, from outside it.
+//!
+//! Every other check in this repository executes the model in the same process that holds
+//! the state. That proves the arithmetic and the contracts, but not the chain: a mistake
+//! shared between the executor and the state would be invisible, and nothing about it looks
+//! like a system anyone could join.
+//!
+//! This uploads a model to a live node as contract code, then drives a generation through
+//! `start`, `step` and `emitToken` with signed transactions over JSON-RPC, and compares the
+//! tokens the chain emits against what float64 says the model produces. The client shares
+//! no memory with the node and no code with the tests — it encodes calls by hand for that
+//! reason — so agreement means the chain did the work.
+//!
+//! ```text
+//! cargo run --release -p tensor-node -- --journal run.txt &
+//! cargo run --release -p tensor-cli
+//! ```
+
+mod abi;
+mod rpc;
+
+use abi::{addr_word, bytes_tuple, dyn_bytes, packed, selector, signed, word};
+use alloy_primitives::Address;
+use rpc::Client;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The account every development chain funds first; the key is public by design.
+const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const GAS: u64 = 2_000_000_000;
+/// Qwen3's epsilon in Q32, which is what the fixture was generated against.
+const RMS_EPS: i64 = 4_295;
+
+fn read(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
+}
+
+fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>, String> {
+    Ok(read(dir, name)?
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect())
+}
+
+fn meta(s: &str, key: &str) -> Result<usize, String> {
+    let at = s
+        .find(&format!("\"{key}\":"))
+        .ok_or_else(|| format!("meta.json has no {key}"))?;
+    s[at + key.len() + 3..]
+        .split([',', '\n', '}'])
+        .next()
+        .ok_or("truncated")?
+        .trim()
+        .parse()
+        .map_err(|e| format!("{key}: {e}"))
+}
+
+/// Compiles a contract and returns its deployment bytecode.
+fn solc_bin(src: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let out = Command::new("solc")
+        .args(["--optimize", "--optimize-runs", "200", "--bin"])
+        .arg(src)
+        .output()
+        .map_err(|e| format!("solc: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("solc: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let at = text
+        .find(&format!(":{name} ======="))
+        .ok_or_else(|| format!("{name} not in solc output"))?;
+    let hex = text[at..]
+        .lines()
+        .find(|l| l.starts_with("60"))
+        .ok_or("no bytecode")?
+        .trim();
+    rpc::unhex(hex).ok_or_else(|| "bytecode is not hex".to_string())
+}
+
+/// Bytes per chunk. Well under `WeightStore`'s 24,000 limit on purpose: a real layer is
+/// 31.5MB and spans hundreds of chunks, so uploading even a small fixture as several
+/// deliberately makes tensors cross chunk boundaries. A size that let each layer fit in one
+/// chunk would leave the directory path — the one every real model takes — unexercised.
+const CHUNK: usize = 8_192;
+
+/// Stores a blob as contract code and returns the address to address it by.
+///
+/// One chunk is stored directly; anything larger becomes several chunks and a directory
+/// that lists them. The precompile resolves either, so a caller holds one address whichever
+/// happened.
+fn upload(c: &mut Client, uploader: Address, blob: &[u8], what: &str) -> Result<Address, String> {
+    let store = selector("store(bytes)");
+    let mut chunks = Vec::new();
+    for (i, part) in blob.chunks(CHUNK).enumerate() {
+        let mut d = store.clone();
+        d.extend_from_slice(&word(32));
+        d.extend_from_slice(&dyn_bytes(part));
+        let r = c.send(Some(uploader), d, &format!("{what} chunk {i}"))?;
+        chunks.push(rpc::first_topic(&r)?);
+    }
+    if chunks.len() == 1 {
+        return Ok(chunks[0]);
+    }
+
+    let mut d = selector("finish(address[])");
+    d.extend_from_slice(&word(32));
+    d.extend_from_slice(&word(chunks.len() as u64));
+    for a in &chunks {
+        d.extend_from_slice(&addr_word(*a));
+    }
+    let r = c.send(Some(uploader), d, &format!("{what} directory"))?;
+    rpc::first_topic(&r)
+}
+
+fn say(s: &str) {
+    println!("\n\x1b[1m{s}\x1b[0m");
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("\n\x1b[31mfailed:\x1b[0m {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let url = std::env::var("RPC").unwrap_or_else(|_| "http://127.0.0.1:8545".into());
+    let dir: PathBuf = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("workspace root")
+                .join("testdata/tiny")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .into();
+
+    let mut c = Client::new(&url, KEY, GAS)?;
+    say("chain");
+    println!("  rpc         {url}");
+    println!("  sender      {:#x}", c.address());
+    println!("  block       {}", c.block_number()?);
+
+    // ---- the model ----
+    let mj = std::fs::read_to_string(dir.join("meta.json"))
+        .map_err(|e| format!("{}: {e}", dir.join("meta.json").display()))?;
+    let dim = meta(&mj, "dim")?;
+    let hidden = meta(&mj, "hidden")?;
+    let n_layers = meta(&mj, "n_layers")?;
+    let n_heads = meta(&mj, "n_heads")?;
+    let n_kv = meta(&mj, "n_kv")?;
+    let head_dim = meta(&mj, "head_dim")?;
+    let vocab = meta(&mj, "vocab")?;
+    let positions = meta(&mj, "positions")?;
+    let (q_width, kv_width, half) = (n_heads * head_dim, n_kv * head_dim, head_dim / 2);
+
+    say("model");
+    println!("  fixture     {}", dir.display());
+    println!("  layers      {n_layers}   dim {dim}   hidden {hidden}");
+    println!("  heads       {n_heads} query, {n_kv} kv, head_dim {head_dim}");
+    println!("  vocab       {vocab}   positions {positions}");
+
+    // ---- deploy the runtime ----
+    let contracts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .join("contracts/src");
+
+    say("deploying");
+    let up = solc_bin(&contracts.join("WeightStore.sol"), "Uploader")?;
+    let uploader = rpc::created(&c.send(None, up, "deploy Uploader")?)?;
+    println!("  uploader    {uploader:#x}");
+    let gen_bin = solc_bin(&contracts.join("Generator.sol"), "Generator")?;
+    let generator = rpc::created(&c.send(None, gen_bin, "deploy Generator")?)?;
+    println!("  generator   {generator:#x}");
+
+    // ---- upload the weights ----
+    //
+    // One blob per layer: seven tensors then four norm vectors, laid out contiguously, with
+    // the offset of each recorded so the contract can address into it. This is the layout a
+    // 31.5MB layer uses; nothing about it is special to a fixture this small.
+    let shapes: [(&str, usize, usize); 7] = [
+        ("q", q_width, dim),
+        ("k", kv_width, dim),
+        ("v", kv_width, dim),
+        ("o", dim, q_width),
+        ("gate", hidden, dim),
+        ("up", hidden, dim),
+        ("down", dim, hidden),
+    ];
+
+    say("uploading weights as contract code");
+    let mut layer_at: Vec<Address> = Vec::with_capacity(n_layers);
+    let mut offsets = vec![[0u64; 11]; n_layers];
+    let mut uploaded = 0usize;
+    for (l, off) in offsets.iter_mut().enumerate() {
+        let mut blob = Vec::new();
+        for (i, (name, rows, cols)) in shapes.iter().enumerate() {
+            let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
+            if raw.len() != rows + rows * cols * 2 {
+                return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
+            }
+            off[i] = blob.len() as u64;
+            blob.extend_from_slice(&raw);
+        }
+        for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
+            .iter()
+            .enumerate()
+        {
+            off[7 + j] = blob.len() as u64;
+            blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))?));
+        }
+        uploaded += blob.len();
+
+        let parts = blob.len().div_ceil(CHUNK);
+        let at = upload(&mut c, uploader, &blob, &format!("layer {l}"))?;
+        println!(
+            "  layer {l}     {at:#x}  {} bytes in {parts} chunk{}",
+            blob.len(),
+            if parts == 1 { "" } else { "s" }
+        );
+        layer_at.push(at);
+    }
+
+    let head_blob = read(&dir, "lm_head.bin")?;
+    let head = upload(&mut c, uploader, &head_blob, "lm_head")?;
+    uploaded += head_blob.len();
+    println!(
+        "  lm_head     {head:#x}  {} bytes in {} chunks",
+        head_blob.len(),
+        head_blob.len().div_ceil(CHUNK)
+    );
+    println!("  total       {uploaded} bytes on chain");
+
+    // ---- generate ----
+    let final_norm = read_i64(&dir, "final_norm.bin")?;
+    let embed = read_i64(&dir, "embed.bin")?;
+    let cos = read_i64(&dir, "cos.bin")?;
+    let sin = read_i64(&dir, "sin.bin")?;
+
+    let config = |out: &mut Vec<u8>| {
+        for f in [dim, hidden, n_heads, n_kv, head_dim, positions, n_layers] {
+            out.extend_from_slice(&word(f as u64));
+        }
+        out.extend_from_slice(&signed(RMS_EPS));
+    };
+
+    let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
+(bytes,bytes)),uint16)";
+    let emit_sig = "emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
+bytes,address,uint32,uint32)";
+    // A session id nobody else is using. Sessions are owned and keyed, so two generations
+    // can run at once without one destroying the other.
+    let id = [0x7au8; 32];
+
+    say("generating");
+    println!("  each position: seed, run every layer, classify\n");
+    let mut tokens = Vec::with_capacity(positions);
+    for pos in 0..positions {
+        let before = c.gas_used;
+
+        let mut d = selector(if pos == 0 {
+            "start(bytes32,bytes)"
+        } else {
+            "feed(bytes32,bytes)"
+        });
+        d.extend_from_slice(&id);
+        d.extend_from_slice(&word(2 * 32));
+        d.extend_from_slice(&dyn_bytes(&packed(&embed[pos * dim..(pos + 1) * dim])));
+        c.send(Some(generator), d, "seed")?;
+
+        // The model, re-encoded per position: the rotary table is the only part that
+        // depends on where in the sequence we are.
+        let mut model = Vec::new();
+        config(&mut model);
+        let mut layers = word(n_layers as u64).to_vec();
+        for (l, off) in offsets.iter().enumerate() {
+            layers.extend_from_slice(&addr_word(layer_at[l]));
+            for o in off {
+                layers.extend_from_slice(&word(*o));
+            }
+        }
+        let a = pos * half;
+        let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
+        let head_off = 10 * 32;
+        model.extend_from_slice(&word(head_off as u64));
+        model.extend_from_slice(&word((head_off + layers.len()) as u64));
+        model.extend_from_slice(&layers);
+        model.extend_from_slice(&rope);
+
+        let mut done = 0usize;
+        let mut steps = 0;
+        while done < n_layers {
+            let mut d = selector(step_sig);
+            d.extend_from_slice(&id);
+            d.extend_from_slice(&word(3 * 32));
+            d.extend_from_slice(&word(n_layers as u64));
+            d.extend_from_slice(&model);
+            let r = c.send(Some(generator), d, &format!("step from layer {done}"))?;
+            let out = c.output_of(&r)?;
+            let next = rpc::word_at(&out, 0).ok_or("step returned no layer")? as usize;
+            if next <= done {
+                return Err(format!("step did not advance past layer {done}"));
+            }
+            done = next;
+            steps += 1;
+        }
+
+        let mut d = selector(emit_sig);
+        d.extend_from_slice(&id);
+        config(&mut d);
+        d.extend_from_slice(&word(13 * 32));
+        d.extend_from_slice(&addr_word(head));
+        d.extend_from_slice(&word(0));
+        d.extend_from_slice(&word(vocab as u64));
+        d.extend_from_slice(&dyn_bytes(&packed(&final_norm)));
+        let r = c.send(Some(generator), d, "emitToken")?;
+        let out = c.output_of(&r)?;
+        let token = rpc::word_at(&out, 0).ok_or("emitToken returned no token")? as u32;
+        tokens.push(token);
+
+        println!(
+            "  position {pos}: token {token:>5}   {} transactions   {} gas",
+            steps + 2,
+            c.gas_used - before
+        );
+    }
+
+    // ---- against what float64 says ----
+    say("what float64 says");
+    let want: Vec<u32> = read(&dir, "tokens.bin")?
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+        .collect();
+    println!("  expected    {want:?}");
+    println!("  chain       {tokens:?}");
+
+    say("chain state");
+    println!("  blocks      {}", c.block_number()?);
+    println!("  sent        {} transactions", c.sent);
+    println!("  gas         {}", c.gas_used);
+    println!("  state root  {}", c.state_root()?);
+
+    if tokens != want {
+        return Err("the chain emitted different tokens".into());
+    }
+    println!("\n\x1b[1m  match: yes\x1b[0m — every token, generated on chain\n");
+    Ok(())
+}

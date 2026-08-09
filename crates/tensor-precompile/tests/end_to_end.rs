@@ -48,6 +48,46 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Places a blob in the database the way an upload would leave it, as one chunk or as
+/// several behind a directory, and returns the address to address it by.
+fn place(db: &mut CacheDB<EmptyDB>, at: Address, blob: Vec<u8>, chunk: usize) {
+    if chunk == 0 || blob.len() <= chunk {
+        db.insert_account_info(
+            at,
+            AccountInfo {
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
+                ..Default::default()
+            },
+        );
+        return;
+    }
+    let mut dir = vec![0x01u8]; // TAG_DIRECTORY
+    for (i, part) in blob.chunks(chunk).enumerate() {
+        let mut a = *at
+            .as_slice()
+            .last_chunk::<20>()
+            .expect("address is 20 bytes");
+        a[0] = 0xc0;
+        a[17..19].copy_from_slice(&(i as u16).to_be_bytes());
+        let part_at = Address::new(a);
+        db.insert_account_info(
+            part_at,
+            AccountInfo {
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(part.to_vec())))),
+                ..Default::default()
+            },
+        );
+        dir.extend_from_slice(part_at.as_slice());
+    }
+    db.insert_account_info(
+        at,
+        AccountInfo {
+            code: Some(Bytecode::new_raw(Bytes::from(dir))),
+            ..Default::default()
+        },
+    );
+}
+
 fn layer_addr(l: usize) -> Address {
     let mut a = [0u8; 20];
     a[0] = 0xa0;
@@ -199,6 +239,19 @@ impl Chain {
 /// not depend on it — a token split across transactions is the same token — which is the
 /// property `granularity_does_not_change_the_output` checks.
 fn generate(per_call: usize, session: u8) -> Vec<u32> {
+    generate_stored(per_call, session, 0)
+}
+
+/// As above, but storing each blob as `chunk`-byte chunks behind a directory when `chunk`
+/// is non-zero.
+///
+/// Every test here used a single chunk until this existed, and that is the configuration no
+/// real model can have: a Qwen3-0.6B layer is 31.5MB against a 24,000-byte chunk limit, so
+/// every layer of every real model is a directory. The gap was not hypothetical — norm
+/// vectors were being read with a direct `extcodecopy` that understood only single chunks,
+/// so a directory returned its address table interpreted as weights. It generated tokens
+/// without reverting; they were simply the wrong ones.
+fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
     let dir = root().join("testdata/tiny");
     let mj = std::fs::read_to_string(dir.join("meta.json")).expect("meta.json");
 
@@ -231,16 +284,7 @@ fn generate(per_call: usize, session: u8) -> Vec<u32> {
             ..Default::default()
         },
     );
-    db.insert_account_info(
-        HEAD,
-        AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(tagged(read(
-                &dir,
-                "lm_head.bin",
-            ))))),
-            ..Default::default()
-        },
-    );
+    place(&mut db, HEAD, read(&dir, "lm_head.bin"), chunk);
 
     // Seven tensors then four norm vectors, one blob and one address per layer — the layout
     // the chain actually holds.
@@ -269,13 +313,7 @@ fn generate(per_call: usize, session: u8) -> Vec<u32> {
             off[7 + j] = blob.len() as u64;
             blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))));
         }
-        db.insert_account_info(
-            layer_addr(l),
-            AccountInfo {
-                code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
-                ..Default::default()
-            },
-        );
+        place(&mut db, layer_addr(l), blob, chunk);
     }
 
     let final_norm = read_i64(&dir, "final_norm.bin");
@@ -374,6 +412,23 @@ fn expected() -> Vec<u32> {
 #[test]
 fn generates_the_tokens_float64_produces() {
     assert_eq!(generate(usize::MAX, 0x01), expected());
+}
+
+/// Weights stored as a directory of chunks must generate exactly the same tokens.
+///
+/// This is the configuration every real model is in, and it was the one never tested. Chunk
+/// sizes are picked to split tensors mid-row and to leave a short final chunk, since a size
+/// that divided a layer evenly would miss the boundary arithmetic entirely.
+#[test]
+fn chunked_storage_generates_the_same_tokens() {
+    let want = expected();
+    for (i, chunk) in [1000usize, 4096, 8192, 23_999].into_iter().enumerate() {
+        assert_eq!(
+            generate_stored(usize::MAX, 0x40 + i as u8, chunk),
+            want,
+            "{chunk}-byte chunks gave different tokens"
+        );
+    }
 }
 
 /// Splitting a token across transactions must not change it.

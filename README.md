@@ -164,6 +164,7 @@ activations stay in memory.
 crates/tensor-kernel/       deterministic integer matmul, plus the bandwidth benchmark
 crates/tensor-model/        the transformer, and the cross-machine determinism report
 crates/tensor-node/         a development chain carrying the precompiles, over JSON-RPC
+crates/tensor-cli/          a client that generates tokens on a chain over JSON-RPC
 crates/tensor-precompile/   the EVM precompile, and its end-to-end tests
 contracts/src/              Solidity: the matmul library and the model registry
 tools/                      safetensors -> int16 conversion, and reference vectors
@@ -189,6 +190,22 @@ It is not a client. There is no peer-to-peer, no consensus and no sync, so nobod
 it — a real deployment means these precompiles inside reth. What it does establish is that a
 model runs under an ordinary Ethereum interface, and that what it did is a matter of record
 afterwards rather than something that happened inside one process.
+
+### A model generating tokens on a chain
+
+```sh
+./generate.sh          # node, upload, generate, then replay it all independently
+```
+
+A client that shares no memory with the node and no code with the tests uploads a
+transformer as contract code, drives a generation over JSON-RPC, and checks the tokens
+against float64 — then the node's recording is replayed from genesis to confirm a second
+execution reaches the same state.
+
+Finding this worth doing was not academic: storing weights the way a real deployment must —
+chunked, behind a directory, since a 31.5MB layer cannot be one 24,000-byte chunk — exposed
+a bug that would have given **every real model wrong tokens, without reverting**. See
+[`docs/results.md`](docs/results.md).
 
 ### Verification by re-execution
 

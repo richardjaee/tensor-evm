@@ -292,3 +292,101 @@ fn both_forms_coexist() {
     );
     assert_eq!(decode(output(&result)).unwrap(), expected);
 }
+
+/// A blob split across several chunk accounts, with a directory listing them.
+///
+/// This is how every real model is stored — a Qwen3-0.6B layer is 31.5MB against a 24,000
+/// byte chunk limit — and until this test existed, every test in this repository used a
+/// single chunk instead. The path all production traffic takes was the one path never
+/// exercised.
+fn db_with_directory(blob: Vec<u8>, chunk: usize) -> CacheDB<EmptyDB> {
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(
+        CALLER,
+        AccountInfo {
+            balance: U256::from(1u64) << 100,
+            ..Default::default()
+        },
+    );
+    let mut dir = vec![0x01u8]; // TAG_DIRECTORY
+    for (i, part) in blob.chunks(chunk).enumerate() {
+        let mut a = [0u8; 20];
+        a[0] = 0xc0;
+        a[18..].copy_from_slice(&(i as u16).to_be_bytes());
+        let at = Address::new(a);
+        db.insert_account_info(
+            at,
+            AccountInfo {
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(part.to_vec())))),
+                ..Default::default()
+            },
+        );
+        dir.extend_from_slice(at.as_slice());
+    }
+    db.insert_account_info(
+        WEIGHTS,
+        AccountInfo {
+            code: Some(Bytecode::new_raw(Bytes::from(dir))),
+            ..Default::default()
+        },
+    );
+    db
+}
+
+/// A directory must give exactly what one chunk gives, at every offset and every split.
+///
+/// Chunk sizes are chosen so the boundary lands inside a weight row rather than between
+/// rows, which is the case a size that happened to divide the tensor evenly would miss.
+#[test]
+fn a_directory_of_chunks_reads_the_same_as_one() {
+    let (rows, cols) = (64, 96);
+    let (scales, weights, acts) = fixture(rows, cols);
+
+    let mut expected = vec![0i64; rows];
+    matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
+
+    let blob = weight_blob(rows, cols, &scales, &weights);
+    let input = encode_state(rows, cols, WEIGHTS, 0, &acts);
+
+    for chunk in [7usize, 64, 1000, 4096, blob.len() - 1] {
+        let result = run(
+            db_with_directory(blob.clone(), chunk),
+            MATMUL_STATE_ADDRESS,
+            input.clone(),
+            16_000_000,
+        );
+        let got = decode(output(&result)).expect("output must decode");
+        assert_eq!(got, expected, "{chunk}-byte chunks gave a different answer");
+    }
+}
+
+/// The same, but reading a tensor that does not start at the beginning of the blob — which
+/// is every tensor in a real layer except the first.
+#[test]
+fn a_directory_reads_correctly_from_an_offset() {
+    let (rows, cols) = (32, 48);
+    let (scales, weights, acts) = fixture(rows, cols);
+
+    let mut expected = vec![0i64; rows];
+    matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
+
+    // A blob holding the tensor after some other tensor's bytes, as a layer's does.
+    let lead = 1234usize;
+    let mut blob = vec![0xabu8; lead];
+    blob.extend(weight_blob(rows, cols, &scales, &weights));
+
+    for chunk in [17usize, 256, 999] {
+        let input = encode_state(rows, cols, WEIGHTS, lead as u32, &acts);
+        let result = run(
+            db_with_directory(blob.clone(), chunk),
+            MATMUL_STATE_ADDRESS,
+            input,
+            16_000_000,
+        );
+        let got = decode(output(&result)).expect("output must decode");
+        assert_eq!(
+            got, expected,
+            "{chunk}-byte chunks at offset {lead} gave a different answer"
+        );
+    }
+}

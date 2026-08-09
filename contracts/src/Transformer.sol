@@ -20,6 +20,12 @@ import {Tensor} from "./Tensor.sol";
 ///      crosses the call boundary is an address and an offset; passing them as arguments
 ///      costs about 31,500 times more than multiplying by them.
 library Transformer {
+    /// @dev How an uploaded blob announces its shape, matching `WeightStore`.
+    uint8 internal constant TAG_CHUNK = 0x00;
+    uint8 internal constant TAG_DIRECTORY = 0x01;
+
+    error BadBlob();
+
     /// @notice Geometry. `headDim` is independent of `dim / nHeads` — in Qwen3-0.6B it is
     ///         128 against 64, so the query and output projections are not square, and code
     ///         assuming otherwise produces fluent nonsense.
@@ -137,19 +143,72 @@ library Transformer {
     /// @dev A Q32 vector read straight out of contract code. Three gas a word against
     ///      sixteen a byte for calldata, and the values are identical every call.
     ///
-    ///      The `+ 1` skips the tag byte every uploaded blob carries, which distinguishes a
-    ///      chunk from a directory of chunks. This is the one place a contract reads weights
-    ///      without going through a precompile, so it is the one place that has to know.
+    ///      This is the one place a contract reads weights without going through a
+    ///      precompile, so it is the one place that has to understand how a blob is stored.
+    ///      A blob is either a single chunk — a tag byte then the bytes — or a directory: a
+    ///      tag byte then twenty bytes per chunk. Both must be handled here, because a real
+    ///      layer has no choice about which it is. Qwen3-0.6B's is 31.5MB against a chunk
+    ///      limit of 24,000 bytes, so every layer of every real model is a directory.
     ///
-    ///      It also means norm weights must live in a single chunk. They are a few kilobytes
-    ///      and a chunk holds twenty-four, so that holds for any model of this shape — but
-    ///      it is an assumption rather than a guarantee, and a wide enough model would need
-    ///      this to resolve across chunks like everything else.
+    ///      An earlier version handled only the single-chunk case, and the failure was
+    ///      silent: reading a directory returned its address table interpreted as norm
+    ///      weights, which is well-formed nonsense. It generated tokens, they were simply
+    ///      the wrong ones.
     function _norm(address at, uint32 offset, uint256 n) private view returns (bytes memory out) {
         out = new bytes(n * 8);
+        uint256 tag;
         assembly ("memory-safe") {
-            extcodecopy(at, add(out, 0x20), add(offset, 1), mul(n, 8))
+            // Scratch space at 0x00 is scratch precisely so one byte may be read into it
+            // without disturbing the allocator.
+            extcodecopy(at, 0x00, 0, 1)
+            tag := byte(0, mload(0x00))
         }
+        if (tag == TAG_CHUNK) {
+            assembly ("memory-safe") {
+                extcodecopy(at, add(out, 0x20), add(offset, 1), mul(n, 8))
+            }
+        } else if (tag == TAG_DIRECTORY) {
+            // A separate function rather than a branch, because the walk needs more locals
+            // than the compiler can reach from inside a caller this large.
+            _spanFromDirectory(at, offset, out);
+        } else {
+            revert BadBlob();
+        }
+    }
+
+    /// @dev Fills `out` from a directory, crossing chunk boundaries as needed.
+    function _spanFromDirectory(address at, uint256 want, bytes memory out) private view {
+        bytes memory dir = at.code;
+        uint256 entries = (dir.length - 1) / 20;
+        uint256 seen = 0; // payload bytes passed
+        uint256 left = out.length;
+        uint256 done = 0; // bytes written
+
+        for (uint256 i = 0; i < entries && left > 0; ++i) {
+            address chunk;
+            uint256 size;
+            assembly ("memory-safe") {
+                chunk := shr(96, mload(add(add(dir, 0x20), add(1, mul(i, 20)))))
+                size := sub(extcodesize(chunk), 1)
+            }
+            if (want >= seen + size) {
+                seen += size;
+                continue;
+            }
+            uint256 start = want - seen;
+            uint256 take = size - start;
+            if (take > left) take = left;
+            assembly ("memory-safe") {
+                extcodecopy(chunk, add(add(out, 0x20), done), add(start, 1), take)
+            }
+            want += take;
+            left -= take;
+            done += take;
+            seen += size;
+        }
+        // Reading past the end must revert rather than return a short vector, which would
+        // be normalised against zeros into plausible garbage.
+        if (left != 0) revert BadBlob();
     }
 
     function _mark(Block memory b, uint256 before) private view {

@@ -1,0 +1,17 @@
+[package]
+name = "tensor-cli"
+description = "A client that drives a generation on a tensor-evm chain over JSON-RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy-consensus = { version = "2", features = ["k256"] }
+alloy-eips = "2"
+alloy-primitives = "1"
+alloy-signer = "1"
+alloy-signer-local = "1"
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
