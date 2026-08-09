@@ -88,6 +88,15 @@ fn forwarder(n: usize, args: &[u8]) -> Vec<u8> {
     code
 }
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. Without it the matmul reverts, and because the forwarder
+/// discards the success flag that shows up as a suspiciously cheap loop rather than as a
+/// failure — which is the exact shape of a bug this file was written to catch.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
@@ -114,9 +123,9 @@ fn gas_for(calls: usize, rows: usize, cols: usize) -> u64 {
     db.insert_account_info(
         WEIGHTS,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(weight_blob(
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(weight_blob(
                 rows, cols, &scales, &weights,
-            )))),
+            ))))),
             ..Default::default()
         },
     );

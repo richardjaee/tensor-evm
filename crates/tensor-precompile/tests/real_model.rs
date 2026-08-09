@@ -31,6 +31,14 @@ const MODEL_ID: u64 = 1;
 /// Activations are Q32: `v` is stored as `round(v * 2^32)`.
 const Q32: f64 = 4_294_967_296.0;
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -215,7 +223,7 @@ fn project(f: &Fixture) -> Vec<i64> {
     db.insert_account_info(
         WEIGHTS,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(f.blob.clone()))),
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(f.blob.clone())))),
             ..Default::default()
         },
     );

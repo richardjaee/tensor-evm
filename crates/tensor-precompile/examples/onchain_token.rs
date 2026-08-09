@@ -33,6 +33,14 @@ const WEIGHTS: Address = Address::new([0x33; 20]);
 const GAS_CAP: u64 = 400_000_000;
 const ID: [u8; 32] = [0x07; 32];
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn read(dir: &Path, name: &str) -> Vec<u8> {
     std::fs::read(dir.join(name))
         .unwrap_or_else(|e| panic!("{}: {e} — run tools/reflayer.py", dir.join(name).display()))
@@ -265,7 +273,7 @@ fn main() {
     db.insert_account_info(
         WEIGHTS,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(blob))),
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
             ..Default::default()
         },
     );

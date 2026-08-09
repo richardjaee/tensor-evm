@@ -30,6 +30,14 @@ const HEAD: Address = Address::new([0x44; 20]);
 const GAS_CAP: u64 = 4_000_000_000;
 const ID: [u8; 32] = [0x21; 32];
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -184,7 +192,10 @@ fn main() {
     db.insert_account_info(
         HEAD,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(read(&dir, "lm_head.bin")))),
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(read(
+                &dir,
+                "lm_head.bin",
+            ))))),
             ..Default::default()
         },
     );
@@ -217,7 +228,7 @@ fn main() {
         db.insert_account_info(
             layer_addr(l),
             AccountInfo {
-                code: Some(Bytecode::new_raw(Bytes::from(blob))),
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
                 ..Default::default()
             },
         );

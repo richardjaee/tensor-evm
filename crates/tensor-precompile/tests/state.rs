@@ -20,6 +20,14 @@ use tensor_precompile::{decode, encode, gas_cost, MATMUL_ADDRESS};
 const CALLER: Address = Address::new([0x11; 20]);
 const WEIGHTS: Address = Address::new([0x33; 20]);
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn fixture(rows: usize, cols: usize) -> (Vec<i8>, Vec<i16>, Vec<i64>) {
     let weights = (0..rows * cols)
         .map(|i| (((i as i64 * 2654435761) % 4001) - 2000) as i16)
@@ -45,7 +53,7 @@ fn db_with_weights(blob: Vec<u8>) -> CacheDB<EmptyDB> {
     db.insert_account_info(
         WEIGHTS,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(blob))),
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
             ..Default::default()
         },
     );

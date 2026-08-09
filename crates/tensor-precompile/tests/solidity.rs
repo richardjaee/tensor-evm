@@ -26,6 +26,14 @@ const REGISTRY: Address = Address::new([0x55; 20]);
 const WEIGHTS: Address = Address::new([0x33; 20]);
 const MODEL_ID: u64 = 7;
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn contracts_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -178,7 +186,7 @@ impl Harness {
         db.insert_account_info(
             WEIGHTS,
             AccountInfo {
-                code: Some(Bytecode::new_raw(Bytes::from(blob))),
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
                 ..Default::default()
             },
         );

@@ -32,6 +32,14 @@ const HEAD: Address = Address::new([0x44; 20]);
 /// 2^24 is one of the settings this design already asks to be raised.
 const GAS_CAP: u64 = 2_000_000_000;
 
+/// A blob as a real upload leaves it: a leading tag byte marking this as a chunk rather
+/// than a directory of chunks. The harness places code directly where a chain would run
+/// `WeightStore`, so it has to produce the same bytes.
+fn tagged(mut b: Vec<u8>) -> Vec<u8> {
+    b.insert(0, 0x00);
+    b
+}
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -226,7 +234,10 @@ fn generate(per_call: usize, session: u8) -> Vec<u32> {
     db.insert_account_info(
         HEAD,
         AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from(read(&dir, "lm_head.bin")))),
+            code: Some(Bytecode::new_raw(Bytes::from(tagged(read(
+                &dir,
+                "lm_head.bin",
+            ))))),
             ..Default::default()
         },
     );
@@ -261,7 +272,7 @@ fn generate(per_call: usize, session: u8) -> Vec<u32> {
         db.insert_account_info(
             layer_addr(l),
             AccountInfo {
-                code: Some(Bytecode::new_raw(Bytes::from(blob))),
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(blob)))),
                 ..Default::default()
             },
         );

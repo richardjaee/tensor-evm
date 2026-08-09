@@ -136,10 +136,19 @@ library Transformer {
 
     /// @dev A Q32 vector read straight out of contract code. Three gas a word against
     ///      sixteen a byte for calldata, and the values are identical every call.
+    ///
+    ///      The `+ 1` skips the tag byte every uploaded blob carries, which distinguishes a
+    ///      chunk from a directory of chunks. This is the one place a contract reads weights
+    ///      without going through a precompile, so it is the one place that has to know.
+    ///
+    ///      It also means norm weights must live in a single chunk. They are a few kilobytes
+    ///      and a chunk holds twenty-four, so that holds for any model of this shape — but
+    ///      it is an assumption rather than a guarantee, and a wide enough model would need
+    ///      this to resolve across chunks like everything else.
     function _norm(address at, uint32 offset, uint256 n) private view returns (bytes memory out) {
         out = new bytes(n * 8);
         assembly ("memory-safe") {
-            extcodecopy(at, add(out, 0x20), offset, mul(n, 8))
+            extcodecopy(at, add(out, 0x20), add(offset, 1), mul(n, 8))
         }
     }
 

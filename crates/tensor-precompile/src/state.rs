@@ -42,6 +42,103 @@ use tensor_kernel::matmul;
 
 use crate::{gas_cost, BASE_GAS, MAX_DIM};
 
+/// First byte of a chunk's deployed code.
+const TAG_CHUNK: u8 = 0x00;
+/// First byte of a directory's.
+const TAG_DIRECTORY: u8 = 0x01;
+/// Bytes an address occupies in a directory.
+const ENTRY: usize = 20;
+
+/// Resolves `len` bytes at `offset` within a weight blob, following a directory if the
+/// address is one.
+///
+/// A model arrives in chunks because no transaction carries 31.5MB, so a tensor is a byte
+/// range spanning several contracts and something has to stitch it back. Doing it here
+/// rather than in the contract keeps the caller's view of a tensor as an address and an
+/// offset, whichever way the bytes were uploaded.
+///
+/// Chunk and directory are told apart by the first byte of code rather than by a marker in
+/// the payload, because a blob's first byte is a quantisation scale and can be anything —
+/// any in-band marker could collide with real weights.
+fn resolve<CTX: ContextTr>(
+    context: &mut CTX,
+    at: Address,
+    offset: usize,
+    len: usize,
+) -> Result<Option<(Vec<u8>, u64)>, String> {
+    let loaded = context
+        .journal_mut()
+        .code(at)
+        .map_err(|_| "failed to load weights".to_string())?;
+    let mut charged = if loaded.is_cold {
+        COLD_ACCOUNT_GAS
+    } else {
+        WARM_ACCOUNT_GAS
+    };
+    let code = loaded.data;
+    if code.is_empty() {
+        return Ok(None);
+    }
+
+    if code[0] == TAG_CHUNK {
+        let end = match offset.checked_add(len) {
+            Some(e) => e + 1,
+            None => return Ok(None),
+        };
+        if end > code.len() {
+            return Ok(None);
+        }
+        return Ok(Some((code[offset + 1..end].to_vec(), charged)));
+    }
+    if code[0] != TAG_DIRECTORY {
+        return Ok(None);
+    }
+
+    let n = (code.len() - 1) / ENTRY;
+    let mut out = Vec::with_capacity(len);
+    let mut seen = 0usize; // bytes of blob passed so far
+    let mut want = offset;
+    let mut left = len;
+
+    for i in 0..n {
+        if left == 0 {
+            break;
+        }
+        let a = &code[1 + i * ENTRY..1 + (i + 1) * ENTRY];
+        let chunk_at = Address::from_slice(a);
+        let chunk = context
+            .journal_mut()
+            .code(chunk_at)
+            .map_err(|_| "failed to load chunk".to_string())?;
+        charged += if chunk.is_cold {
+            COLD_ACCOUNT_GAS
+        } else {
+            WARM_ACCOUNT_GAS
+        };
+        let data = chunk.data;
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let size = data.len() - 1; // the tag is not payload
+
+        if want >= seen + size {
+            seen += size;
+            continue;
+        }
+        let start = want - seen;
+        let take = left.min(size - start);
+        out.extend_from_slice(&data[1 + start..1 + start + take]);
+        want += take;
+        left -= take;
+        seen += size;
+    }
+
+    if left != 0 {
+        return Ok(None); // the directory does not span the range asked for
+    }
+    Ok(Some((out, charged)))
+}
+
 /// Address of the state-reading matmul.
 ///
 /// The calldata form at `0x100` is kept alongside it: it is the right shape for small
@@ -230,20 +327,21 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
             .collect();
 
-        // Warmth is what the access actually costs, and it is only knowable from the load
-        // itself. A forward pass hits the same weights account on every call of every
-        // layer, so charging the cold price unconditionally would overcharge by 26x on all
-        // but the first — around a million gas per token at 32B, for nothing.
-        let loaded = context
-            .journal_mut()
-            .code(weights_at)
-            .map_err(|_| "failed to load weights account".to_string())?;
-        let access = if loaded.is_cold {
-            COLD_ACCOUNT_GAS
-        } else {
-            WARM_ACCOUNT_GAS
+        let Some(weights_len) = rows_u.checked_mul(cols_u).and_then(|n| n.checked_mul(2)) else {
+            return Ok(Some(revert(gas_limit)));
         };
-        let code = loaded.data;
+        let Some(span) = rows_u.checked_add(weights_len) else {
+            return Ok(Some(revert(gas_limit)));
+        };
+
+        // Warmth is what the access actually costs, and is only knowable from the load. A
+        // forward pass hits the same weights on every call of every layer, so charging the
+        // cold price unconditionally would overcharge by 26x on all but the first.
+        let Some((bytes, access)) = resolve(context, weights_at, offset, span)? else {
+            // Either the blob cannot hold the declared shape or the directory does not span
+            // it. Either way it is the caller's error, not a reason to read past the end.
+            return Ok(Some(revert(gas_limit)));
+        };
 
         let Some(total) = compute.checked_add(access) else {
             return Ok(Some(revert(gas_limit)));
@@ -252,26 +350,8 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             return Ok(Some(oog(gas_limit)));
         }
 
-        let Some(weights_len) = rows_u.checked_mul(cols_u).and_then(|n| n.checked_mul(2)) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        let Some(end) = offset
-            .checked_add(rows_u)
-            .and_then(|n| n.checked_add(weights_len))
-        else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        // A blob too short for the declared shape is the caller's error, not a reason to
-        // read whatever happens to follow in memory.
-        if end > code.len() {
-            return Ok(Some(revert(gas_limit)));
-        }
-
-        let scales: Vec<i8> = code[offset..offset + rows_u]
-            .iter()
-            .map(|&b| b as i8)
-            .collect();
-        let weights: Vec<i16> = code[offset + rows_u..end]
+        let scales: Vec<i8> = bytes[..rows_u].iter().map(|&b| b as i8).collect();
+        let weights: Vec<i16> = bytes[rows_u..]
             .chunks_exact(2)
             .map(|c| i16::from_be_bytes([c[0], c[1]]))
             .collect();
@@ -377,19 +457,21 @@ fn run_classify<CTX: ContextTr>(
         .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
         .collect();
 
-    let loaded = context
-        .journal_mut()
-        .code(at)
-        .map_err(|_| "failed to load classifier weights".to_string())?;
-    let access = if loaded.is_cold {
-        COLD_ACCOUNT_GAS
-    } else {
-        WARM_ACCOUNT_GAS
-    };
-    let code = loaded.data;
-
-    let Some((row, logit)) = crate::classify::classify(&code, offset, rows as usize, cols_u, &x)
+    // Through the same resolver as the matmul, so a classifier uploaded in chunks behaves
+    // exactly like one that fitted in a single deployment. At 151,936 rows it never fits,
+    // so chunked is the normal case rather than the exception.
+    let Some(span) = (rows as usize)
+        .checked_mul(cols_u)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(rows as usize))
     else {
+        return Ok(Some(revert(gas_limit)));
+    };
+    let Some((bytes, access)) = resolve(context, at, offset, span)? else {
+        return Ok(Some(revert(gas_limit)));
+    };
+
+    let Some((row, logit)) = crate::classify::classify(&bytes, 0, rows as usize, cols_u, &x) else {
         return Ok(Some(revert(gas_limit)));
     };
 
