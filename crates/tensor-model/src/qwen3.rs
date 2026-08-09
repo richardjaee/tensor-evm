@@ -27,7 +27,9 @@ pub struct QTensor<'a> {
 }
 
 impl QTensor<'_> {
-    fn apply(&self, x: &[i64], out: &mut [i64]) {
+    /// Public because a mixture-of-experts block applies the same tensors from another
+    /// module; a projection is a projection wherever it is reached from.
+    pub fn apply(&self, x: &[i64], out: &mut [i64]) {
         debug_assert_eq!(x.len(), self.cols);
         debug_assert_eq!(out.len(), self.rows);
         matmul(self.w, self.scales, x, self.rows, self.cols, out);

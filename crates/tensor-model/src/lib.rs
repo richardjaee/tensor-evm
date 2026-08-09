@@ -15,5 +15,6 @@
 /// others for the same reason.
 pub use tensor_kernel::fixed;
 
+pub mod moe;
 pub mod ops;
 pub mod qwen3;

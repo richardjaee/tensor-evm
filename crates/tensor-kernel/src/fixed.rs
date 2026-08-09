@@ -125,6 +125,34 @@ pub fn silu(z: i64) -> i64 {
     (((z as i128) * (sig as i128)) >> F) as i64
 }
 
+/// The `k` largest values, best first, as `(index, value)`.
+///
+/// Ties go to the lower index, and the sort is by value then index rather than by value
+/// alone. That is not a detail: a mixture-of-experts router picks which parameters a token
+/// reads, so two nodes that break a tie differently do not merely round differently — they
+/// read different weights and produce different tokens. Selection sort rather than
+/// `sort_unstable_by` because `k` is small, and because "unstable" is precisely the property
+/// that must not appear anywhere in consensus.
+pub fn top_k(v: &[i64], k: usize, out: &mut Vec<(usize, i64)>) {
+    out.clear();
+    let k = k.min(v.len());
+    for _ in 0..k {
+        let mut best: Option<(usize, i64)> = None;
+        for (i, &x) in v.iter().enumerate() {
+            if out.iter().any(|&(j, _)| j == i) {
+                continue;
+            }
+            match best {
+                Some((_, bv)) if x <= bv => {}
+                _ => best = Some((i, x)),
+            }
+        }
+        if let Some(b) = best {
+            out.push(b);
+        }
+    }
+}
+
 /// First maximum wins, matching the companion project's greedy selection.
 pub fn argmax(v: &[i64]) -> usize {
     let mut best = 0usize;
@@ -240,5 +268,48 @@ mod tests {
     fn argmax_takes_the_first_maximum() {
         assert_eq!(argmax(&[1, 5, 5, 2]), 1);
         assert_eq!(argmax(&[-3, -1, -2]), 1);
+    }
+}
+
+#[cfg(test)]
+mod top_k_tests {
+    use super::*;
+
+    #[test]
+    fn returns_the_largest_in_order() {
+        let v = [3i64, 9, 1, 7, 5];
+        let mut out = Vec::new();
+        top_k(&v, 3, &mut out);
+        assert_eq!(out, vec![(1, 9), (3, 7), (4, 5)]);
+    }
+
+    /// The property consensus depends on. Equal scores must resolve to the lower index on
+    /// every machine, because the winner decides which expert's weights a token reads.
+    #[test]
+    fn ties_go_to_the_lower_index() {
+        let v = [5i64, 5, 5, 5];
+        let mut out = Vec::new();
+        top_k(&v, 2, &mut out);
+        assert_eq!(out, vec![(0, 5), (1, 5)]);
+    }
+
+    #[test]
+    fn handles_negatives_and_a_k_past_the_end() {
+        let v = [-9i64, -1, -5];
+        let mut out = Vec::new();
+        top_k(&v, 10, &mut out);
+        assert_eq!(out, vec![(1, -1), (2, -5), (0, -9)]);
+    }
+
+    /// Selecting one must agree with `argmax`, or a router and a classifier would disagree
+    /// about what "largest" means.
+    #[test]
+    fn agrees_with_argmax_at_k_of_one() {
+        let mut out = Vec::new();
+        for seed in 0..64i64 {
+            let v: Vec<i64> = (0..37).map(|i| ((i * 37 + seed * 11) % 23) - 11).collect();
+            top_k(&v, 1, &mut out);
+            assert_eq!(out[0].0, argmax(&v), "seed {seed}");
+        }
     }
 }
