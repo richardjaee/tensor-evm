@@ -108,6 +108,12 @@ execution begins. The computation is not cheap relative to transport — it is u
 So weights cannot travel as arguments. They must already be on chain, with the caller
 passing a reference and the precompile reading from state.
 
+### Largest model verified
+
+**Qwen3-4B**, on chain, every position matching float64 — 176M gas a token against 112M for
+Qwen3-0.6B. Six point seven times the parameters for 1.57 times the gas, because arithmetic
+was never what a token was paying for.
+
 ### Phase 6 headline
 
 The whole of Qwen3-0.6B, in integers, reproduces the model: **top-1 and top-5 both agree

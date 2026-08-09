@@ -14,6 +14,7 @@ should not have to swap.
 
 import argparse
 import json
+import os
 import struct
 import sys
 
@@ -29,7 +30,13 @@ def read_safetensors(path, wanted=None):
 
     numpy has no bfloat16, but the formats agree bit for bit in their top sixteen bits, so
     a left shift by sixteen is an exact widening rather than an approximation.
+
+    Accepts a directory as well as a file. Anything past about a gigabyte ships sharded —
+    Qwen3-4B is three files — with an index naming which tensor lives where, so a reader
+    that only understands one file understands only the smallest models.
     """
+    if os.path.isdir(path):
+        return _read_sharded(path, wanted)
     with open(path, "rb") as f:
         (n,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(n))
@@ -55,6 +62,30 @@ def read_safetensors(path, wanted=None):
                 raise SystemExit(f"{name}: unsupported dtype {dtype}")
             out[name] = arr.reshape(meta["shape"])
         return out
+
+
+def _read_sharded(directory, wanted=None):
+    """Every shard the index points at, merged.
+
+    Only shards holding something wanted are opened, so asking for one tensor does not
+    read eight gigabytes.
+    """
+    index = os.path.join(directory, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        index = os.path.join(directory, "index.json")
+    with open(index) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    by_file = {}
+    for name, shard in weight_map.items():
+        if wanted is not None and name not in wanted:
+            continue
+        by_file.setdefault(shard, set()).add(name)
+
+    out = {}
+    for shard, names in by_file.items():
+        out.update(read_safetensors(os.path.join(directory, shard), names))
+    return out
 
 
 def quantize_rows(w):

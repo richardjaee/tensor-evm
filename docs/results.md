@@ -467,6 +467,38 @@ Reported rather than tuned away.
 single 151,936 x 1024 matmul — 155M multiply-accumulates, more than a third of the model's
 parameters — so at this size a vocabulary is not a detail.
 
+## Qwen3-4B
+
+Six point seven times the parameters of Qwen3-0.6B, running unchanged. The only code that
+needed touching was the exporter, which could read one safetensors file and Qwen3-4B ships
+as three.
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| layers | 28 | 36 |
+| dim | 1024 | 2560 |
+| parameters | 0.6B | 4.0B |
+| gas per token | 112,574,489 | 176,377,176 |
+| peak memory | — | 10.2 GB |
+| tokens | all match float64 | all match float64 |
+
+**Gas grows far slower than the model.** Six point seven times the parameters costs 1.57
+times the gas, because arithmetic was never what a token was paying for — the per-layer
+overhead and the cache dominate at small sizes, and only the arithmetic scales with
+parameters. The same shape appears in wall clock: a bigger model is *relatively* cheaper on
+this design, and the fixed costs stop mattering somewhere above here.
+
+That also means the earlier per-token figures should not be extrapolated by parameter count.
+A 32B model is not 53 times a 0.6B one.
+
+### What bounds this machine
+
+10.2 GB resident for a 4B model, because the harness holds every weight in memory at once.
+A real node would not — weights are contract code, read through the state database — so this
+is a property of the test harness rather than of the design. It is still what decides which
+models can be checked here: 26 GB of RAM puts the ceiling around 8B, and the mixture-of-
+experts variants need a router that does not exist yet.
+
 ## Caveats
 
 - Projections assume weights stream at the measured rate and count nothing for attention,

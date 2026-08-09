@@ -170,7 +170,12 @@ fn main() {
     let kv_width = n_kv * head_dim;
     let half = head_dim / 2;
 
-    println!("Qwen3-0.6B on chain: {n_layers} layers, vocab {vocab}, {positions} positions\n");
+    let params = (n_layers * (2 * dim * q_width + 2 * dim * kv_width + 3 * dim * hidden)
+        + vocab * dim) as f64;
+    println!(
+        "on chain: {n_layers} layers, dim {dim}, vocab {vocab}, {positions} positions, {:.1}B parameters\n",
+        params / 1e9
+    );
 
     let mut db = CacheDB::new(EmptyDB::default());
     db.insert_account_info(
