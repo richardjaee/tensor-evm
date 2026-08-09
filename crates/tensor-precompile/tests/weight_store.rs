@@ -145,25 +145,39 @@ fn returned(result: &ExecutionResult) -> &[u8] {
     }
 }
 
-/// A directory listing `n` chunks must deploy as exactly `1 + 20n` bytes.
+/// A directory listing `n` chunks must deploy as exactly `1 + 24n` bytes.
 ///
-/// The addresses need not exist: a directory is a list, and what is being checked is that
-/// the list survives being written. Sizes bracket the two-byte boundary at 65,536 bytes —
-/// 3,276 entries is just under, 3,277 just over, and 13,219 is the real classifier's.
+/// Twenty bytes of address and four of cumulative offset. Sizes bracket the two-byte
+/// boundary at 65,536 bytes — with 24-byte entries that is 2,730 chunks, so 2,729 is just
+/// under and 2,731 just over — and 13,219 is the real classifier's.
 #[test]
 fn a_directory_is_not_truncated_by_its_length_field() {
     let mut h = Harness::new();
     let finish = keccak256(b"finish(address[])")[..4].to_vec();
 
-    for n in [1usize, 100, 3_276, 3_277, 4_000, 13_219] {
+    for n in [1usize, 100, 2_729, 2_731, 4_000, 13_219] {
         let mut d = finish.clone();
         d.extend_from_slice(&word(32));
         d.extend_from_slice(&word(n as u64));
+        // Real chunk accounts, because the directory now reads their sizes rather than
+        // taking a caller's word for them — which is the point of storing the offsets.
+        let mut addrs = Vec::with_capacity(n);
         for i in 0..n {
             let mut a = [0u8; 20];
             a[0] = 0xc0;
             a[16..].copy_from_slice(&(i as u32).to_be_bytes());
-            d.extend_from_slice(&addr_word(Address::new(a)));
+            let at = Address::new(a);
+            h.db.insert_account_info(
+                at,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(Bytes::from(vec![0u8; 1 + (i % 7) + 1]))),
+                    ..Default::default()
+                },
+            );
+            addrs.push(at);
+        }
+        for a in &addrs {
+            d.extend_from_slice(&addr_word(*a));
         }
 
         let result = h.call(d);
@@ -171,7 +185,7 @@ fn a_directory_is_not_truncated_by_its_length_field() {
         let ptr = Address::from_slice(&out[12..32]);
         assert_eq!(
             h.code_len(ptr),
-            1 + 20 * n,
+            1 + 24 * n,
             "a directory of {n} chunks deployed at the wrong size"
         );
     }

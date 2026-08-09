@@ -61,7 +61,9 @@ fn place(db: &mut CacheDB<EmptyDB>, at: Address, blob: Vec<u8>, chunk: usize) {
         );
         return;
     }
+    // Twenty bytes of address then four of cumulative blob length, as the uploader writes.
     let mut dir = vec![0x01u8]; // TAG_DIRECTORY
+    let mut total = 0u32;
     for (i, part) in blob.chunks(chunk).enumerate() {
         let mut a = *at
             .as_slice()
@@ -77,7 +79,9 @@ fn place(db: &mut CacheDB<EmptyDB>, at: Address, blob: Vec<u8>, chunk: usize) {
                 ..Default::default()
             },
         );
+        total += part.len() as u32;
         dir.extend_from_slice(part_at.as_slice());
+        dir.extend_from_slice(&total.to_be_bytes());
     }
     db.insert_account_info(
         at,

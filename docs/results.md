@@ -751,5 +751,45 @@ O(chunks actually read).
 
 This is a fixable property of the format rather than of the design: if each directory entry
 carried its chunk's cumulative offset, resolution could seek to the first relevant chunk
-instead of walking to it. That is the next thing to do, and it is worth roughly an order of
-magnitude on the dominant cost.
+instead of walking to it. I guessed that was worth roughly an order of magnitude. It was
+worth 16%, and the next section is why.
+
+## Seeking directories, and a prediction that was wrong
+
+Directory entries now carry the blob's cumulative length through each chunk: twenty bytes of
+address, four of offset. Where a byte lives is answerable from the directory alone, so a
+reader seeks to the first chunk that matters instead of loading every chunk before it to
+learn how long they were. The offsets are read from the chunks themselves at upload time
+rather than taken from the caller, since a caller who mis-stated them would produce a
+directory that resolves to the wrong bytes while looking perfectly well-formed.
+
+Measured on the real Qwen3-0.6B, same 1.19 GB, same five tokens, same output:
+
+| | before | after |
+|---|---|---|
+| seed a position | 1,448,190 | 1,445,730 |
+| 28 layers | 286,749,930 | 240,742,126 |
+| classifier | 35,248,279 | 35,248,279 |
+| **per token** | **323,842,735** | **277,436,135** |
+
+A 16% saving on a token, and **none at all on the classifier**. I had predicted an order of
+magnitude. The reasoning behind that prediction was correct as far as it went — reading a
+tensor near the end of a blob did touch every chunk before it — and it missed the thing that
+actually determines the cost.
+
+A layer's seven projections do not each read a small part of the blob. Together they read
+*all* of it, because the blob is exactly those seven tensors. So the chunks a layer must
+genuinely read were always about 1,337, and skipping is only ever saving the overhead of
+passing chunks on the way to ones you were going to read anyway. The classifier is the
+clearest case: it reads its whole 311MB starting at offset zero, so there is nothing in
+front of it to skip, and its cost did not move by a single gas.
+
+Seeking is still worth having — it removes an O(chunks) term per read, it takes the norm
+vectors' repeated walks with it, and its benefit grows with how selectively a blob is read,
+which is exactly what a mixture-of-experts model will do. But the dominant cost of a token
+is reading the bytes the model actually needs, and no addressing scheme reduces that. That
+is a floor set by the model's size, not by the storage format.
+
+The general lesson is worth keeping: an optimisation aimed at work that was never the
+bottleneck returns what that work cost, which here was a sixth of it. The measurement was
+cheap and the prediction was free; only one of them was right.

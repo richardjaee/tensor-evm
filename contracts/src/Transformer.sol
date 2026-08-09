@@ -23,6 +23,8 @@ library Transformer {
     /// @dev How an uploaded blob announces its shape, matching `WeightStore`.
     uint8 internal constant TAG_CHUNK = 0x00;
     uint8 internal constant TAG_DIRECTORY = 0x01;
+    /// @dev Bytes per directory entry: a 20-byte address then a 4-byte cumulative offset.
+    uint256 internal constant ENTRY = 24;
 
     error BadBlob();
 
@@ -177,34 +179,58 @@ library Transformer {
     }
 
     /// @dev Fills `out` from a directory, crossing chunk boundaries as needed.
+    ///
+    ///      Each entry is twenty bytes of address then four of cumulative blob length. Where
+    ///      a byte lives is therefore answerable from the directory alone: a chunk's start
+    ///      is the previous entry's cumulative end, so no chunk has to be loaded or even
+    ///      measured to be skipped, and only the chunks actually read are touched.
     function _spanFromDirectory(address at, uint256 want, bytes memory out) private view {
-        bytes memory dir = at.code;
-        uint256 entries = (dir.length - 1) / 20;
-        uint256 seen = 0; // payload bytes passed
-        uint256 left = out.length;
-        uint256 done = 0; // bytes written
-
-        for (uint256 i = 0; i < entries && left > 0; ++i) {
-            address chunk;
+        bytes memory dir;
+        uint256 entries;
+        {
             uint256 size;
             assembly ("memory-safe") {
-                chunk := shr(96, mload(add(add(dir, 0x20), add(1, mul(i, 20)))))
-                size := sub(extcodesize(chunk), 1)
+                size := extcodesize(at)
             }
-            if (want >= seen + size) {
-                seen += size;
-                continue;
-            }
-            uint256 start = want - seen;
-            uint256 take = size - start;
-            if (take > left) take = left;
+            if (size == 0) revert BadBlob();
+            // A word of headroom, because entries are 24 bytes and `mload` reads 32: the
+            // last entry's read would otherwise run past the buffer.
+            dir = new bytes(size + 32);
             assembly ("memory-safe") {
-                extcodecopy(chunk, add(add(out, 0x20), done), add(start, 1), take)
+                extcodecopy(at, add(dir, 0x20), 0, size)
             }
-            want += take;
-            left -= take;
-            done += take;
-            seen += size;
+            entries = (size - 1) / ENTRY;
+        }
+
+        uint256 left = out.length;
+        uint256 done = 0; // bytes written
+        uint256 prev = 0; // where the current chunk starts in the blob
+
+        for (uint256 i = 0; i < entries && left > 0; ++i) {
+            uint256 entry;
+            assembly ("memory-safe") {
+                entry := mload(add(add(dir, 0x20), add(1, mul(i, ENTRY))))
+            }
+            uint256 cum = (entry >> 64) & 0xffffffff;
+
+            if (cum > want) {
+                uint256 take = cum - want;
+                if (take > left) take = left;
+                // The address and the offset are read straight out of `entry` so neither
+                // needs a slot of its own; this function is otherwise stack-too-deep.
+                assembly ("memory-safe") {
+                    extcodecopy(
+                        shr(96, entry),
+                        add(add(out, 0x20), done),
+                        add(sub(want, prev), 1),
+                        take
+                    )
+                }
+                want += take;
+                left -= take;
+                done += take;
+            }
+            prev = cum;
         }
         // Reading past the end must revert rather than return a short vector, which would
         // be normalised against zeros into plausible garbage.

@@ -30,6 +30,9 @@ library WeightStore {
     ///      value is what the uploader targets.
     uint256 internal constant MAX_CHUNK = 24_000;
 
+    /// @dev Bytes per directory entry: a 20-byte address then a 4-byte cumulative offset.
+    uint256 internal constant ENTRY = 24;
+
     /// @dev The largest body the prologue below can describe. Four bytes of length, so the
     ///      bound is enormous and the check is cheap — the point is that exceeding it must
     ///      revert rather than wrap.
@@ -38,6 +41,7 @@ library WeightStore {
     error DeployFailed();
     error ChunkTooLarge(uint256 size);
     error BlobTooLarge(uint256 size);
+    error NoSuchChunk(address at);
 
     /// @notice Deploy `data` as a chunk and return its address
     function storeChunk(bytes memory data) internal returns (address ptr) {
@@ -46,16 +50,48 @@ library WeightStore {
     }
 
     /// @notice Deploy a directory listing `chunks` in order
-    /// @dev Twenty bytes each, concatenated. A tensor's byte range is resolved against them
-    ///      by position, so order is the layout and cannot be changed after the fact —
-    ///      which is the same immutability that makes weights worth committing to.
+    ///
+    /// @dev Twenty-four bytes an entry: the chunk's address, then the total number of bytes
+    ///      the blob holds through the end of that chunk. A tensor's byte range is resolved
+    ///      against them by position, so order is the layout and cannot be changed after the
+    ///      fact — the same immutability that makes weights worth committing to.
+    ///
+    ///      The cumulative offset is what makes reading affordable. Without it a reader has
+    ///      to load every chunk before the one it wants purely to learn how long they were,
+    ///      so reading a tensor near the end of a 31.5MB layer touched all 1,337 of its
+    ///      chunks — O(chunks) per read, and it dominated the cost of a token. With it, a
+    ///      reader seeks to the first chunk that matters and touches only what it reads.
+    ///
+    ///      Sizes are read from the chunks here rather than taken from the caller. A caller
+    ///      that mis-stated them would produce a directory that resolves to the wrong bytes
+    ///      while looking well-formed, and this is written once and read forever.
     function storeDirectory(address[] memory chunks) internal returns (address ptr) {
-        bytes memory body = new bytes(chunks.length * 20);
+        // A word of slack, trimmed off at the end. `mstore` writes 32 bytes and an entry is
+        // 24, so the last one would otherwise run eight bytes past the buffer — the same
+        // hazard this project has already been caught by twice. Earlier entries are safe
+        // only because the next write covers the overhang, which is not a property to rely
+        // on for the last.
+        bytes memory body = new bytes(chunks.length * ENTRY + 32);
+        uint256 total = 0;
         for (uint256 i = 0; i < chunks.length; ++i) {
-            bytes20 a = bytes20(chunks[i]);
+            address c = chunks[i];
+            uint256 size;
             assembly ("memory-safe") {
-                mstore(add(add(body, 0x20), mul(i, 20)), a)
+                size := extcodesize(c)
             }
+            // Every chunk carries a leading tag byte that is not payload. An empty account
+            // would underflow that subtraction, so it is refused outright.
+            if (size == 0) revert NoSuchChunk(c);
+            total += size - 1;
+            if (total > MAX_BLOB) revert BlobTooLarge(total);
+
+            bytes32 entry = bytes32(bytes20(c)) | bytes32(total << 64);
+            assembly ("memory-safe") {
+                mstore(add(add(body, 0x20), mul(i, ENTRY)), entry)
+            }
+        }
+        assembly ("memory-safe") {
+            mstore(body, mul(mload(chunks), ENTRY))
         }
         ptr = _deploy(TAG_DIRECTORY, body);
     }

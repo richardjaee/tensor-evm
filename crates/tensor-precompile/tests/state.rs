@@ -61,7 +61,12 @@ fn db_with_weights(blob: Vec<u8>) -> CacheDB<EmptyDB> {
 }
 
 fn run(db: CacheDB<EmptyDB>, to: Address, data: Vec<u8>, gas_limit: u64) -> ExecutionResult {
-    let evm = Context::mainnet().with_db(db).build_mainnet();
+    // Reading a real layer's tensor is past EIP-7825's 2^24 cap, which is one of the limits
+    // this chain raises on purpose. A harness that kept it could only test toy shapes.
+    let evm = Context::mainnet()
+        .with_db(db)
+        .modify_cfg_chained(|c| c.tx_gas_limit_cap = Some(4_000_000_000))
+        .build_mainnet();
     let mut evm = evm.with_precompiles(TensorPrecompiles::default());
 
     evm.transact(TxEnv {
@@ -308,7 +313,10 @@ fn db_with_directory(blob: Vec<u8>, chunk: usize) -> CacheDB<EmptyDB> {
             ..Default::default()
         },
     );
+    // Twenty bytes of address then four of cumulative blob length, which is what the
+    // uploader writes and what lets a reader seek rather than walk.
     let mut dir = vec![0x01u8]; // TAG_DIRECTORY
+    let mut total = 0u32;
     for (i, part) in blob.chunks(chunk).enumerate() {
         let mut a = [0u8; 20];
         a[0] = 0xc0;
@@ -321,7 +329,9 @@ fn db_with_directory(blob: Vec<u8>, chunk: usize) -> CacheDB<EmptyDB> {
                 ..Default::default()
             },
         );
+        total += part.len() as u32;
         dir.extend_from_slice(at.as_slice());
+        dir.extend_from_slice(&total.to_be_bytes());
     }
     db.insert_account_info(
         WEIGHTS,
@@ -389,4 +399,90 @@ fn a_directory_reads_correctly_from_an_offset() {
             "{chunk}-byte chunks at offset {lead} gave a different answer"
         );
     }
+}
+
+/// A directory at the scale a real layer reaches: 1,337 chunks of 23,552 bytes.
+///
+/// The fixtures above are a few kilobytes, and this is 31.5MB — the size at which the
+/// seeking directory format was introduced and therefore the size at which its arithmetic
+/// has to be checked. Reads are taken at the offsets a real layer uses, including the last
+/// tensor, which is where a resolver that mis-seeks will land short.
+#[test]
+fn resolves_at_the_scale_of_a_real_layer() {
+    const CHUNK: usize = 23_552;
+    const CHUNKS: usize = 1_337;
+    let total = 31_488_000usize;
+
+    // Deterministic bytes, so a mis-seek gives the wrong values rather than plausible ones.
+    let blob: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(
+        CALLER,
+        AccountInfo {
+            balance: U256::from(1u64) << 100,
+            ..Default::default()
+        },
+    );
+    let mut dir = vec![0x01u8];
+    let mut cum = 0u32;
+    for (i, part) in blob.chunks(CHUNK).enumerate() {
+        let mut a = [0u8; 20];
+        a[0] = 0xc0;
+        a[16..].copy_from_slice(&(i as u32).to_be_bytes());
+        let at = Address::new(a);
+        db.insert_account_info(
+            at,
+            AccountInfo {
+                code: Some(Bytecode::new_raw(Bytes::from(tagged(part.to_vec())))),
+                ..Default::default()
+            },
+        );
+        cum += part.len() as u32;
+        dir.extend_from_slice(at.as_slice());
+        dir.extend_from_slice(&cum.to_be_bytes());
+    }
+    assert_eq!(dir.len(), 1 + CHUNKS * 24, "directory size");
+    db.insert_account_info(
+        WEIGHTS,
+        AccountInfo {
+            code: Some(Bytecode::new_raw(Bytes::from(dir))),
+            ..Default::default()
+        },
+    );
+
+    // Qwen3-0.6B's own layout: the seven projections in the order a layer stores them.
+    let (dim, hidden, q_width, kv_width) = (1024usize, 3072usize, 2048usize, 1024usize);
+    let shapes = [
+        (q_width, dim),
+        (kv_width, dim),
+        (kv_width, dim),
+        (dim, q_width),
+        (hidden, dim),
+        (hidden, dim),
+        (dim, hidden),
+    ];
+    let mut offset = 0usize;
+    for (rows, cols) in shapes {
+        let acts: Vec<i64> = (0..cols).map(|i| ((i as i64 * 7) % 1000) - 500).collect();
+        let input = encode_state(rows, cols, WEIGHTS, offset as u32, &acts);
+
+        let span = rows + rows * cols * 2;
+        let scales: Vec<i8> = blob[offset..offset + rows]
+            .iter()
+            .map(|&b| b as i8)
+            .collect();
+        let weights: Vec<i16> = blob[offset + rows..offset + span]
+            .chunks_exact(2)
+            .map(|c| i16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        let mut expected = vec![0i64; rows];
+        matmul_scalar(&weights, &scales, &acts, rows, cols, &mut expected);
+
+        let result = run(db.clone(), MATMUL_STATE_ADDRESS, input, 1_000_000_000);
+        let got = decode(output(&result)).expect("output must decode");
+        assert_eq!(got, expected, "{rows}x{cols} at offset {offset}");
+        offset += span;
+    }
+    assert!(offset < total, "the layout must fit the blob");
 }

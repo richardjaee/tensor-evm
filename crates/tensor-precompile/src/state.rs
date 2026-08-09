@@ -47,7 +47,8 @@ const TAG_CHUNK: u8 = 0x00;
 /// First byte of a directory's.
 const TAG_DIRECTORY: u8 = 0x01;
 /// Bytes an address occupies in a directory.
-const ENTRY: usize = 20;
+/// Bytes per directory entry: a 20-byte address then a 4-byte cumulative blob offset.
+const ENTRY: usize = 24;
 
 /// Resolves `len` bytes at `offset` within a weight blob, following a directory if the
 /// address is one.
@@ -94,18 +95,48 @@ fn resolve<CTX: ContextTr>(
         return Ok(None);
     }
 
+    // Each entry is an address and the blob's cumulative length through that chunk, so
+    // where a byte lives is answerable from the directory alone. Without the offsets a
+    // reader had to load every preceding chunk just to learn how long it was, which made
+    // reading a tensor near the end of a 31.5MB layer touch all 1,337 of its chunks and
+    // dominated the cost of a token.
     let n = (code.len() - 1) / ENTRY;
+    let end = match offset.checked_add(len) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let cum = |i: usize| -> usize {
+        let e = &code[1 + i * ENTRY..1 + (i + 1) * ENTRY];
+        u32::from_be_bytes(e[20..24].try_into().expect("four bytes")) as usize
+    };
+    if n == 0 || end > cum(n - 1) {
+        return Ok(None); // the directory does not span the range asked for
+    }
+
+    // The first chunk holding `offset`: the lowest `i` whose cumulative end exceeds it.
+    let mut lo = 0usize;
+    let mut hi = n - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if cum(mid) > offset {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
     let mut out = Vec::with_capacity(len);
-    let mut seen = 0usize; // bytes of blob passed so far
     let mut want = offset;
     let mut left = len;
 
-    for i in 0..n {
+    for i in lo..n {
         if left == 0 {
             break;
         }
-        let a = &code[1 + i * ENTRY..1 + (i + 1) * ENTRY];
-        let chunk_at = Address::from_slice(a);
+        let entry = &code[1 + i * ENTRY..1 + (i + 1) * ENTRY];
+        let chunk_at = Address::from_slice(&entry[..20]);
+        let seen = if i == 0 { 0 } else { cum(i - 1) };
+
         let chunk = context
             .journal_mut()
             .code(chunk_at)
@@ -120,17 +151,17 @@ fn resolve<CTX: ContextTr>(
             return Ok(None);
         }
         let size = data.len() - 1; // the tag is not payload
-
-        if want >= seen + size {
-            seen += size;
-            continue;
+                                   // The directory is written from the chunks' own sizes, so a mismatch means the two
+                                   // have diverged and no answer derived from them can be trusted.
+        if cum(i) != seen + size {
+            return Ok(None);
         }
+
         let start = want - seen;
         let take = left.min(size - start);
         out.extend_from_slice(&data[1 + start..1 + start + take]);
         want += take;
         left -= take;
-        seen += size;
     }
 
     if left != 0 {
