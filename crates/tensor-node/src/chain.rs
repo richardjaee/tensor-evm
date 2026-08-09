@@ -30,6 +30,10 @@ pub struct Receipt {
     pub created: Option<Address>,
     pub gas_used: u64,
     pub success: bool,
+    /// @dev What the transaction returned. A receipt does not carry this on Ethereum —
+    ///      callers use `eth_call` for return values — but a chain whose whole point is
+    ///      auditing should keep what a transaction produced next to the record that it
+    ///      ran, so it is stored and served by `tensor_getOutput`.
     pub output: Bytes,
     pub logs: Vec<(Address, Vec<B256>, Bytes)>,
 }

@@ -332,6 +332,26 @@ pub fn handle(chain: &mut Chain, req: &Value) -> Value {
             )
         }
 
+        // Not an Ethereum method. A receipt does not carry return data, because on
+        // Ethereum a caller who wants it re-runs the call — which is exactly the thing a
+        // chain built for auditing should not require, since re-running is what the record
+        // exists to make unnecessary.
+        "tensor_getOutput" => {
+            let Some(h) = params
+                .first()
+                .and_then(|v| v.as_str())
+                .and_then(hex_bytes)
+                .filter(|b| b.len() == 32)
+                .map(|b| B256::from_slice(&b))
+            else {
+                return err(&id, -32602, "expected a transaction hash");
+            };
+            match chain.receipts.iter().find(|r| r.hash == h) {
+                Some(r) => ok(&id, json!(format!("0x{}", hex::encode(&r.output)))),
+                None => ok(&id, Value::Null),
+            }
+        }
+
         _ => err(&id, -32601, &format!("{method} is not implemented")),
     }
 }
