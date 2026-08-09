@@ -341,7 +341,9 @@ bytes,address,uint32,uint32)";
         d.extend_from_slice(&word(vocab as u64));
         d.extend_from_slice(&dyn_bytes(&packed(&final_norm)));
         let ret = chain.send(d, "emitToken");
-        tokens.push(u32::from_be_bytes(ret[28..32].try_into().expect("token word")));
+        tokens.push(u32::from_be_bytes(
+            ret[28..32].try_into().expect("token word"),
+        ));
     }
     tokens
 }
@@ -395,8 +397,14 @@ fn the_fixture_is_structurally_hard() {
     assert_ne!(hs, dim / heads, "head_dim must not be dim/heads");
     assert_ne!(heads * hs, dim, "query projection must not be square");
     assert!(kv < heads && heads % kv == 0, "attention must be grouped");
-    assert!(meta(&mj, "n_layers") > 1, "one layer would not test per-layer norms");
-    assert!(meta(&mj, "positions") > 1, "one position would not test the cache");
+    assert!(
+        meta(&mj, "n_layers") > 1,
+        "one layer would not test per-layer norms"
+    );
+    assert!(
+        meta(&mj, "positions") > 1,
+        "one position would not test the cache"
+    );
 
     // Norm weights above unit scale, which is what broke three separate activation bounds.
     let peak = read_i64(&root().join("testdata/tiny"), "l3_post_norm.bin")
