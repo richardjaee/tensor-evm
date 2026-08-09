@@ -840,3 +840,44 @@ This is the router and the reference block, tested and measured. No published Mo
 runs here yet: that needs the layout in `Transformer.sol`, an arch flag in the registry, and
 an exporter that writes experts as addressable offsets. The mechanism is the part that had to
 be proven deterministic, and it is.
+
+## A mixture layer through the contracts
+
+`Transformer` now has a mixture branch: `nExperts` of zero keeps the dense feed-forward,
+anything else routes. The layout needs no per-expert table. Experts are identical in shape,
+so expert `e`'s gate, up and down each sit one stride past expert zero's, and adding an
+expert to a model is appending bytes.
+
+`Config` gained `nExperts`, `topK` and `expertStride`; `Layer` gained the router's offset.
+All four sit after the fields a dense model uses, so a dense encoding is unchanged up to the
+point it stops caring.
+
+### Testing it without a second reference
+
+Checking a mixture layer would normally mean writing the whole layer again in Rust —
+attention, norms and all — which is a lot of code whose only purpose is to be wrong in
+different ways.
+
+There is a cheaper check that is also stronger. With `topK` of one the chosen expert's
+routing weight is exactly one, so a mixture layer must produce *precisely* what a dense
+layer produces when handed that expert's tensors. Same arithmetic, two paths through the
+contract, and the comparison is exact rather than approximate. Any error in the stride, the
+offset arithmetic or the scaling shows up immediately.
+
+The trap is that the check passes trivially if the router happens to pick expert zero, since
+then it compares expert zero against expert zero. The first version of the test did exactly
+that. It now runs eight inputs, asserts equality on each, and requires that more than one
+expert was actually reached — otherwise the stride was never exercised at all. A second test
+requires that visiting two experts changes the output, which fails if the routing weights
+are ignored.
+
+### The offset that broke everything, and how it showed up
+
+Widening `Config` from eight fields to eleven moved the offset to the layer array inside the
+`Model` struct, which is written as a literal. Missing it produced panic `0x32` — an array
+index out of bounds — from inside Solidity, on a dense model that had nothing to do with
+mixtures.
+
+That is the third time in this project a struct change has broken encodings written by hand
+in two places at once. The failure is at least loud: an out-of-bounds panic rather than a
+plausible number. The generation tests caught it before anything else ran.

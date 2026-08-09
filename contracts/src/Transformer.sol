@@ -43,6 +43,18 @@ library Transformer {
         uint32 nLayers;
         /// @dev Q32, from the checkpoint. Qwen3 specifies 1e-6 where Llama specifies 1e-5.
         int256 rmsEps;
+        /// @dev Zero means a dense feed-forward. Anything else routes.
+        ///
+        ///      Appended after `rmsEps` rather than placed among the widths so that a dense
+        ///      model's encoding is unchanged up to the point it stops caring — the fields a
+        ///      dense caller fills sit where they always did.
+        uint32 nExperts;
+        /// @dev How many experts a token visits. The cost of a layer follows this rather
+        ///      than `nExperts`, which is the whole reason routing is worth having.
+        uint32 topK;
+        /// @dev Bytes from one expert's tensors to the next. Experts are identical in shape,
+        ///      so one stride addresses all of them and the layer needs no table.
+        uint32 expertStride;
     }
 
     /// @notice Where one layer's tensors live: which contract, and at what offsets.
@@ -67,6 +79,8 @@ library Transformer {
         uint32 qNorm;
         uint32 kNorm;
         uint32 postNorm;
+        /// @dev Where the router tensor sits in this layer's blob. Unused when dense.
+        uint32 router;
     }
 
     /// @notice Rotary tables for this position only, sliced by the caller so that nothing
@@ -350,6 +364,11 @@ library Transformer {
         bytes memory normed = Tensor.rmsnorm(b.s, c.rmsEps, _norm(b.l.at, b.l.postNorm, b.c.dim), x);
         _mark(b, g);
 
+        if (c.nExperts != 0) {
+            _mixture(b, x, normed);
+            return;
+        }
+
         g = gasleft();
         bytes memory gate = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.gate, normed);
         bytes memory up = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.up, normed);
@@ -362,5 +381,61 @@ library Transformer {
         g = gasleft();
         Tensor.addInto(x, Tensor.matmul(b.s, c.dim, c.hidden, b.l.at, b.l.down, gated));
         _mark(b, g);
+    }
+
+    /// @dev The feed-forward as a mixture: score the experts, then run only the chosen ones.
+    ///
+    ///      The saving is not in the arithmetic, which is the same per expert visited. It is
+    ///      that the experts not chosen are never read, and reading is what a token pays
+    ///      for. A layer of a 256-expert model is megabytes; visiting eight of them touches
+    ///      three per cent of it.
+    ///
+    ///      Experts are visited in the order the router returned them, best-scoring first.
+    ///      The sum is over integers and so does not depend on that order — but the order is
+    ///      fixed rather than incidental, because a chain should not have to rely on
+    ///      associativity to agree with itself.
+    function _mixture(Block memory b, bytes memory x, bytes memory normed) private view {
+        Config memory c = b.c;
+
+        uint256 g = gasleft();
+        (uint32[] memory experts, int256[] memory weights) =
+            Tensor.route(c.nExperts, c.dim, b.l.at, b.l.router, c.topK, normed);
+        _mark(b, g);
+
+        for (uint256 i = 0; i < experts.length; ++i) {
+            g = gasleft();
+            // Every expert has the same shape, so its tensors sit one stride apart from the
+            // first expert's — no per-expert table, and adding an expert is appending bytes.
+            _oneExpert(b, x, normed, uint32(uint256(experts[i]) * c.expertStride), weights[i]);
+            _mark(b, g);
+        }
+    }
+
+    /// @dev One expert's feed-forward, scaled by its routing weight and added to the
+    ///      residual. A separate function because the loop above cannot hold the gate, the
+    ///      up projection, the activation and the offsets at once.
+    function _oneExpert(
+        Block memory b,
+        bytes memory x,
+        bytes memory normed,
+        uint32 base,
+        int256 weight
+    ) private view {
+        // The gate and up projections are scoped so they die before the down projection is
+        // reached; holding all four at once is past what the stack can address from a
+        // caller this size.
+        bytes memory gated;
+        {
+            bytes memory gate =
+                Tensor.matmul(b.s, b.c.hidden, b.c.dim, b.l.at, b.l.gate + base, normed);
+            bytes memory up =
+                Tensor.matmul(b.s, b.c.hidden, b.c.dim, b.l.at, b.l.up + base, normed);
+            gated = Tensor.swiglu(b.s, gate, up);
+        }
+        Tensor.addScaled(
+            x,
+            Tensor.matmul(b.s, b.c.dim, b.c.hidden, b.l.at, b.l.down + base, gated),
+            weight
+        );
     }
 }

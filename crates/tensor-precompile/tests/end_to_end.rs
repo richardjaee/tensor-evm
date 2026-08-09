@@ -326,19 +326,25 @@ fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
     let sin = read_i64(&dir, "sin.bin");
     let eps = tensor_kernel::fixed::RMS_EPS_QWEN3;
 
+    // Seven widths, the epsilon, then the mixture fields. The last three are zero for a
+    // dense model — `nExperts` of zero is what selects the dense feed-forward — and they sit
+    // after `rmsEps` so a dense encoding is unchanged up to the point it stops caring.
     let config = |out: &mut Vec<u8>| {
         for f in [dim, hidden, n_heads, n_kv, head_dim, positions, n_layers] {
             out.extend_from_slice(&word(f as u64));
         }
         out.extend_from_slice(&signed(eps));
+        for f in [0u64, 0, 0] {
+            out.extend_from_slice(&word(f));
+        }
     };
 
     let mut chain = Chain { db, nonce: 0 };
-    let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
-(bytes,bytes)),uint16)";
-    let emit_sig = "emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-bytes,address,uint32,uint32)";
+    let cfg_ty = "(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32)";
+    let layer_ty = "(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,\
+uint32,uint32,uint32)";
+    let step_sig = format!("step(bytes32,({cfg_ty},{layer_ty}[],(bytes,bytes)),uint16)");
+    let emit_sig = format!("emitToken(bytes32,{cfg_ty},bytes,address,uint32,uint32)");
 
     let mut tokens = Vec::with_capacity(positions);
     for pos in 0..positions {
@@ -363,10 +369,13 @@ bytes,address,uint32,uint32)";
             for o in off {
                 layers.extend_from_slice(&word(*o));
             }
+            // The router offset, unused by a dense model.
+            layers.extend_from_slice(&word(0));
         }
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
-        let head = 10 * 32;
+        // Eleven config words then the two offsets that follow it.
+        let head = 13 * 32;
         model.extend_from_slice(&word(head as u64));
         model.extend_from_slice(&word((head + layers.len()) as u64));
         model.extend_from_slice(&layers);
@@ -388,7 +397,8 @@ bytes,address,uint32,uint32)";
         let mut d = keccak256(emit_sig.as_bytes())[..4].to_vec();
         d.extend_from_slice(&id);
         config(&mut d);
-        d.extend_from_slice(&word(13 * 32));
+        // id, eleven config words, this offset, the head address and two more: sixteen.
+        d.extend_from_slice(&word(16 * 32));
         d.extend_from_slice(&addr_word(HEAD));
         d.extend_from_slice(&word(0));
         d.extend_from_slice(&word(vocab as u64));

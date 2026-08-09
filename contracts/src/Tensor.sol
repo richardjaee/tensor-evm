@@ -28,6 +28,11 @@ library Tensor {
     ///      next act is always to discard all but one.
     address internal constant CLASSIFY = address(0x106);
 
+    /// @dev The mixture-of-experts router. In the VM rather than here because selection
+    ///      decides which weights a token reads: two nodes that break a tie differently do
+    ///      not round differently, they run different parameters and emit different text.
+    address internal constant ROUTER = address(0x107);
+
     /// @notice Operand bundles.
     /// @dev Not tidiness: the EVM's stack is what limits how a transformer block can be
     ///      written, and seven loose arguments leave a caller no room for the values it
@@ -149,6 +154,41 @@ library Tensor {
                 let sum := add(sar(192, mload(p)), sar(192, mload(add(s, mul(i, 8)))))
                 // Write the eight low bytes without disturbing the neighbours: read the
                 // surrounding word, clear the field, and put the value back.
+                let word := mload(p)
+                mstore(p, or(shl(192, and(sum, 0xffffffffffffffff)), shr(64, shl(64, word))))
+            }
+        }
+    }
+
+    /// @notice `dst[i] += (src[i] * weight) >> 32`, elementwise, in place
+    ///
+    /// @dev How a mixture of experts is summed: each expert's output enters the residual
+    ///      stream scaled by its routing weight, which is Q32 and sums to one across the
+    ///      chosen experts.
+    ///
+    ///      Note that this wraps on overflow rather than saturating, matching `addInto`
+    ///      above. The Rust reference saturates. Neither has reached a magnitude where the
+    ///      two differ — routing weights are at most one, so a scaled expert output is
+    ///      smaller than the output itself — but it is a divergence rather than a choice,
+    ///      and it should be resolved in one direction rather than left to a magnitude
+    ///      nobody has hit yet.
+    function addScaled(bytes memory dst, bytes memory src, int256 weight) internal pure {
+        require(src.length == dst.length, "residual widths must match");
+        uint256 n = dst.length / W;
+        for (uint256 i = 0; i < n; ++i) {
+            int256 sum;
+            assembly ("memory-safe") {
+                let p := add(add(dst, 0x20), mul(i, 8))
+                sum := sar(192, mload(p))
+            }
+            int256 v;
+            assembly ("memory-safe") {
+                v := sar(192, mload(add(add(src, 0x20), mul(i, 8))))
+            }
+            // Arithmetic shift, so a negative expert output stays negative.
+            sum += (v * weight) >> 32;
+            assembly ("memory-safe") {
+                let p := add(add(dst, 0x20), mul(i, 8))
                 let word := mload(p)
                 mstore(p, or(shl(192, and(sum, 0xffffffffffffffff)), shr(64, shl(64, word))))
             }
@@ -327,6 +367,45 @@ library Tensor {
             // The logit occupies bytes 4..12; shift it to the top of a word, then down
             // arithmetically so the sign extends.
             logit := sar(192, shl(32, word))
+        }
+    }
+
+    /// @notice Score every expert and return the `k` chosen, best first
+    /// @return experts Their indices
+    /// @return routeWeights Their routing weights, Q32, summing to one across the chosen
+    ///
+    /// @dev The two arrays are returned in parallel rather than as a struct array because a
+    ///      caller uses them separately: the indices address weights, the weights scale
+    ///      outputs, and pairing them would mean unpacking at every use.
+    function route(
+        uint32 nExperts,
+        uint32 cols,
+        address weights,
+        uint32 offset,
+        uint32 k,
+        bytes memory x
+    ) internal view returns (uint32[] memory experts, int256[] memory routeWeights) {
+        require(x.length == uint256(cols) * W, "activation width");
+        bytes memory input = new bytes(36 + x.length);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            // Ascending, so no field lands on top of one already written.
+            mstore(p, or(shl(224, nExperts), shl(192, cols)))
+            mstore(add(p, 8), shl(96, weights))
+            mstore(add(p, 28), or(shl(224, offset), shl(192, k)))
+            mcopy(add(p, 36), add(x, 0x20), mload(x))
+        }
+
+        // Twelve bytes an expert: a `uint32` index then an `int64` weight.
+        bytes memory ret = _call(ROUTER, input, uint256(k) * 12);
+        experts = new uint32[](k);
+        routeWeights = new int256[](k);
+        for (uint256 i = 0; i < k; ++i) {
+            assembly ("memory-safe") {
+                let word := mload(add(add(ret, 0x20), mul(i, 12)))
+                mstore(add(add(experts, 0x20), mul(i, 0x20)), shr(224, word))
+                mstore(add(add(routeWeights, 0x20), mul(i, 0x20)), sar(192, shl(32, word)))
+            }
         }
     }
 }
