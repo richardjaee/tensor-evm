@@ -881,3 +881,27 @@ mixtures.
 That is the third time in this project a struct change has broken encodings written by hand
 in two places at once. The failure is at least loud: an out-of-bounds panic rather than a
 plausible number. The generation tests caught it before anything else ran.
+
+## A mixture model, generating what float64 says
+
+The layer tests establish that routing reads the right experts and sums them correctly.
+This is the bar the dense path is held to: a whole model, every position, against float64.
+
+`testdata/moe` is three layers routing two experts of six, so a token reads a third of each
+layer and four sixths of every layer are never touched. It emits `[12, 46, 71]`, and so does
+the chain — at one, two and all layers per transaction, and with the weights stored in
+4,096-byte chunks behind directories.
+
+`synth_model.py --experts N --top-k K` writes the fixture and its float64 reference together,
+so the expected tokens come from a mixture computed in float64 rather than from the integer
+path agreeing with itself. Its reference breaks ties by lowest index and softmaxes over the
+chosen experts alone, matching the chain — the two mistakes that are self-consistent and
+silently wrong.
+
+### A fixture that predates the feature
+
+`testdata/tiny` has no `n_experts` field, and the pinned determinism digest is taken against
+it. Regenerating it to gain a field whose absence already means "dense" would have moved a
+constant that exists to catch arithmetic changes. The harness defaults the field instead.
+That is the right trade: a fixture is a fixed point, and changing one to make code tidier
+spends the thing it is for.

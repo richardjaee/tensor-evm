@@ -91,7 +91,7 @@ measurements and [`docs/design.md`](docs/design.md) for the plan.
 | 4 | Real weights, verified against float64 | **done** |
 | 5 | A real Qwen3 layer, verified against float64 | **done** |
 | 6 | Full 28-layer forward pass and logits | **done** |
-| 5 | Mixture-of-experts support | |
+| 7 | Mixture-of-experts, end to end | **done** |
 
 ### Phase 0 headline
 
@@ -288,6 +288,12 @@ calibrated against that measurement rather than estimated.
 This is also why mixture-of-experts models are favourable here despite their size. A dense
 1T model reads 2 TB per token; DeepSeek-V3 is 671B parameters but activates ~37B, reading
 ~74 GB. Storage grows, and storage is the cheap axis.
+
+That is now implemented rather than argued. A router precompile at `0x107` scores every
+expert and returns the chosen few, and measured through the precompiles, **eight times the
+experts costs 1.0002 times the gas** — 110,230 against 110,260 — because the experts not
+chosen are never read. A mixture model generates the tokens float64 produces, at every
+granularity and stored in chunks.
 
 ## Not in scope
 

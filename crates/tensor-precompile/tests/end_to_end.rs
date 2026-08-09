@@ -115,6 +115,19 @@ fn read_i64(dir: &Path, name: &str) -> Vec<i64> {
         .collect()
 }
 
+/// A field a fixture may not carry.
+///
+/// `testdata/tiny` predates mixtures and the pinned determinism digest is taken against it,
+/// so it is left exactly as it is rather than regenerated to gain a field whose absence
+/// already means the right thing.
+fn meta_or(s: &str, key: &str, default: usize) -> usize {
+    if s.contains(&format!("\"{key}\":")) {
+        meta(s, key)
+    } else {
+        default
+    }
+}
+
 fn meta(s: &str, key: &str) -> usize {
     let at = s
         .find(&format!("\"{key}\":"))
@@ -256,7 +269,12 @@ fn generate(per_call: usize, session: u8) -> Vec<u32> {
 /// so a directory returned its address table interpreted as weights. It generated tokens
 /// without reverting; they were simply the wrong ones.
 fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
-    let dir = root().join("testdata/tiny");
+    generate_from(&root().join("testdata/tiny"), per_call, session, chunk)
+}
+
+/// As above, against any fixture — dense or a mixture, decided by the fixture's own
+/// `n_experts`.
+fn generate_from(dir: &Path, per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
     let mj = std::fs::read_to_string(dir.join("meta.json")).expect("meta.json");
 
     let dim = meta(&mj, "dim");
@@ -268,6 +286,9 @@ fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
     let vocab = meta(&mj, "vocab");
     let positions = meta(&mj, "positions");
     let (q_width, kv_width, half) = (n_heads * head_dim, n_kv * head_dim, head_dim / 2);
+    // Zero is a dense model, which is what `Transformer` branches on.
+    let n_experts = meta_or(&mj, "n_experts", 0);
+    let top_k = meta_or(&mj, "top_k", 0);
     let id = [session; 32];
 
     let mut db = CacheDB::new(EmptyDB::default());
@@ -288,42 +309,81 @@ fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
             ..Default::default()
         },
     );
-    place(&mut db, HEAD, read(&dir, "lm_head.bin"), chunk);
+    place(&mut db, HEAD, read(dir, "lm_head.bin"), chunk);
 
-    // Seven tensors then four norm vectors, one blob and one address per layer — the layout
-    // the chain actually holds.
-    let shapes: [(&str, usize, usize); 7] = [
+    // Attention, then the feed-forward, then the norms — one blob and one address per
+    // layer, which is the layout the chain actually holds.
+    //
+    // A dense layer carries gate, up and down directly. A mixture carries every expert's
+    // three tensors laid out expert by expert, so expert `e`'s sit one stride past expert
+    // zero's, plus the router. Either way the layer's twelve offsets say where things are.
+    let attention: [(&str, usize, usize); 4] = [
         ("q", q_width, dim),
         ("k", kv_width, dim),
         ("v", kv_width, dim),
         ("o", dim, q_width),
-        ("gate", hidden, dim),
-        ("up", hidden, dim),
-        ("down", dim, hidden),
     ];
-    let mut offsets = vec![[0u64; 11]; n_layers];
+    let gate_len = hidden + hidden * dim * 2;
+    let down_len = dim + dim * hidden * 2;
+    let stride = (gate_len * 2 + down_len) as u64;
+
+    let mut offsets = vec![[0u64; 12]; n_layers];
     for (l, off) in offsets.iter_mut().enumerate() {
         let mut blob = Vec::new();
-        for (i, (name, rows, cols)) in shapes.iter().enumerate() {
-            let raw = read(&dir, &format!("l{l}_{name}.bin"));
+        for (i, (name, rows, cols)) in attention.iter().enumerate() {
+            let raw = read(dir, &format!("l{l}_{name}.bin"));
             assert_eq!(raw.len(), rows + rows * cols * 2, "l{l}_{name} shape");
             off[i] = blob.len() as u64;
             blob.extend_from_slice(&raw);
         }
+
+        let ffn_at = blob.len();
+        if n_experts == 0 {
+            for (i, (name, rows, cols)) in [
+                ("gate", hidden, dim),
+                ("up", hidden, dim),
+                ("down", dim, hidden),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let raw = read(dir, &format!("l{l}_{name}.bin"));
+                assert_eq!(raw.len(), rows + rows * cols * 2, "l{l}_{name} shape");
+                off[4 + i] = blob.len() as u64;
+                blob.extend_from_slice(&raw);
+            }
+        } else {
+            let raw = read(dir, &format!("l{l}_experts.bin"));
+            assert_eq!(
+                raw.len(),
+                n_experts * stride as usize,
+                "l{l}_experts: {n_experts} experts of {stride} bytes"
+            );
+            // Expert zero's three tensors; the rest are reached by stride.
+            off[4] = ffn_at as u64;
+            off[5] = (ffn_at + gate_len) as u64;
+            off[6] = (ffn_at + gate_len * 2) as u64;
+            blob.extend_from_slice(&raw);
+        }
+
         for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
             .iter()
             .enumerate()
         {
             off[7 + j] = blob.len() as u64;
-            blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))));
+            blob.extend(packed(&read_i64(dir, &format!("l{l}_{name}.bin"))));
+        }
+        if n_experts != 0 {
+            off[11] = blob.len() as u64;
+            blob.extend_from_slice(&read(dir, &format!("l{l}_router.bin")));
         }
         place(&mut db, layer_addr(l), blob, chunk);
     }
 
-    let final_norm = read_i64(&dir, "final_norm.bin");
-    let embed = read_i64(&dir, "embed.bin");
-    let cos = read_i64(&dir, "cos.bin");
-    let sin = read_i64(&dir, "sin.bin");
+    let final_norm = read_i64(dir, "final_norm.bin");
+    let embed = read_i64(dir, "embed.bin");
+    let cos = read_i64(dir, "cos.bin");
+    let sin = read_i64(dir, "sin.bin");
     let eps = tensor_kernel::fixed::RMS_EPS_QWEN3;
 
     // Seven widths, the epsilon, then the mixture fields. The last three are zero for a
@@ -334,7 +394,7 @@ fn generate_stored(per_call: usize, session: u8, chunk: usize) -> Vec<u32> {
             out.extend_from_slice(&word(f as u64));
         }
         out.extend_from_slice(&signed(eps));
-        for f in [0u64, 0, 0] {
+        for f in [n_experts as u64, top_k as u64, stride] {
             out.extend_from_slice(&word(f));
         }
     };
@@ -369,8 +429,6 @@ uint32,uint32,uint32)";
             for o in off {
                 layers.extend_from_slice(&word(*o));
             }
-            // The router offset, unused by a dense model.
-            layers.extend_from_slice(&word(0));
         }
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
@@ -494,4 +552,54 @@ fn the_fixture_is_structurally_hard() {
         .unwrap_or(0) as f64
         / 4_294_967_296.0;
     assert!(peak > 10.0, "norm weights are too tame at {peak:.1}");
+}
+
+/// A mixture model, generating the tokens float64 says it produces.
+///
+/// The layer-level tests establish that routing reads the right experts and sums them
+/// correctly. This is the same bar the dense path is held to: a whole model, every position,
+/// against what float64 emits — which is the only check that catches a mistake the integer
+/// path and its own reference would make together.
+///
+/// The fixture routes two experts of six, so a token reads a third of each layer and four
+/// sixths of every layer are never touched.
+#[test]
+fn a_mixture_model_generates_the_tokens_float64_produces() {
+    let dir = root().join("testdata/moe");
+    let want = read(&dir, "tokens.bin")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+        .collect::<Vec<u32>>();
+    assert_eq!(generate_from(&dir, usize::MAX, 0x70, 0), want);
+}
+
+/// Splitting a mixture across transactions must not change what it emits, and neither must
+/// storing it in chunks. Routing adds a decision to every layer, so the granularity knob and
+/// the storage format both get a second chance to change an answer.
+#[test]
+fn a_mixture_is_unchanged_by_granularity_and_chunking() {
+    let dir = root().join("testdata/moe");
+    let want = read(&dir, "tokens.bin")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+        .collect::<Vec<u32>>();
+
+    assert_eq!(generate_from(&dir, 1, 0x71, 0), want, "one layer per call");
+    assert_eq!(generate_from(&dir, 2, 0x72, 0), want, "two layers per call");
+    assert_eq!(
+        generate_from(&dir, usize::MAX, 0x73, 4096),
+        want,
+        "stored in 4096-byte chunks"
+    );
+}
+
+/// The fixture has to actually route, or the tests above are checking a dense model with
+/// extra steps.
+#[test]
+fn the_mixture_fixture_routes() {
+    let mj = std::fs::read_to_string(root().join("testdata/moe/meta.json")).expect("meta.json");
+    let experts = meta(&mj, "n_experts");
+    let k = meta(&mj, "top_k");
+    assert!(experts > k, "a model that visits every expert is dense");
+    assert!(k > 1, "one expert would never exercise the weighted sum");
 }

@@ -1,0 +1,19 @@
+{
+  "dim": 32,
+  "hidden": 48,
+  "n_layers": 3,
+  "n_heads": 4,
+  "n_kv": 2,
+  "head_dim": 16,
+  "vocab": 96,
+  "positions": 3,
+  "rope_theta": 1000000.0,
+  "prompt_ids": [
+    4,
+    61,
+    94
+  ],
+  "seed": 11,
+  "n_experts": 6,
+  "top_k": 2
+}

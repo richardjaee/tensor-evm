@@ -58,6 +58,11 @@ def main():
     ap.add_argument("--head-dim", type=int, default=16)
     ap.add_argument("--vocab", type=int, default=128)
     ap.add_argument("--positions", type=int, default=3)
+    # Zero experts is a dense model. Anything else replaces every layer's feed-forward with
+    # a mixture, which is what a chain wants: a token then pays for the experts it visits
+    # rather than for the experts the model contains.
+    ap.add_argument("--experts", type=int, default=0)
+    ap.add_argument("--top-k", type=int, default=2)
     a = ap.parse_args()
 
     dim, hidden, L, H, KV, hs = a.dim, a.hidden, a.layers, a.heads, a.kv, a.head_dim
@@ -86,6 +91,11 @@ def main():
     def norm(n, scale):
         return np.abs(rng.normal(1.0, 0.3, size=n)) * scale
 
+    E, K = a.experts, a.top_k
+    if E:
+        assert 1 <= K <= E, "top-k must be between one and the expert count"
+        assert E > K, "an expert count equal to top-k would never skip anything"
+
     W = []
     for l in range(L):
         W.append(
@@ -103,6 +113,14 @@ def main():
                 "post_norm": norm(dim, 1.0 + 20.0 * l / max(L - 1, 1)),
             }
         )
+        if E:
+            # Every expert is shaped like the dense feed-forward it replaces, which is what
+            # lets one stride address all of them. The router is one row an expert.
+            W[l]["router"] = mat(E, dim)
+            W[l]["experts"] = [
+                {"gate": mat(hidden, dim), "up": mat(hidden, dim), "down": mat(dim, hidden)}
+                for _ in range(E)
+            ]
     final_norm = norm(dim, 2.0)
     head = mat(V, dim)
     emb = rng.normal(0.0, 0.05, size=(V, dim))
@@ -110,9 +128,21 @@ def main():
 
     # ---- export, in the layout the chain reads ----
     for l in range(L):
-        for key in ("q", "k", "v", "o", "gate", "up", "down"):
+        dense_keys = ("q", "k", "v", "o") if E else ("q", "k", "v", "o", "gate", "up", "down")
+        for key in dense_keys:
             qm, sh = quantize_rows(W[l][key].astype(np.float32))
             write(f"l{l}_{key}.bin", blob(qm, sh))
+        if E:
+            # Expert by expert, so expert e's three tensors sit one stride past expert
+            # zero's. The chain addresses them by multiplying, not by looking up.
+            parts = []
+            for e in range(E):
+                for key in ("gate", "up", "down"):
+                    qm, sh = quantize_rows(W[l]["experts"][e][key].astype(np.float32))
+                    parts.append(blob(qm, sh))
+            write(f"l{l}_experts.bin", b"".join(parts))
+            qm, sh = quantize_rows(W[l]["router"].astype(np.float32))
+            write(f"l{l}_router.bin", blob(qm, sh))
         for key in ("input_norm", "q_norm", "k_norm", "post_norm"):
             write(f"l{l}_{key}.bin", to_q32(W[l][key]).astype("<i8").tobytes())
 
@@ -165,8 +195,23 @@ def main():
 
             h = h + w["o"] @ attn
             n = rmsnorm(h, w["post_norm"], eps)
-            gt, up = w["gate"] @ n, w["up"] @ n
-            h = h + w["down"] @ ((gt / (1.0 + np.exp(-gt))) * up)
+            if E:
+                # Ties to the lower index, matching the chain's `top_k`. Which expert wins
+                # is not a rounding difference: it decides which weights the token reads.
+                sc = w["router"] @ n
+                order = sorted(range(E), key=lambda i: (-sc[i], i))[:K]
+                # Softmax over the chosen alone, not over all experts with the losers
+                # dropped — that leaves the kept weights summing to less than one and
+                # quietly scales the whole feed-forward down.
+                ex = np.exp(np.array([sc[i] for i in order]) - max(sc[i] for i in order))
+                rw = ex / ex.sum()
+                for slot, i in enumerate(order):
+                    e_ = w["experts"][i]
+                    gt, up = e_["gate"] @ n, e_["up"] @ n
+                    h = h + rw[slot] * (e_["down"] @ ((gt / (1.0 + np.exp(-gt))) * up))
+            else:
+                gt, up = w["gate"] @ n, w["up"] @ n
+                h = h + w["down"] @ ((gt / (1.0 + np.exp(-gt))) * up)
             x = h
             peak = max(peak, float(np.abs(x).max()))
         tokens.append(int(np.argmax(head @ rmsnorm(x, final_norm, eps))))
@@ -176,6 +221,7 @@ def main():
         "dim": dim, "hidden": hidden, "n_layers": L, "n_heads": H, "n_kv": KV,
         "head_dim": hs, "vocab": V, "positions": P, "rope_theta": theta,
         "prompt_ids": ids, "seed": a.seed,
+        "n_experts": E, "top_k": K if E else 0,
     }
     with open(os.path.join(a.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -183,6 +229,8 @@ def main():
     total = sum(os.path.getsize(os.path.join(a.out, f)) for f in os.listdir(a.out))
     print(f"dim {dim}, hidden {hidden}, layers {L}, heads {H}, kv {KV}, head_dim {hs}, vocab {V}")
     print(f"  q_proj {qw}x{dim}, o_proj {dim}x{qw} — neither square")
+    if E:
+        print(f"  mixture: {E} experts, top {K} — a token reads {K/E:.0%} of each layer")
     print(f"  peak residual magnitude {peak:.1f}")
     print(f"  tokens {tokens}")
     print(f"  wrote {a.out} ({total/1024:.0f} KB)")
