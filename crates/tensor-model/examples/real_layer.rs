@@ -176,6 +176,7 @@ fn main() {
             rows: cfg.dim,
             cols: cfg.hidden,
         },
+        mixture: None,
     };
 
     let rope = Rope {

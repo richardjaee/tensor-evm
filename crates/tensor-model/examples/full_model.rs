@@ -158,6 +158,7 @@ fn main() {
                 gate: t(4, cfg.hidden, cfg.dim),
                 up: t(5, cfg.hidden, cfg.dim),
                 down: t(6, cfg.dim, cfg.hidden),
+                mixture: None,
             }
         })
         .collect();

@@ -84,6 +84,19 @@ pub struct LayerWeights<'a> {
     pub gate: QTensor<'a>,
     pub up: QTensor<'a>,
     pub down: QTensor<'a>,
+    /// A mixture in place of the dense feed-forward above.
+    ///
+    /// `None` is dense, and the three tensors are used as written. Otherwise `gate`, `up`
+    /// and `down` are ignored and the router decides which experts a token visits — which
+    /// is what makes a 30B model cost what a 3B model costs to read.
+    pub mixture: Option<Mixture<'a>>,
+}
+
+/// A router and the experts it chooses between.
+pub struct Mixture<'a> {
+    pub router: QTensor<'a>,
+    pub experts: Vec<crate::moe::Expert<'a>>,
+    pub top_k: usize,
 }
 
 /// Precomputed rotary tables, `seq_len * head_dim/2` entries each.
@@ -244,6 +257,14 @@ pub fn forward_layer(
 
     // ---- feed-forward ----
     rmsnorm(x, w.post_norm, cfg.rms_eps, &mut s.normed);
+    if let Some(m) = &w.mixture {
+        // The mixture adds into the residual itself, weighted expert by expert, so there is
+        // no single projection to add afterwards.
+        let mut ms =
+            crate::moe::MoeScratch::new(cfg.dim, m.experts[0].gate.rows, m.router.rows, m.top_k);
+        crate::moe::forward(&s.normed, &m.router, &m.experts, m.top_k, &mut ms, x);
+        return;
+    }
     w.gate.apply(&s.normed, &mut s.gate);
     w.up.apply(&s.normed, &mut s.up);
     swiglu(&s.gate, &s.up, &mut s.ffn);
@@ -566,6 +587,7 @@ mod tests {
                 rows: cfg.dim,
                 cols: cfg.hidden,
             },
+            mixture: None,
         };
 
         let rope_tab = Rope {
