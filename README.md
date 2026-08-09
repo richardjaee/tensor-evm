@@ -148,6 +148,17 @@ docs/design.md              architecture, scaling analysis, non-goals, limitatio
 docs/results.md             every measurement, with the command that produces it
 ```
 
+## Checking it works
+
+```sh
+./verify.sh          # tests, lint, formatting — needs nothing but the repository
+./verify.sh --full   # the above, plus the real checkpoint if models/ is populated
+```
+
+The first tier proves the whole generation loop — seed, every layer, classifier, argmax —
+against what float64 says the model emits. The second runs the same path against the
+published Qwen3-0.6B weights.
+
 ## Building
 
 ```sh
