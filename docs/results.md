@@ -793,3 +793,50 @@ is a floor set by the model's size, not by the storage format.
 The general lesson is worth keeping: an optimisation aimed at work that was never the
 bottleneck returns what that work cost, which here was a sixth of it. The measurement was
 cheap and the prediction was free; only one of them was right.
+
+## The router precompile: 8x the experts for 1.00x the gas
+
+Expert selection is a precompile at `0x107` rather than contract code, and not for speed.
+The router's own arithmetic is trivial — one row per expert against the model width. What
+selection decides is *which parameters a token reads*, so two nodes that break a tie
+differently do not round differently: they run different weights and emit different text.
+Putting the comparison in the VM means every node runs the same comparison, written once,
+rather than whatever a contract author's sort happened to do.
+
+The measurement that justifies routing existing at all, taken through the precompiles in a
+real EVM — score, choose, then read only the chosen experts:
+
+| experts stored | chosen | gas |
+|---|---|---|
+| 8 | 2 | 110,230 |
+| 64 | 2 | 110,260 |
+
+Eight times the weights for 1.0002 times the gas. The thirty gas of difference is the router
+scoring 56 more rows; the experts' weights are never touched, and they are the megabytes.
+
+This is where the seeking directory format finally pays. Against dense layers it was worth a
+sixth, because a layer's seven projections collectively read the whole blob and there was
+almost nothing to skip. A router taking 8 of 256 skips 97% of a layer, and every skipped
+chunk is an account never touched. The two changes are the same idea applied twice: cost
+should follow what a token reads, not what the model contains.
+
+### What had to be got right
+
+`top_k` breaks ties by lowest index and is a selection sort rather than `sort_unstable_by`,
+because "unstable" is precisely the property that must not appear anywhere in consensus.
+
+The routing weights are a softmax over the chosen scores alone, not over all experts with
+the losers dropped. The second form is self-consistent, plausible, and silently scales the
+whole feed-forward down. Every self-consistency test passes against it; only the float64
+comparison catches it, at 8.4e-4 against a mean magnitude of 8.7e-4.
+
+Asking for more experts than exist is refused rather than satisfied with fewer. A caller
+handed `k-1` weights would normalise over the wrong count and scale its feed-forward down
+without noticing — the same failure by a different route.
+
+### Still a mechanism, not a model
+
+This is the router and the reference block, tested and measured. No published MoE checkpoint
+runs here yet: that needs the layout in `Transformer.sol`, an arch flag in the registry, and
+an exporter that writes experts as addressable offsets. The mechanism is the part that had to
+be proven deterministic, and it is.

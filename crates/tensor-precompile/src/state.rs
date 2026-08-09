@@ -277,6 +277,11 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
                 unreachable_stub,
             ),
             Precompile::new(
+                PrecompileId::Custom("tensor-router".into()),
+                crate::router::ROUTER_ADDRESS,
+                unreachable_stub,
+            ),
+            Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,
                 unreachable_stub,
@@ -308,6 +313,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
     ) -> Result<Option<InterpreterResult>, String> {
         if inputs.bytecode_address == crate::classify::CLASSIFY_ADDRESS {
             return run_classify(context, inputs);
+        }
+        if inputs.bytecode_address == crate::router::ROUTER_ADDRESS {
+            return run_router(context, inputs);
         }
         if inputs.bytecode_address != MATMUL_STATE_ADDRESS {
             return PrecompileProvider::<CTX>::run(&mut self.inner, context, inputs);
@@ -416,6 +424,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
     fn contains(&self, address: &Address) -> bool {
         *address == MATMUL_STATE_ADDRESS
             || *address == crate::classify::CLASSIFY_ADDRESS
+            || *address == crate::router::ROUTER_ADDRESS
             || PrecompileProvider::<CTX>::contains(&self.inner, address)
     }
 }
@@ -513,6 +522,70 @@ fn run_classify<CTX: ContextTr>(
     Ok(Some(InterpreterResult::new(
         InstructionResult::Return,
         crate::classify::pack(row, logit),
+        gas,
+    )))
+}
+
+/// Scores every expert against the residual and returns the chosen few.
+///
+/// The router tensor is small — one row an expert — so nothing here is expensive. What it
+/// buys is expensive: the caller now knows which experts to read and, more to the point,
+/// which not to. A layer of a 256-expert model is megabytes, and choosing eight of them
+/// means never touching the other 97%.
+fn run_router<CTX: ContextTr>(
+    context: &mut CTX,
+    inputs: &CallInputs,
+) -> Result<Option<InterpreterResult>, String> {
+    let gas_limit = inputs.gas_limit;
+    let input = inputs.input.as_bytes(context).to_vec();
+
+    // Parsed by the same function the standalone entry point uses, so the two cannot drift
+    // about what a well-formed call is.
+    let Some((experts, cols, at, offset, k)) = crate::router::parse(&input) else {
+        return Ok(Some(revert(gas_limit)));
+    };
+    let Some(compute) = crate::router::gas_cost(experts, cols) else {
+        return Ok(Some(revert(gas_limit)));
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Some(oog(gas_limit)));
+    }
+
+    let cols_u = cols as usize;
+    let experts_u = experts as usize;
+    let x: Vec<i64> = input[crate::router::HEADER..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let Some(span) = experts_u
+        .checked_mul(cols_u)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(experts_u))
+    else {
+        return Ok(Some(revert(gas_limit)));
+    };
+    let Some((bytes, access)) = resolve(context, at, offset, span)? else {
+        return Ok(Some(revert(gas_limit)));
+    };
+
+    let scales: Vec<i8> = bytes[..experts_u].iter().map(|&b| b as i8).collect();
+    let weights: Vec<i16> = bytes[experts_u..]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    let mut scores = vec![0i64; experts_u];
+    matmul(&weights, &scales, &x, experts_u, cols_u, &mut scores);
+
+    let chosen = crate::router::route(&scores, k);
+
+    let mut gas = Gas::new(gas_limit);
+    if !gas.record_regular_cost(compute + access) {
+        return Ok(Some(oog(gas_limit)));
+    }
+    Ok(Some(InterpreterResult::new(
+        InstructionResult::Return,
+        crate::router::encode_output(&chosen).into(),
         gas,
     )))
 }

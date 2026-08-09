@@ -322,3 +322,6 @@ pub mod norm;
 pub mod attention;
 
 pub mod classify;
+
+/// The mixture-of-experts router, which decides which weights a token reads.
+pub mod router;
