@@ -26,6 +26,18 @@ The question this project exists to answer is how far that goes.
 If the answer is yes, verifiable inference needs neither zero-knowledge proofs nor trusted
 hardware — just ordinary consensus over a VM that can do arithmetic at memory speed.
 
+## Seeing it work
+
+```sh
+./demo-reth.sh     # a reth node, a model uploaded to it, tokens generated on chain
+```
+
+One command. It starts [reth](https://github.com/paradigmxyz/reth) carrying the tensor
+precompiles, uploads a transformer as contract code, and generates tokens by signed
+transactions over JSON-RPC — checked against what float64 says the model emits. Every part
+of the chain is reth's: the network, the transaction pool, the payload builder, the
+consensus engine. The only substitution is the executor.
+
 ## The answer, so far
 
 **Qwen3-30B-A3B runs on a chain.** All 60.5 GB of it, uploaded as contract code, generating
