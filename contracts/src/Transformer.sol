@@ -311,6 +311,12 @@ library Transformer {
         uint256 pos,
         bytes memory x
     ) private view {
+        // Two calls, deliberately. Fusing them into one precompile was tried and measured
+        // 2.4% worse: the saving is one round trip of the attention result, and the wrapper
+        // pays for it by copying the query and both caches into a freshly allocated buffer
+        // rather than the scratch the other wrappers reuse. The fused form exists at 0x109
+        // and is tested against this one; it becomes worth using when its header fits the
+        // scratch path, which needs a head wider than one word.
         uint256 g = gasleft();
         bytes memory attn = Tensor.attention(
             b.s,

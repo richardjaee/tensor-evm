@@ -307,6 +307,11 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
                 unreachable_stub,
             ),
             Precompile::new(
+                PrecompileId::Custom("tensor-attn-proj".into()),
+                ATTN_PROJ_ADDRESS,
+                unreachable_stub,
+            ),
+            Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,
                 unreachable_stub,
@@ -344,6 +349,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         }
         if inputs.bytecode_address == FFN_ADDRESS {
             return run_host(context, inputs, ffn_state_with);
+        }
+        if inputs.bytecode_address == ATTN_PROJ_ADDRESS {
+            return run_host(context, inputs, attn_proj_state_with);
         }
         if inputs.bytecode_address != MATMUL_STATE_ADDRESS {
             return PrecompileProvider::<CTX>::run(&mut self.inner, context, inputs);
@@ -385,6 +393,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             || *address == crate::classify::CLASSIFY_ADDRESS
             || *address == crate::router::ROUTER_ADDRESS
             || *address == FFN_ADDRESS
+            || *address == ATTN_PROJ_ADDRESS
             || PrecompileProvider::<CTX>::contains(&self.inner, address)
     }
 }
@@ -921,4 +930,115 @@ fn run_host<CTX: ContextTr>(
             )))
         }
     }
+}
+
+/// Address of attention fused with its output projection.
+pub const ATTN_PROJ_ADDRESS: Address = revm::precompile::u64_to_address(0x109);
+
+/// ```text
+/// [0..4)    heads     u32
+/// [4..8)    n_kv      u32
+/// [8..12)   head_dim  u32
+/// [12..16)  positions u32
+/// [16..20)  dim       u32, the residual width the projection returns
+/// [20..40)  weights   address holding the output projection
+/// [40..44)  offset    u32, where it sits in that blob
+/// [44 ..)   q, then k, then v
+/// ```
+pub const ATTN_PROJ_HEADER: usize = 44;
+
+/// Attention and the output projection that always follows it, in one call.
+///
+/// `o_proj` was the single most expensive line in a layer's profile — 184,368 gas of 673,643
+/// — and almost none of it was arithmetic. Attention returns `heads * head_dim` values,
+/// which in Qwen3-0.6B is twice the residual stream, and every one of them was packed into
+/// `bytes`, handed back to Solidity, and handed straight into another precompile.
+///
+/// Nothing else ever consumes an attention result, so it need not leave the VM at all.
+pub fn attn_proj_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    if input.len() < ATTN_PROJ_HEADER {
+        return Ok(Outcome::Revert);
+    }
+    let heads = u32::from_be_bytes(input[0..4].try_into().expect("four")) as u64;
+    let n_kv = u32::from_be_bytes(input[4..8].try_into().expect("four")) as u64;
+    let hs = u32::from_be_bytes(input[8..12].try_into().expect("four")) as u64;
+    let positions = u32::from_be_bytes(input[12..16].try_into().expect("four")) as u64;
+    let dim = u32::from_be_bytes(input[16..20].try_into().expect("four")) as u64;
+    let at = Address::from_slice(&input[20..40]);
+    let offset = u32::from_be_bytes(input[40..44].try_into().expect("four")) as usize;
+
+    if heads == 0 || n_kv == 0 || hs == 0 || positions == 0 || dim == 0 {
+        return Ok(Outcome::Revert);
+    }
+    if heads > MAX_DIM || n_kv > MAX_DIM || hs > MAX_DIM || positions > MAX_DIM || dim > MAX_DIM {
+        return Ok(Outcome::Revert);
+    }
+    // Grouped-query attention shares each key head across an exact number of query heads.
+    if !heads.is_multiple_of(n_kv) {
+        return Ok(Outcome::Revert);
+    }
+
+    let (heads_u, n_kv_u, hs_u, pos_u, dim_u) = (
+        heads as usize,
+        n_kv as usize,
+        hs as usize,
+        positions as usize,
+        dim as usize,
+    );
+    let q_len = heads_u * hs_u;
+    let cache = pos_u * n_kv_u * hs_u;
+    if input.len() != ATTN_PROJ_HEADER + (q_len + cache + cache) * 8 {
+        return Ok(Outcome::Revert);
+    }
+
+    let Some(compute) = crate::attention::attention_gas(heads, hs, positions)
+        .and_then(|a| a.checked_add(gas_cost(dim, q_len as u64)?))
+    else {
+        return Ok(Outcome::Revert);
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let read = |at_byte: usize, n: usize| -> Vec<i64> {
+        input[at_byte..at_byte + n * 8]
+            .chunks_exact(8)
+            .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+            .collect()
+    };
+    let q = read(ATTN_PROJ_HEADER, q_len);
+    let k = read(ATTN_PROJ_HEADER + q_len * 8, cache);
+    let v = read(ATTN_PROJ_HEADER + (q_len + cache) * 8, cache);
+
+    let attn = crate::attention::attend(q, k, v, heads_u, n_kv_u, hs_u, pos_u);
+
+    let span = dim_u + dim_u * q_len * 2;
+    let Some((bytes, access)) = resolve_with(code_of, at, offset, span)? else {
+        return Ok(Outcome::Revert);
+    };
+    let scales: Vec<i8> = bytes[..dim_u].iter().map(|&b| b as i8).collect();
+    let weights: Vec<i16> = bytes[dim_u..]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+
+    let mut out = vec![0i64; dim_u];
+    matmul(&weights, &scales, &attn, dim_u, q_len, &mut out);
+
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let mut packed = Vec::with_capacity(dim_u * 8);
+    for value in out {
+        packed.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(Outcome::Return(packed, total))
 }

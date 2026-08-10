@@ -155,59 +155,7 @@ pub fn attention_precompile(input: &[u8], gas_limit: u64, reservoir: u64) -> Pre
     // a convex combination of values — softmax weights sum to one — so its output cannot
     // exceed the values it mixes, which came from a projection.
 
-    // 1/sqrt(headDim) in Q32, by integer square root — no float provenance, and identical
-    // to what the Solidity and the Rust reference derive.
-    let scale = {
-        let root = isqrt((hs as u128) << 64);
-        (((ONE as u128) << 32) / root) as i128
-    };
-
-    let group = heads / n_kv;
-    let mut out = vec![0i64; q_len];
-    let mut scores = vec![0i64; positions];
-
-    for h in 0..heads {
-        let kvh = h / group;
-        let qh = &q[h * hs..(h + 1) * hs];
-
-        for (t, s) in scores.iter_mut().enumerate() {
-            let base = t * kvw + kvh * hs;
-            let mut acc: i128 = 0;
-            for j in 0..hs {
-                acc += (qh[j] as i128) * (k[base + j] as i128); // Q64
-            }
-            *s = (((acc >> F) * scale) >> F) as i64;
-        }
-
-        // Softmax. The maximum is subtracted first because the exponential is defined only
-        // for non-positive arguments, so this is what makes every call legal.
-        let max = *scores.iter().max().expect("positions > 0");
-        let mut sum: i128 = 0;
-        let mut e = vec![0u64; positions];
-        for t in 0..positions {
-            e[t] = exp_q32(scores[t] - max);
-            sum += e[t] as i128;
-        }
-        if sum == 0 {
-            // Only reachable if the spread exceeds what Q32 represents. Uniform is the
-            // honest answer; leaving zeros would silently drop the whole row.
-            let u = ONE / positions as i64;
-            scores.iter_mut().for_each(|s| *s = u);
-        } else {
-            for t in 0..positions {
-                scores[t] = (((e[t] as i128) << F) / sum) as i64;
-            }
-        }
-
-        let dst = &mut out[h * hs..(h + 1) * hs];
-        for (t, &w) in scores.iter().enumerate() {
-            let base = t * kvw + kvh * hs;
-            let w = w as i128;
-            for (o, vv) in dst.iter_mut().zip(&v[base..base + hs]) {
-                *o += ((w * *vv as i128) >> F) as i64;
-            }
-        }
-    }
+    let out = attend(q, k, v, heads, n_kv, hs, positions);
 
     Ok(PrecompileOutput::new(gas_used, pack(&out), reservoir))
 }
@@ -317,6 +265,79 @@ pub fn encode_rmsnorm(eps: i64, weight: &[i64], x: &[i64]) -> Vec<u8> {
         }
     }
     b
+}
+
+/// Grouped-query attention over a cache, returning `heads * head_dim` values.
+///
+/// Lifted out of the precompile so the fused attention-and-projection form runs this and
+/// not a copy of it. Two implementations of attention would be two opinions about what a
+/// layer computes.
+pub fn attend(
+    q: Vec<i64>,
+    k: Vec<i64>,
+    v: Vec<i64>,
+    heads: usize,
+    n_kv: usize,
+    hs: usize,
+    positions: usize,
+) -> Vec<i64> {
+    let kvw = n_kv * hs;
+    let q_len = heads * hs;
+    // 1/sqrt(headDim) in Q32, by integer square root — no float provenance, and identical
+    // to what the Solidity and the Rust reference derive.
+    let scale = {
+        let root = isqrt((hs as u128) << 64);
+        (((ONE as u128) << 32) / root) as i128
+    };
+
+    let group = heads / n_kv;
+    let mut out = vec![0i64; q_len];
+    let mut scores = vec![0i64; positions];
+
+    for h in 0..heads {
+        let kvh = h / group;
+        let qh = &q[h * hs..(h + 1) * hs];
+
+        for (t, s) in scores.iter_mut().enumerate() {
+            let base = t * kvw + kvh * hs;
+            let mut acc: i128 = 0;
+            for j in 0..hs {
+                acc += (qh[j] as i128) * (k[base + j] as i128); // Q64
+            }
+            *s = (((acc >> F) * scale) >> F) as i64;
+        }
+
+        // Softmax. The maximum is subtracted first because the exponential is defined only
+        // for non-positive arguments, so this is what makes every call legal.
+        let max = *scores.iter().max().expect("positions > 0");
+        let mut sum: i128 = 0;
+        let mut e = vec![0u64; positions];
+        for t in 0..positions {
+            e[t] = exp_q32(scores[t] - max);
+            sum += e[t] as i128;
+        }
+        if sum == 0 {
+            // Only reachable if the spread exceeds what Q32 represents. Uniform is the
+            // honest answer; leaving zeros would silently drop the whole row.
+            let u = ONE / positions as i64;
+            scores.iter_mut().for_each(|s| *s = u);
+        } else {
+            for t in 0..positions {
+                scores[t] = (((e[t] as i128) << F) / sum) as i64;
+            }
+        }
+
+        let dst = &mut out[h * hs..(h + 1) * hs];
+        for (t, &w) in scores.iter().enumerate() {
+            let base = t * kvw + kvh * hs;
+            let w = w as i128;
+            for (o, vv) in dst.iter_mut().zip(&v[base..base + hs]) {
+                *o += ((w * *vv as i128) >> F) as i64;
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]

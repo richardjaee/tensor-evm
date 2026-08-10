@@ -1547,3 +1547,27 @@ not change the shape of the problem. What remains is the attention half of a lay
 query, key and value projections, the rotary tables, the cache, and the output projection —
 each still a separate call with its own arguments. The same trick would apply, and the same
 caution: every fusion is another place where one implementation could disagree with itself.
+
+## Fusing attention: tried, measured, not adopted
+
+`o_proj` was the largest single line in a layer — 184,368 gas of 673,643 — and almost none of
+it arithmetic. Attention returns `heads * head_dim` values, twice the residual stream in
+Qwen3-0.6B, and nothing but the output projection ever reads them. Fusing the two looked like
+the same win the feed-forward gave.
+
+It measured **2.4% worse**: 561,069 gas against 547,653.
+
+The saving is real — one round trip of the attention result — and the wrapper gives it back.
+`Tensor.attention` builds its input through `_build`, which reuses the scratch buffer a layer
+already allocated. The fused wrapper cannot: its header is 44 bytes and `_build` takes a
+single `bytes32`, so it allocates a fresh buffer and copies the query and both caches into
+it. Those are larger than the result it saved passing.
+
+So the layer keeps the two calls. The fused precompile stays at `0x109`, tested bit-for-bit
+against the pair it would replace, because the arithmetic is right and only the plumbing is
+not — it becomes worth adopting once `_build` accepts a head wider than one word.
+
+Worth recording as a result rather than deleting as a failure. Fusing is not a win in itself;
+it is a trade of one copy for another, and which side is larger has to be measured. The
+feed-forward won because it removed three round trips of `hidden`-wide intermediates and
+added one small buffer. This removes one round trip and adds a large buffer.

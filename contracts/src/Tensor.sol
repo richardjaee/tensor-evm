@@ -38,6 +38,11 @@ library Tensor {
     ///      costs — a layer profiled at 2.8% precompile and the rest argument marshalling.
     address internal constant FFN = address(0x108);
 
+    /// @dev Attention and the projection that always follows it. Nothing else consumes an
+    ///      attention result, so it never needs to leave the VM — and it is twice the
+    ///      residual stream wide, which made `o_proj` the most expensive line in a layer.
+    address internal constant ATTN_PROJ = address(0x109);
+
     /// @notice Operand bundles.
     /// @dev Not tidiness: the EVM's stack is what limits how a transformer block can be
     ///      written, and seven loose arguments leave a caller no room for the values it
@@ -373,6 +378,47 @@ library Tensor {
             // arithmetically so the sign extends.
             logit := sar(192, shl(32, word))
         }
+    }
+
+    /// @notice Attention and its output projection, in one call
+    function attnProj(
+        Scratch memory s,
+        AttnShape memory shape,
+        address weights,
+        uint32 offset,
+        AttnArgs memory a
+    ) internal view returns (bytes memory) {
+        bytes memory input = new bytes(44 + a.q.length + a.k.length + a.v.length);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            // Ascending, so no field lands on top of one already written.
+            mstore(p, or(shl(224, mload(shape)), shl(192, mload(add(shape, 0x20)))))
+            mstore(add(p, 8), or(shl(224, mload(add(shape, 0x40))), shl(192, mload(add(shape, 0x60)))))
+            mstore(add(p, 16), shl(224, mload(add(shape, 0x80))))
+            mstore(add(p, 20), shl(96, weights))
+            mstore(add(p, 40), shl(224, offset))
+            let w := add(p, 44)
+            mcopy(w, add(mload(a), 0x20), mload(mload(a)))
+            w := add(w, mload(mload(a)))
+            mcopy(w, add(mload(add(a, 0x20)), 0x20), mload(mload(add(a, 0x20))))
+            w := add(w, mload(mload(add(a, 0x20))))
+            mcopy(w, add(mload(add(a, 0x40)), 0x20), mload(mload(add(a, 0x40))))
+        }
+        return _call(ATTN_PROJ, input, uint256(mload_dim(shape)) * W);
+    }
+
+    /// @dev The five widths an attention call needs, as a struct because the stack cannot
+    ///      hold them alongside the three vectors.
+    struct AttnShape {
+        uint256 heads;
+        uint256 nKv;
+        uint256 headDim;
+        uint256 positions;
+        uint256 dim;
+    }
+
+    function mload_dim(AttnShape memory shape) private pure returns (uint256 d) {
+        d = shape.dim;
     }
 
     /// @notice Gate, up, SwiGLU and down, in one call

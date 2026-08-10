@@ -543,3 +543,57 @@ fn the_fused_feed_forward_equals_the_calls_it_replaces() {
         assert_eq!(got, want, "{dim}x{hidden}");
     }
 }
+
+/// Attention fused with its output projection must equal the two calls it replaces.
+///
+/// Exactly, at every shape. Nothing but attention ever consumes an attention result, so
+/// keeping it inside the VM changes what a layer costs and must not change what it computes.
+#[test]
+fn fused_attention_equals_attention_then_projection() {
+    use tensor_precompile::attention::attend;
+    use tensor_precompile::state::{attn_proj_state_with, Outcome, ATTN_PROJ_HEADER};
+
+    for (heads, n_kv, hs, positions, dim) in [
+        (4usize, 2usize, 8usize, 3usize, 16usize),
+        (16, 8, 32, 5, 64),
+    ] {
+        let q_len = heads * hs;
+        let cache = positions * n_kv * hs;
+        let (os, ow, _) = fixture(dim, q_len);
+
+        let vals = |n: usize, seed: i64| -> Vec<i64> {
+            (0..n)
+                .map(|i| ((i as i64 * 40503 + seed) % 131071) - 65535)
+                .collect()
+        };
+        let (q, k, v) = (vals(q_len, 7), vals(cache, 11), vals(cache, 13));
+
+        // The two calls, separately.
+        let attn = attend(q.clone(), k.clone(), v.clone(), heads, n_kv, hs, positions);
+        let mut want = vec![0i64; dim];
+        matmul_scalar(&ow, &os, &attn, dim, q_len, &mut want);
+
+        let mut input = Vec::new();
+        for f in [heads, n_kv, hs, positions, dim] {
+            input.extend_from_slice(&(f as u32).to_be_bytes());
+        }
+        input.extend_from_slice(WEIGHTS.as_slice());
+        input.extend_from_slice(&0u32.to_be_bytes());
+        for value in q.iter().chain(&k).chain(&v) {
+            input.extend_from_slice(&value.to_be_bytes());
+        }
+        assert_eq!(input.len(), ATTN_PROJ_HEADER + (q_len + cache * 2) * 8);
+
+        let blob = tagged(weight_blob(dim, q_len, &os, &ow));
+        let mut code_of =
+            |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((blob.clone(), false)) };
+        let got = match attn_proj_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
+            Outcome::Return(bytes, _) => bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
+                .collect::<Vec<i64>>(),
+            _ => panic!("refused {heads}x{hs} over {positions}"),
+        };
+        assert_eq!(got, want, "{heads} heads, {positions} positions, dim {dim}");
+    }
+}
