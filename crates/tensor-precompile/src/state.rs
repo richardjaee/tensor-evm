@@ -1064,6 +1064,26 @@ pub const LAYER_ADDRESS: Address = revm::precompile::u64_to_address(0x10a);
 /// ```
 ///
 /// The caches hold `positions - 1` entries; this call appends the one it computes.
+///
+/// # Wiring this from Solidity
+///
+/// Two things are not obvious and are worth knowing before starting.
+///
+/// The header is ninety-six bytes, which is three words, and `Tensor._build` carries two.
+/// Rather than widening it again and packing eleven offsets and an address across word
+/// boundaries by hand, build the header with `abi.encodePacked` and pass it as the first
+/// *part* with a head length of zero. The layout below is exactly what `encodePacked`
+/// produces from six `uint32`, an `address`, eleven `uint32` and an `int64`, and there is no
+/// bit shifting to get wrong.
+///
+/// The cache is the awkward one. A contract holds `kv.k` as a buffer covering positions
+/// zero through `pos`, because `_extendCache` has already written this position's entry into
+/// it before attention reads it. This call wants the entries *before* this position and
+/// computes the current one itself, so a caller must either hand over a slice — which in
+/// Solidity means a copy, and copying the cache is a good part of what fusing was meant to
+/// avoid — or the order of operations has to change so the cache is extended after the layer
+/// runs rather than inside it. The second is the right answer and it is a change to
+/// `forwardLayer`, not to this.
 pub const LAYER_HEADER: usize = 96;
 
 /// A whole transformer block, in one call.

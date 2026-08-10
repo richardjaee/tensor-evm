@@ -1650,3 +1650,26 @@ Three changes did it, and none touched the arithmetic:
 Every one was found by asking where the gas went rather than by guessing, and the answer was
 never the multiply-accumulates. They were 15,360 gas of a layer at the start and they are
 15,360 gas of it now.
+
+## Wiring the whole-layer precompile: what stopped it
+
+`0x10a` is written, tested and registered on both hosts, and is not yet used by a contract.
+Two things surfaced while wiring it that are worth stating before anyone starts.
+
+**The header is three words and `_build` carries two.** Widening it again would mean packing
+eleven offsets and an address across word boundaries by hand. The better answer is to build
+the header with `abi.encodePacked` and pass it as the first *part* with a head length of
+zero — the layout is exactly what `encodePacked` produces from six `uint32`, an `address`,
+eleven `uint32` and an `int64`, and no bit shifting can go wrong.
+
+**The cache does not line up.** A contract holds `kv.k` covering positions zero through
+`pos`, because `_extendCache` writes this position's entry before attention reads it. The
+whole-layer call wants the entries *before* this position and computes the current one
+itself. So a caller must either slice — which in Solidity is a copy, and copying the cache is
+a good part of what fusing was meant to avoid — or `forwardLayer` must stop extending the
+cache itself and let the precompile return the entry to append.
+
+The second is right, and it is a change to the contract rather than to the precompile. It is
+also exactly the kind of change that was worth stopping in front of: the last time the layer
+was rewired, a scratch buffer sized for the old call showed up as the test count dropping
+from 123 to 77 rather than as an error, and that was caught only by counting passing tests.
