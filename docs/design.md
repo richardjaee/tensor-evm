@@ -229,7 +229,7 @@ sizes, and shared security is not the property being sought.
 | 4 | Real weights, verified against float64 | done |
 | 5 | A whole model, on a chain, over JSON-RPC | done — Qwen3-0.6B, then Qwen3-30B-A3B |
 | 6 | Mixture of experts | done — router precompile, verified on a trained router |
-| 7 | Ordering: peer-to-peer, consensus, sync | a reth node runs the precompiles end to end; two peer, but a follower needs a consensus layer to adopt a head |
+| 7 | Ordering: peer-to-peer, consensus, sync | done — a follower re-executes the sealer's blocks through the engine API and agrees on the state root |
 
 Two things about that table are worth keeping rather than tidying away.
 
@@ -260,4 +260,4 @@ anyone can read off a receipt. They do not say it is a chain. That needs:
 - **A second implementation.** Three machines running one binary rules out hardware, threads
   and operating system. It does not rule out a bug in that binary.
 - **Someone else running it.** The 30B chain was produced twice, on two CPU vendors, and
-  agreed. Both runs were mine.
+  agreed. Both runs were mine, and both nodes run the same binary.

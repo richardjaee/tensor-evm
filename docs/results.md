@@ -1453,3 +1453,59 @@ not repeated allocation — it is the copying itself, and the two projections th
 
 The shape of the answer has been the same at every stage of this project: whatever was made
 fast stopped being the cost, and something nobody had measured took its place.
+
+## Two nodes agreeing on inference
+
+The gap this file kept naming is closed. A second reth node re-executed every block it did
+not produce — the weight uploads, every layer, the classifier — with its own EVM against its
+own copy of the state, and reached the same state root.
+
+```
+ block   txs           gas  status
+    25     1       318,986  VALID
+    26     1       318,986  VALID
+    27     1       318,986  VALID
+    28     1       318,986  VALID
+    29     1        72,491  VALID
+
+sealer   block 29  root 0x7245b34836674da6d77f8e695ef4328886062cb63f70b5c6c5f3142ef677d038
+follower block 29  root 0x7245b34836674da6d77f8e695ef4328886062cb63f70b5c6c5f3142ef677d038
+
+  agreed: the follower re-executed every block and reached the same state
+```
+
+Those 318,986-gas blocks are layers of a transformer. The follower never uploaded the model
+and was never told what the answer should be; it was handed transactions and recomputed
+them.
+
+**`VALID` is the measurement.** It means the follower's own execution produced the state root
+the block claims. A token generated on one machine was checked by another that had only the
+transactions — which is what "verifiable inference" was supposed to mean all along.
+
+### Why it took a consensus client rather than gossip
+
+The two nodes were already peered, and it changed nothing. A post-merge Ethereum node
+propagates blocks over peer-to-peer but adopts one only when a consensus client calls
+`engine_forkchoiceUpdated`. A follower without one sits at genesis holding valid blocks it
+has no authority to canonicalise — which looks like a broken sync and is correct behaviour.
+
+`tools/engine_relay.py` is that consensus client, reduced to the one job that matters here:
+hand over a payload, let the follower verify it, record the verdict, then name the head. Real
+consensus decides *which* chain; this decides nothing and only asks whether the follower
+agrees with the one it is given.
+
+Three details were needed and are worth recording. The follower serves
+`debug_getRawTransaction`, because an execution payload carries raw signed transactions
+rather than the objects `eth_getBlock` returns — and the point is that the follower verifies
+the signatures itself. reth reads its JWT secret rather than creating it, so the file has to
+exist before launch. And Prague is active from genesis on this chain, so `newPayloadV4`.
+
+### What is still not shown
+
+Both nodes run the same binary. Two vendors and two processes agreeing rules out hardware
+and rules out one process fooling itself; it does not rule out a bug they share. That needs a
+second implementation, and it is now the only structural gap left.
+
+```sh
+./demo-network.sh    # a sealer, a follower, a model, and a verdict on every block
+```

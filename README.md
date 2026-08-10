@@ -29,7 +29,8 @@ hardware — just ordinary consensus over a VM that can do arithmetic at memory 
 ## Seeing it work
 
 ```sh
-./demo-reth.sh     # a reth node, a model uploaded to it, tokens generated on chain
+./demo-reth.sh       # a reth node, a model uploaded to it, tokens generated on chain
+./demo-network.sh    # and a second node re-executing every block, with a verdict
 ```
 
 One command. It starts [reth](https://github.com/paradigmxyz/reth) carrying the tensor
@@ -58,11 +59,15 @@ Fifty times the parameters of the dense model for fourteen times the gas, becaus
 reads eight experts of a hundred and twenty-eight and never touches the rest. That is the
 whole mixture-of-experts argument, measured rather than projected.
 
-**What this is not.** It is one implementation, and both reproductions were run by the same
-person. There is no peer-to-peer, no consensus and no ordering — nodes agree here because
-they were handed the same inputs, not because they gossiped and settled. So this shows a 30B
-model *fits and runs* under an ordinary Ethereum interface at a knowable cost. It does not
-show a network agreeing on it, and that is the largest thing left.
+A second node now verifies it. Handed the sealer's blocks through the engine API — which is
+what a consensus client does — a follower re-executes every layer and the classifier with its
+own EVM and returns `VALID`, meaning its own execution produced the state root the block
+claims. It never uploaded the model and was never told the answer.
+
+**What this is not.** Both nodes run the same binary. Two vendors and two processes agreeing
+rules out the hardware and rules out one process fooling itself; it does not rule out a bug
+they share, and only a second independent implementation would. That is now the only
+structural gap.
 
 Every figure above is reproducible from this repository; see
 [`docs/results.md`](docs/results.md) for the commands and the failures along the way.
