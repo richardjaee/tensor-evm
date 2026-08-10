@@ -344,97 +344,28 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         let gas_limit = inputs.gas_limit;
         let input = inputs.input.as_bytes(context).to_vec();
 
-        if input.len() < HEADER {
-            return Ok(Some(revert(gas_limit)));
-        }
-
-        let rows = u32::from_be_bytes(input[0..4].try_into().unwrap()) as u64;
-        let cols = u32::from_be_bytes(input[4..8].try_into().unwrap()) as u64;
-        let weights_at = Address::from_slice(&input[8..28]);
-        let offset = u32::from_be_bytes(input[28..32].try_into().unwrap()) as usize;
-
-        if rows == 0 || cols == 0 || rows > MAX_DIM || cols > MAX_DIM {
-            return Ok(Some(revert(gas_limit)));
-        }
-
-        let Some(compute) = gas_cost(rows, cols) else {
-            return Ok(Some(revert(gas_limit)));
+        let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+            let loaded = context
+                .journal_mut()
+                .code(a)
+                .map_err(|_| "failed to load weights".to_string())?;
+            Ok((loaded.data.to_vec(), loaded.is_cold))
         };
-        // Priced against the cheaper of the two access costs. The real figure depends on
-        // whether the weights account is already warm, which is not known until it is
-        // loaded; this is only the affordability precheck, so it must not reject a caller
-        // who can in fact pay.
-        let Some(floor) = compute.checked_add(WARM_ACCOUNT_GAS) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        if floor > gas_limit {
-            return Ok(Some(oog(gas_limit)));
+        match matmul_state_with(&mut code_of, &input, gas_limit)? {
+            Outcome::Revert => Ok(Some(revert(gas_limit))),
+            Outcome::OutOfGas => Ok(Some(oog(gas_limit))),
+            Outcome::Return(bytes, used) => {
+                let mut gas = Gas::new(gas_limit);
+                if !gas.record_regular_cost(used) {
+                    return Ok(Some(oog(gas_limit)));
+                }
+                Ok(Some(InterpreterResult::new(
+                    InstructionResult::Return,
+                    bytes.into(),
+                    gas,
+                )))
+            }
         }
-
-        let (rows_u, cols_u) = (rows as usize, cols as usize);
-
-        // Activations arrive as calldata; only they scale with cols rather than rows*cols,
-        // which is the entire reason this form is affordable.
-        let Some(acts_len) = cols_u.checked_mul(8) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        if input.len() != HEADER + acts_len {
-            return Ok(Some(revert(gas_limit)));
-        }
-        let acts: Vec<i64> = input[HEADER..]
-            .chunks_exact(8)
-            .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
-            .collect();
-
-        let Some(weights_len) = rows_u.checked_mul(cols_u).and_then(|n| n.checked_mul(2)) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        let Some(span) = rows_u.checked_add(weights_len) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-
-        // Warmth is what the access actually costs, and is only knowable from the load. A
-        // forward pass hits the same weights on every call of every layer, so charging the
-        // cold price unconditionally would overcharge by 26x on all but the first.
-        let Some((bytes, access)) = resolve(context, weights_at, offset, span)? else {
-            // Either the blob cannot hold the declared shape or the directory does not span
-            // it. Either way it is the caller's error, not a reason to read past the end.
-            return Ok(Some(revert(gas_limit)));
-        };
-
-        let Some(total) = compute.checked_add(access) else {
-            return Ok(Some(revert(gas_limit)));
-        };
-        if total > gas_limit {
-            return Ok(Some(oog(gas_limit)));
-        }
-
-        let scales: Vec<i8> = bytes[..rows_u].iter().map(|&b| b as i8).collect();
-        let weights: Vec<i16> = bytes[rows_u..]
-            .chunks_exact(2)
-            .map(|c| i16::from_be_bytes([c[0], c[1]]))
-            .collect();
-
-        let mut out = vec![0i64; rows_u];
-        matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
-
-        let mut bytes = Vec::with_capacity(rows_u * 8);
-        for v in out {
-            bytes.extend_from_slice(&v.to_be_bytes());
-        }
-
-        let mut gas = Gas::new(gas_limit);
-        // Affordability was established before the read; this cannot fail, and treating
-        // it as OOG rather than asserting keeps a future refactor from turning a pricing
-        // mistake into a node panic.
-        if !gas.record_regular_cost(total) {
-            return Ok(Some(oog(gas_limit)));
-        }
-        Ok(Some(InterpreterResult::new(
-            InstructionResult::Return,
-            Bytes::from(bytes),
-            gas,
-        )))
     }
 
     fn warm_addresses(&self) -> &revm::primitives::AddressSet {
@@ -608,4 +539,111 @@ fn run_router<CTX: ContextTr>(
         crate::router::encode_output(&chosen).into(),
         gas,
     )))
+}
+
+/// What a precompile decided, before a host turns it into its own result type.
+pub enum Outcome {
+    Return(Vec<u8>, u64),
+    Revert,
+    OutOfGas,
+}
+
+/// The state-reading matmul, against any host that can produce an account's code.
+///
+/// Lifted out of the provider so reth can run the same function. A second implementation of
+/// this would be a second opinion about what a model computes, which is the one thing a
+/// chain cannot have.
+pub fn matmul_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    if input.len() < HEADER {
+        return Ok(Outcome::Revert);
+    }
+
+    let rows = u32::from_be_bytes(input[0..4].try_into().unwrap()) as u64;
+    let cols = u32::from_be_bytes(input[4..8].try_into().unwrap()) as u64;
+    let weights_at = Address::from_slice(&input[8..28]);
+    let offset = u32::from_be_bytes(input[28..32].try_into().unwrap()) as usize;
+
+    if rows == 0 || cols == 0 || rows > MAX_DIM || cols > MAX_DIM {
+        return Ok(Outcome::Revert);
+    }
+
+    let Some(compute) = gas_cost(rows, cols) else {
+        return Ok(Outcome::Revert);
+    };
+    // Priced against the cheaper of the two access costs. The real figure depends on
+    // whether the weights account is already warm, which is not known until it is
+    // loaded; this is only the affordability precheck, so it must not reject a caller
+    // who can in fact pay.
+    let Some(floor) = compute.checked_add(WARM_ACCOUNT_GAS) else {
+        return Ok(Outcome::Revert);
+    };
+    if floor > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let (rows_u, cols_u) = (rows as usize, cols as usize);
+
+    // Activations arrive as calldata; only they scale with cols rather than rows*cols,
+    // which is the entire reason this form is affordable.
+    let Some(acts_len) = cols_u.checked_mul(8) else {
+        return Ok(Outcome::Revert);
+    };
+    if input.len() != HEADER + acts_len {
+        return Ok(Outcome::Revert);
+    }
+    let acts: Vec<i64> = input[HEADER..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let Some(weights_len) = rows_u.checked_mul(cols_u).and_then(|n| n.checked_mul(2)) else {
+        return Ok(Outcome::Revert);
+    };
+    let Some(span) = rows_u.checked_add(weights_len) else {
+        return Ok(Outcome::Revert);
+    };
+
+    // Warmth is what the access actually costs, and is only knowable from the load. A
+    // forward pass hits the same weights on every call of every layer, so charging the
+    // cold price unconditionally would overcharge by 26x on all but the first.
+    let Some((bytes, access)) = resolve_with(code_of, weights_at, offset, span)? else {
+        // Either the blob cannot hold the declared shape or the directory does not span
+        // it. Either way it is the caller's error, not a reason to read past the end.
+        return Ok(Outcome::Revert);
+    };
+
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let scales: Vec<i8> = bytes[..rows_u].iter().map(|&b| b as i8).collect();
+    let weights: Vec<i16> = bytes[rows_u..]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+
+    let mut out = vec![0i64; rows_u];
+    matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
+
+    let scales: Vec<i8> = bytes[..rows_u].iter().map(|&b| b as i8).collect();
+    let weights: Vec<i16> = bytes[rows_u..]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+
+    let mut out = vec![0i64; rows_u];
+    matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
+
+    let mut packed = Vec::with_capacity(rows_u * 8);
+    for v in out {
+        packed.extend_from_slice(&v.to_be_bytes());
+    }
+    Ok(Outcome::Return(packed, total))
 }
