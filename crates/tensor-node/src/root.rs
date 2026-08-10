@@ -60,7 +60,15 @@ fn is_empty(acct: &revm::database::DbAccount) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::chain::Chain;
-    use revm::primitives::Address;
+    use revm::primitives::{Address, B256};
+
+    /// The storage root of an account with no storage: the empty trie. Only the measurement
+    /// below builds leaves by hand, so this lives with it.
+    const EMPTY_STORAGE_ROOT: B256 = B256::new([
+        0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8,
+        0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63,
+        0xb4, 0x21,
+    ]);
 
     /// The root of an empty state: the hash of the RLP of the empty string. Not zero — a
     /// chain reporting zero for genesis would disagree with every other client at once.
@@ -116,6 +124,64 @@ mod tests {
             let t = Instant::now();
             let _ = chain.state_root();
             println!("{n:>7} accounts  {:?} per root", t.elapsed());
+        }
+    }
+
+    /// Where the cost of a root actually goes: preparing leaves, or building the trie.
+    ///
+    /// Worth knowing before optimising it. Caching leaves helps only if leaves are the
+    /// expensive part, and a whole large model turns this into hours either way.
+    #[test]
+    #[ignore = "a measurement, not a check; run with --ignored"]
+    fn root_cost_split_between_leaves_and_trie() {
+        use alloy_trie::root::state_root_unsorted;
+        use alloy_trie::TrieAccount;
+        use revm::primitives::keccak256;
+        use revm::state::AccountInfo;
+        use std::time::Instant;
+
+        for n in [20_000usize, 100_000] {
+            let mut chain = Chain::new(&[]);
+            for i in 0..n {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                chain.db.insert_account_info(
+                    Address::new(a),
+                    AccountInfo {
+                        nonce: 1,
+                        ..Default::default()
+                    },
+                );
+            }
+
+            let t = Instant::now();
+            let leaves: Vec<(B256, TrieAccount)> = chain
+                .db
+                .cache
+                .accounts
+                .iter()
+                .map(|(addr, acct)| {
+                    (
+                        keccak256(addr),
+                        TrieAccount {
+                            nonce: acct.info.nonce,
+                            balance: acct.info.balance,
+                            storage_root: EMPTY_STORAGE_ROOT,
+                            code_hash: acct.info.code_hash,
+                        },
+                    )
+                })
+                .collect();
+            let prep = t.elapsed();
+
+            let t = Instant::now();
+            let _ = state_root_unsorted(leaves);
+            let build = t.elapsed();
+
+            println!(
+                "{n:>7} accounts  leaves {prep:>10.2?}  trie {build:>10.2?}                   trie is {:.0}% of it",
+                build.as_secs_f64() * 100.0 / (build + prep).as_secs_f64()
+            );
         }
     }
 

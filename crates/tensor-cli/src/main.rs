@@ -28,7 +28,9 @@ use std::process::Command;
 
 /// The account every development chain funds first; the key is public by design.
 const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-pub const GAS: u64 = 2_000_000_000;
+/// Gas offered per transaction. Above Ethereum's cap by design — a token exceeds
+/// EIP-7825's 2^24 — and high enough to carry an 8MB upload batch at 226 gas a byte.
+pub const GAS: u64 = 3_500_000_000;
 /// Qwen3's epsilon in Q32, which is what the fixture was generated against.
 const RMS_EPS: i64 = 4_295;
 
@@ -102,10 +104,23 @@ fn chunk_bytes() -> usize {
 /// Bytes of chunk payload to put in one `storeMany` transaction.
 ///
 /// Batching matters more than it looks. Every chunk becomes an account, and the node
-/// recomputes the state root over every account each block — measured at 0.53µs an account —
-/// so uploading a gigabyte one chunk per block spends hours inside the trie rather than the
-/// upload. Batching cuts the block count by the batch size and the trie work with it.
-const BATCH_BYTES: usize = 1 << 20;
+/// recomputes the state root over every account each block — measured at 0.53µs an account,
+/// of which building the trie is about 70% and preparing leaves the rest. The block count is
+/// therefore the lever: an upload spends time proportional to blocks times accounts, and
+/// only the first of those is under a client's control.
+///
+/// Eight megabytes is what the gas cap allows. Code deposit is 200 gas a byte and calldata
+/// 16, so a batch costs about 226 gas a byte: 8MB is 1.81 billion against this client's
+/// 3.5 billion and the node's 4. Sixteen would exceed both.
+/// Overridable so the trade-off can be measured rather than assumed: a bigger batch means
+/// fewer blocks and less trie work, but the EVM charges for memory quadratically, so the
+/// gas per byte rises with it.
+fn batch_bytes() -> usize {
+    std::env::var("BATCH_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 << 20)
+}
 
 /// Stores a blob as contract code and returns the address to address it by.
 ///
@@ -129,7 +144,7 @@ pub fn upload(
     }
 
     let mut chunks = Vec::with_capacity(parts.len());
-    let per_batch = (BATCH_BYTES / size).max(1);
+    let per_batch = (batch_bytes() / size).max(1);
     for (i, batch) in parts.chunks(per_batch).enumerate() {
         let mut d = selector("storeMany(bytes[])");
         d.extend_from_slice(&word(32));

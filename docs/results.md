@@ -968,3 +968,42 @@ that would have to be built to run a whole large model rather than a layer of on
 
 A layer was the right unit anyway. Layer 0 lives entirely in one of sixteen shards, so
 answering the question cost a 3.7 GB download rather than 61 GB.
+
+## Batching an upload: what it buys and what it costs
+
+Uploading 1.25 GB, the same layer four ways:
+
+| batch | transactions | upload gas | wall clock |
+|---|---|---|---|
+| 1 MB | 1,207 | 281.5e9 | 69 s |
+| 2 MB | 598 | 291.6e9 | 60 s |
+| 4 MB | 301 | 311.7e9 | 57 s |
+| 8 MB | 152 | 351.7e9 | 54 s |
+
+Eight times the batch is eight times fewer blocks and 22% less wall clock, for **25% more
+gas**. The gas is not overhead in the chain's accounting — the EVM charges for memory
+quadratically, and a `storeMany` call holds its whole batch in memory while decoding it.
+
+The trade-off inverts with scale, which is the part worth keeping. The trie work an upload
+does is blocks times accounts-so-far, and at a layer's 53,000 accounts the trie is not what
+the time goes on — hence only 22%. At a whole model's 2.6 million it is nearly all of it, and
+the same change is worth hours rather than seconds. Eight megabytes is what the gas cap
+allows: at about 226 gas a byte, that is 1.81 billion against the node's 4 billion.
+
+So the default is 8 MB, chosen for the case this exists for. It is the right default for a
+reason worth stating plainly: upload gas is paid once by whoever publishes a model, while
+token gas is paid again by every node on every token, and batching moves cost onto the
+cheaper of the two. Nothing here changes what a token costs.
+
+### Where a root's time goes
+
+| | 20,000 accounts | 100,000 accounts |
+|---|---|---|
+| preparing leaves | 2.89 ms | 16.19 ms |
+| building the trie | 6.89 ms | 33.81 ms |
+
+Seventy per cent is the trie itself, so caching leaves — the obvious optimisation — could
+recover at most the other thirty. The real fix is not to rebuild the trie at all: keep its
+nodes and update the path from the changed leaves to the root, which is what every
+production client does and what this node does not. That is the single thing standing
+between a layer of a large model and a whole one, and it is not a flag.
