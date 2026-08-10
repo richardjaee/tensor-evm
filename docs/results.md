@@ -1235,12 +1235,43 @@ a matmul reads its weights from chain state and only a provider is handed the co
 that. What made this a small change rather than a fork is that `EvmFactory::Precompiles` is
 unconstrained at the trait level, so a state-reading provider is as acceptable as a table.
 
+### A wall that was not one
+
+`EthEvmConfig` fixes the precompile set to `PrecompilesMap` — a table of stateless
+functions. That looked fatal: a matmul reads megabytes of weights out of chain state, and a
+function handed only its calldata cannot.
+
+alloy-evm's *dynamic* precompiles are handed an `EvmInternals`, which can load accounts, and
+loading accounts is the only thing weight resolution ever needed. So the adapter is thin:
+turn `EvmInternals` into the code source the resolver takes, and call the same function.
+
+Making that possible meant a refactor worth more than the integration. Weight resolution
+reached revm's journal directly, which was fine while revm was the only host. It now takes a
+code source — address to code, and whether the touch was cold — so both hosts run the same
+directory walk, the same seeking, and the same cold and warm accounting. The state-reading
+matmul went the same way. A second implementation of what a matmul computes would be a
+second opinion about what a model says, which is the one thing a chain cannot have two of.
+
+Running a matmul through an EVM that reth built, against weights held in chain state:
+
+```
+  precompiles   0x100-0x107, inside an EVM reth built
+  shape         64x96, weights read from chain state
+  gas           44180
+  result        matches the kernel exactly
+```
+
 ### What this establishes, exactly
 
-That the precompile set is **compatible with a real client**, which was not obvious and is
-the question that decides whether the rest is reachable. It does not run a node. Wiring the
-executor, the chain spec with this design's raised limits, and the node builder is the work
-that follows, and only then is there something with ordering.
+That reth's EVM **executes these precompiles correctly**, against weights in chain state,
+with the same result as the kernel. The executor builder is written and the raised limits
+are applied where reth builds its EVM.
+
+It does not run a node. The launcher needs reth's `test-utils` feature for an in-memory
+database, and that feature currently cannot resolve `arbitrary` against this toolchain — a
+dependency conflict rather than anything about the design. A real database path or a
+resolved conflict is what stands between this and a node with ordering, and it is the last
+structural gap.
 
 The crate is deliberately its own workspace. reth is hundreds of crates, and folding it into
 the main one would put that build in front of every test run — including `verify.sh`, which
