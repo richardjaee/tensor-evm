@@ -302,6 +302,11 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
                 unreachable_stub,
             ),
             Precompile::new(
+                PrecompileId::Custom("tensor-ffn".into()),
+                FFN_ADDRESS,
+                unreachable_stub,
+            ),
+            Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,
                 unreachable_stub,
@@ -336,6 +341,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         }
         if inputs.bytecode_address == crate::router::ROUTER_ADDRESS {
             return run_router(context, inputs);
+        }
+        if inputs.bytecode_address == FFN_ADDRESS {
+            return run_host(context, inputs, ffn_state_with);
         }
         if inputs.bytecode_address != MATMUL_STATE_ADDRESS {
             return PrecompileProvider::<CTX>::run(&mut self.inner, context, inputs);
@@ -376,6 +384,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         *address == MATMUL_STATE_ADDRESS
             || *address == crate::classify::CLASSIFY_ADDRESS
             || *address == crate::router::ROUTER_ADDRESS
+            || *address == FFN_ADDRESS
             || PrecompileProvider::<CTX>::contains(&self.inner, address)
     }
 }
@@ -757,4 +766,159 @@ pub fn router_state_with(
         crate::router::encode_output(&crate::router::route(&scores, k)),
         total,
     ))
+}
+
+/// Address of the fused feed-forward.
+pub const FFN_ADDRESS: Address = revm::precompile::u64_to_address(0x108);
+
+/// ```text
+/// [0..4)    hidden  u32
+/// [4..8)    dim     u32
+/// [8..28)   weights address holding all three tensors
+/// [28..32)  gate    u32, byte offset within it
+/// [32..36)  up      u32
+/// [36..40)  down    u32
+/// [40 ..)   x       i64 x dim
+/// ```
+pub const FFN_HEADER: usize = 40;
+
+/// The whole feed-forward — gate, up, SwiGLU, down — in one call.
+///
+/// Three separate calls cost far more than the arithmetic in them. A layer's profile put the
+/// precompiles at 2.8% of it and Solidity handing them their arguments at the rest, and the
+/// feed-forward is where that hurts most: the intermediates are `hidden` wide, which is three
+/// times the residual stream, and each one is packed into `bytes`, copied across a call
+/// boundary, copied back, and paid for again in the EVM's quadratic memory price.
+///
+/// Fusing removes them. The caller passes `dim` activations and gets `dim` back; everything
+/// of width `hidden` now exists only inside the VM, where it is a `Vec<i64>` and costs
+/// nothing. Same arithmetic, in the same order, against the same weights.
+pub fn ffn_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    if input.len() < FFN_HEADER {
+        return Ok(Outcome::Revert);
+    }
+    let hidden = u32::from_be_bytes(input[0..4].try_into().expect("four")) as u64;
+    let dim = u32::from_be_bytes(input[4..8].try_into().expect("four")) as u64;
+    let at = Address::from_slice(&input[8..28]);
+    let g_off = u32::from_be_bytes(input[28..32].try_into().expect("four")) as usize;
+    let u_off = u32::from_be_bytes(input[32..36].try_into().expect("four")) as usize;
+    let d_off = u32::from_be_bytes(input[36..40].try_into().expect("four")) as usize;
+
+    if hidden == 0 || dim == 0 || hidden > MAX_DIM || dim > MAX_DIM {
+        return Ok(Outcome::Revert);
+    }
+    if input.len() != FFN_HEADER + (dim as usize) * 8 {
+        return Ok(Outcome::Revert);
+    }
+
+    // Three matmuls and one elementwise pass, priced as the separate calls would have been.
+    let Some(compute) = gas_cost(hidden, dim)
+        .and_then(|a| a.checked_mul(2))
+        .and_then(|a| a.checked_add(gas_cost(dim, hidden)?))
+        .and_then(|a| a.checked_add(crate::activation::gas_cost(hidden)?))
+    else {
+        return Ok(Outcome::Revert);
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let (hidden_u, dim_u) = (hidden as usize, dim as usize);
+    let x: Vec<i64> = input[FFN_HEADER..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let wide = hidden_u + hidden_u * dim_u * 2;
+    let tall = dim_u + dim_u * hidden_u * 2;
+    let mut access = 0u64;
+    let mut read =
+        |code_of: CodeSource<'_>, off: usize, span: usize| -> Result<Option<Vec<u8>>, String> {
+            match resolve_with(code_of, at, off, span)? {
+                Some((bytes, charged)) => {
+                    access = access.saturating_add(charged);
+                    Ok(Some(bytes))
+                }
+                None => Ok(None),
+            }
+        };
+
+    let (Some(g), Some(u), Some(d)) = (
+        read(code_of, g_off, wide)?,
+        read(code_of, u_off, wide)?,
+        read(code_of, d_off, tall)?,
+    ) else {
+        return Ok(Outcome::Revert);
+    };
+
+    let split = |b: &[u8], rows: usize| -> (Vec<i8>, Vec<i16>) {
+        (
+            b[..rows].iter().map(|&v| v as i8).collect(),
+            b[rows..]
+                .chunks_exact(2)
+                .map(|c| i16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        )
+    };
+    let (gs, gw) = split(&g, hidden_u);
+    let (us, uw) = split(&u, hidden_u);
+    let (ds, dw) = split(&d, dim_u);
+
+    let mut gate = vec![0i64; hidden_u];
+    let mut up = vec![0i64; hidden_u];
+    matmul(&gw, &gs, &x, hidden_u, dim_u, &mut gate);
+    matmul(&uw, &us, &x, hidden_u, dim_u, &mut up);
+    tensor_kernel::swiglu_vec(&mut gate, &up);
+
+    let mut out = vec![0i64; dim_u];
+    matmul(&dw, &ds, &gate, dim_u, hidden_u, &mut out);
+
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let mut packed = Vec::with_capacity(dim_u * 8);
+    for v in out {
+        packed.extend_from_slice(&v.to_be_bytes());
+    }
+    Ok(Outcome::Return(packed, total))
+}
+
+/// Runs a host-agnostic precompile against revm's journal.
+fn run_host<CTX: ContextTr>(
+    context: &mut CTX,
+    inputs: &CallInputs,
+    run: fn(CodeSource<'_>, &[u8], u64) -> Result<Outcome, String>,
+) -> Result<Option<InterpreterResult>, String> {
+    let gas_limit = inputs.gas_limit;
+    let input = inputs.input.as_bytes(context).to_vec();
+    let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+        let loaded = context
+            .journal_mut()
+            .code(a)
+            .map_err(|_| "failed to load weights".to_string())?;
+        Ok((loaded.data.to_vec(), loaded.is_cold))
+    };
+    match run(&mut code_of, &input, gas_limit)? {
+        Outcome::Revert => Ok(Some(revert(gas_limit))),
+        Outcome::OutOfGas => Ok(Some(oog(gas_limit))),
+        Outcome::Return(bytes, used) => {
+            let mut gas = Gas::new(gas_limit);
+            if !gas.record_regular_cost(used) {
+                return Ok(Some(oog(gas_limit)));
+            }
+            Ok(Some(InterpreterResult::new(
+                InstructionResult::Return,
+                bytes.into(),
+                gas,
+            )))
+        }
+    }
 }

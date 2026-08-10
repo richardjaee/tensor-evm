@@ -33,6 +33,11 @@ library Tensor {
     ///      not round differently, they run different parameters and emit different text.
     address internal constant ROUTER = address(0x107);
 
+    /// @dev The whole feed-forward in one call. Three separate ones spend far more carrying
+    ///      `hidden`-wide intermediates across call boundaries than the arithmetic in them
+    ///      costs — a layer profiled at 2.8% precompile and the rest argument marshalling.
+    address internal constant FFN = address(0x108);
+
     /// @notice Operand bundles.
     /// @dev Not tidiness: the EVM's stack is what limits how a transformer block can be
     ///      written, and seven loose arguments leave a caller no room for the values it
@@ -368,6 +373,33 @@ library Tensor {
             // arithmetically so the sign extends.
             logit := sar(192, shl(32, word))
         }
+    }
+
+    /// @notice Gate, up, SwiGLU and down, in one call
+    /// @dev The caller passes `dim` activations and receives `dim` back. Everything of width
+    ///      `hidden` exists only inside the VM, where it costs nothing to hold.
+    function ffn(
+        Scratch memory s,
+        uint32 hidden,
+        uint32 dim,
+        address weights,
+        uint32 gateOff,
+        uint32 upOff,
+        uint32 downOff,
+        bytes memory x
+    ) internal view returns (bytes memory) {
+        require(x.length == uint256(dim) * W, "activation width");
+        bytes memory input = new bytes(40 + x.length);
+        assembly ("memory-safe") {
+            let p := add(input, 0x20)
+            // Ascending, so no field lands on top of one already written.
+            mstore(p, or(shl(224, hidden), shl(192, dim)))
+            mstore(add(p, 8), shl(96, weights))
+            mstore(add(p, 28), or(shl(224, gateOff), shl(192, upOff)))
+            mstore(add(p, 36), shl(224, downOff))
+            mcopy(add(p, 40), add(x, 0x20), mload(x))
+        }
+        return _call(FFN, input, uint256(dim) * W);
     }
 
     /// @notice Score every expert and return the `k` chosen, best first

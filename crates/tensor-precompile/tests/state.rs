@@ -486,3 +486,60 @@ fn resolves_at_the_scale_of_a_real_layer() {
     }
     assert!(offset < total, "the layout must fit the blob");
 }
+
+/// The fused feed-forward must equal the three calls it replaces, exactly.
+///
+/// Not to a tolerance. It is the same arithmetic in the same order against the same weights;
+/// the only thing removed is Solidity carrying `hidden`-wide intermediates across call
+/// boundaries. If the two ever differ, the fused path is a second opinion about what a layer
+/// computes rather than a cheaper way to reach the first.
+#[test]
+fn the_fused_feed_forward_equals_the_calls_it_replaces() {
+    use tensor_precompile::state::{ffn_state_with, Outcome, FFN_HEADER};
+
+    for (dim, hidden) in [(16usize, 24usize), (64, 128), (128, 384)] {
+        let (gs, gw, x) = fixture(hidden, dim);
+        let (us, uw, _) = fixture(hidden, dim);
+        let (ds, dw, _) = fixture(dim, hidden);
+
+        // One blob holding all three, as a layer does.
+        let mut blob = Vec::new();
+        let g_off = blob.len();
+        blob.extend(weight_blob(hidden, dim, &gs, &gw));
+        let u_off = blob.len();
+        blob.extend(weight_blob(hidden, dim, &us, &uw));
+        let d_off = blob.len();
+        blob.extend(weight_blob(dim, hidden, &ds, &dw));
+
+        // What the separate path produces.
+        let (mut gate, mut up) = (vec![0i64; hidden], vec![0i64; hidden]);
+        matmul_scalar(&gw, &gs, &x, hidden, dim, &mut gate);
+        matmul_scalar(&uw, &us, &x, hidden, dim, &mut up);
+        tensor_kernel::swiglu_vec(&mut gate, &up);
+        let mut want = vec![0i64; dim];
+        matmul_scalar(&dw, &ds, &gate, dim, hidden, &mut want);
+
+        let mut input = Vec::with_capacity(FFN_HEADER + dim * 8);
+        input.extend_from_slice(&(hidden as u32).to_be_bytes());
+        input.extend_from_slice(&(dim as u32).to_be_bytes());
+        input.extend_from_slice(WEIGHTS.as_slice());
+        for o in [g_off, u_off, d_off] {
+            input.extend_from_slice(&(o as u32).to_be_bytes());
+        }
+        for v in &x {
+            input.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let tagged_blob = tagged(blob);
+        let mut code_of =
+            |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((tagged_blob.clone(), false)) };
+        let got = match ffn_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
+            Outcome::Return(bytes, _) => bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
+                .collect::<Vec<i64>>(),
+            _ => panic!("the fused feed-forward refused {dim}x{hidden}"),
+        };
+        assert_eq!(got, want, "{dim}x{hidden}");
+    }
+}

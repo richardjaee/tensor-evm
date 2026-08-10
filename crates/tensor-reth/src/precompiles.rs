@@ -19,7 +19,8 @@ use alloy_primitives::Address;
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 use revm::primitives::Bytes;
 use tensor_precompile::state::{
-    classify_state_with, matmul_state_with, router_state_with, Outcome, MATMUL_STATE_ADDRESS,
+    classify_state_with, ffn_state_with, matmul_state_with, router_state_with, Outcome,
+    FFN_ADDRESS, MATMUL_STATE_ADDRESS,
 };
 
 /// Ethereum's precompiles, plus the tensor set.
@@ -27,6 +28,7 @@ pub fn tensor_precompiles(base: PrecompilesMap) -> PrecompilesMap {
     let mut map = base;
     map.extend_precompiles([
         (MATMUL_STATE_ADDRESS, state_reading(matmul_state_with)),
+        (FFN_ADDRESS, state_reading(ffn_state_with)),
         (
             tensor_precompile::classify::CLASSIFY_ADDRESS,
             state_reading(classify_state_with),

@@ -369,17 +369,14 @@ library Transformer {
             return;
         }
 
+        // One call rather than four. The gate, the up projection and the activation are
+        // `hidden` wide — three times the residual stream here — and carrying them out of
+        // the VM and back cost more than computing them.
         g = gasleft();
-        bytes memory gate = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.gate, normed);
-        bytes memory up = Tensor.matmul(b.s, c.hidden, c.dim, b.l.at, b.l.up, normed);
-        _mark(b, g);
-
-        g = gasleft();
-        bytes memory gated = Tensor.swiglu(b.s, gate, up);
-        _mark(b, g);
-
-        g = gasleft();
-        Tensor.addInto(x, Tensor.matmul(b.s, c.dim, c.hidden, b.l.at, b.l.down, gated));
+        Tensor.addInto(
+            x,
+            Tensor.ffn(b.s, c.hidden, c.dim, b.l.at, b.l.gate, b.l.up, b.l.down, normed)
+        );
         _mark(b, g);
     }
 
@@ -424,17 +421,18 @@ library Transformer {
         // The gate and up projections are scoped so they die before the down projection is
         // reached; holding all four at once is past what the stack can address from a
         // caller this size.
-        bytes memory gated;
-        {
-            bytes memory gate =
-                Tensor.matmul(b.s, b.c.hidden, b.c.dim, b.l.at, b.l.gate + base, normed);
-            bytes memory up =
-                Tensor.matmul(b.s, b.c.hidden, b.c.dim, b.l.at, b.l.up + base, normed);
-            gated = Tensor.swiglu(b.s, gate, up);
-        }
         Tensor.addScaled(
             x,
-            Tensor.matmul(b.s, b.c.dim, b.c.hidden, b.l.at, b.l.down + base, gated),
+            Tensor.ffn(
+                b.s,
+                b.c.hidden,
+                b.c.dim,
+                b.l.at,
+                b.l.gate + base,
+                b.l.up + base,
+                b.l.down + base,
+                normed
+            ),
             weight
         );
     }

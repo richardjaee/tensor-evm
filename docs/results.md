@@ -1509,3 +1509,41 @@ second implementation, and it is now the only structural gap left.
 ```sh
 ./demo-network.sh    # a sealer, a follower, a model, and a verdict on every block
 ```
+
+## Fusing the feed-forward: 18.7% off a layer
+
+The profile said the precompiles charge 2.8% of a layer and Solidity handing them their
+arguments charges the rest. The feed-forward is where that costs most: gate, up and the
+activation are all `hidden` wide — three times the residual stream — and each was packed
+into `bytes`, copied across a call boundary, copied back, and paid for again in the EVM's
+quadratic memory price.
+
+Precompile `0x108` does all four steps in one call. The caller passes `dim` activations and
+receives `dim` back; everything of width `hidden` now exists only inside the VM, where it is
+a `Vec<i64>` and costs nothing.
+
+| | four calls | one call |
+|---|---|---|
+| gas a layer | 673,643 | 547,653 |
+| memory touched | 315,136 bytes | 249,312 bytes |
+| memory cost | 218,964 (33%) | 141,927 (26%) |
+
+**18.7% off a layer**, and a 28-layer token from about 47M gas to 44M. The saving is entirely
+in carrying arguments; the arithmetic is unchanged and the precompiles still charge 18,712
+gas of it.
+
+The equivalence is exact rather than approximate, and the test says so: the fused path must
+equal the three calls it replaces bit for bit, at three shapes. It is the same arithmetic in
+the same order against the same weights, so anything else would mean the fused path is a
+second opinion about what a layer computes rather than a cheaper way to reach the first.
+
+Both feed-forward paths use it — dense and mixture — and both hosts have it, so reth and the
+development node still run one implementation.
+
+### What is left of the 97%
+
+It is now 96.6%, which is the honest way to put it: fusing moved a fifth of the cost and did
+not change the shape of the problem. What remains is the attention half of a layer — the
+query, key and value projections, the rotary tables, the cache, and the output projection —
+each still a separate call with its own arguments. The same trick would apply, and the same
+caution: every fusion is another place where one implementation could disagree with itself.
