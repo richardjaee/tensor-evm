@@ -200,6 +200,35 @@ mod tests {
         }
     }
 
+    /// The incremental trie must agree with one rebuilt from scratch, block by block, on a
+    /// real sequence of transactions.
+    ///
+    /// The trie's own tests compare it against `alloy-trie` on synthetic keys, which proves
+    /// the data structure. This proves the wiring: that the set of accounts a transaction
+    /// touched is exactly the set whose leaves changed. An account mutated without being
+    /// reported, or reported without the leaf being rebuilt, would pass every test in
+    /// `trie.rs` and fork the chain here.
+    #[test]
+    fn the_incremental_trie_agrees_with_one_built_from_scratch() {
+        let txs = journal();
+        let mut chain = Chain::new(&[DEV]);
+        assert_eq!(
+            chain.state_root(),
+            chain.state_root_from_scratch(),
+            "genesis"
+        );
+
+        for (i, raw) in txs.iter().enumerate() {
+            apply_raw(&mut chain, raw).expect("replay must succeed");
+            assert_eq!(
+                chain.state_root(),
+                chain.state_root_from_scratch(),
+                "after transaction {i}"
+            );
+        }
+        assert_eq!(format!("{:#x}", chain.state_root()), EXPECTED_ROOT);
+    }
+
     /// A journal is only worth replaying if a changed transaction changes the result.
     /// Without this, the test above would pass against a root that ignored the input.
     #[test]

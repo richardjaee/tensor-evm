@@ -63,6 +63,9 @@ pub struct Chain {
     pub db: CacheDB<EmptyDB>,
     pub blocks: Vec<Block>,
     pub receipts: Vec<Receipt>,
+    /// The account trie, kept between blocks so a block pays for what it changed rather
+    /// than for everything that has ever existed.
+    pub trie: crate::trie::Trie,
     /// Where to append the raw signed transactions this node accepted, if it is recording.
     /// A journal is what lets somebody else re-execute the chain without having to trust
     /// this node's account of what happened.
@@ -86,13 +89,18 @@ impl Chain {
             db,
             blocks: Vec::new(),
             receipts: Vec::new(),
+            trie: crate::trie::Trie::new(),
             journal: None,
         };
+        for a in prefund {
+            chain.touch(*a);
+        }
+        let genesis_root = chain.state_root();
         chain.blocks.push(Block {
             number: 0,
             hash: B256::with_last_byte(1),
             parent: B256::ZERO,
-            state_root: chain.state_root(),
+            state_root: genesis_root,
             tx_root: alloy_trie::root::ordered_trie_root_with_encoder(
                 &[] as &[&Bytes],
                 |item: &&Bytes, buf: &mut Vec<u8>| buf.extend_from_slice(item),
@@ -102,6 +110,27 @@ impl Chain {
             transactions: Vec::new(),
         });
         chain
+    }
+
+    /// Brings one account's leaf up to date, inserting or removing as its state requires.
+    ///
+    /// Called for every account a transaction touched, which is the set revm hands back —
+    /// so the trie is updated exactly where the state changed and nowhere else.
+    pub fn touch(&mut self, who: Address) {
+        let key = revm::primitives::keccak256(who);
+        let leaf = self.db.cache.accounts.get(&who).and_then(crate::root::leaf);
+        match leaf {
+            Some(v) => self.trie.insert(key, v),
+            // An account that has become empty leaves the trie: EIP-161 says it is not in
+            // the state, and leaving a stale leaf behind would put this node's root at odds
+            // with every other client's.
+            None => self.trie.remove(key),
+        }
+    }
+
+    /// The state root, from the trie this chain maintains.
+    pub fn state_root(&mut self) -> B256 {
+        self.trie.root()
     }
 
     pub fn head(&self) -> &Block {
@@ -155,7 +184,13 @@ impl Chain {
             evm.transact(tx).map_err(|e| format!("{e:?}"))?
         };
         let result = out.result.clone();
+        // The addresses the transaction touched, taken before the state is consumed. This
+        // is the whole reason a block can be cheap: it is the trie's dirty set.
+        let touched: Vec<Address> = out.state.keys().copied().collect();
         self.db.commit(out.state);
+        for a in touched {
+            self.touch(a);
+        }
 
         let created = match &result {
             ExecutionResult::Success {

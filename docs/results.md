@@ -1007,3 +1007,51 @@ recover at most the other thirty. The real fix is not to rebuild the trie at all
 nodes and update the path from the changed leaves to the root, which is what every
 production client does and what this node does not. That is the single thing standing
 between a layer of a large model and a whole one, and it is not a flag.
+
+## An incremental trie: 872x at the scale that mattered
+
+The node rebuilt the whole account trie every block. That is correct, and it is what stood
+between a layer of a large model and a whole one: a block cost time proportional to every
+account that had ever existed, so an upload cost blocks times accounts.
+
+It now keeps the trie between blocks and rebuilds only the path from a changed leaf to the
+root. The set of accounts to update is the one revm already hands back — the accounts a
+transaction touched — so the dirty set costs nothing to compute.
+
+| accounts | one block (44 new accounts + root) | per account |
+|---|---|---|
+| 50,000 | 688 µs | 15.6 µs |
+| 200,000 | 804 µs | 18.3 µs |
+| 800,000 | 1.17 ms | 26.6 µs |
+| 2,600,000 | 1.58 ms | 35.9 µs |
+
+Fifty-two times the accounts for 2.3 times the cost: logarithmic, which is the shape it
+should be. Rebuilding cost 0.53 µs an account, so at 2.6 million a block spent 1,378 ms in
+the trie against 1.58 ms now — **872 times**. For a 61 GB model in 8 MB batches that is
+about 84 minutes of trie work reduced to roughly 9 seconds.
+
+Measured on the real 1.25 GB layer, the upload went from 69 s to 54 s at 1 MB batches. The
+more useful result is what it does to the trade-off recorded above: 1 MB now costs the same
+wall clock as 8 MB did and 20% less gas, because the reason to batch has largely gone.
+
+### Two implementations, one root
+
+`alloy-trie`'s one-shot builder was kept rather than replaced, and it is now the oracle. The
+trie is checked against it after *every* insert and removal across four sequences —
+insertion, scattered removal, in-place update, and interleaved random operations — because a
+trie can be wrong in a way that only appears at one shape, and the final state is unlikely
+to be that shape.
+
+Removal is where the shapes live. A branch left with one child must stop being a branch, and
+an extension onto an extension must merge, or two states with identical contents hash
+differently — a fork between a node that took the shortcut and one that did not.
+
+A separate test replays the recorded journal and compares the incremental root against the
+from-scratch root after every transaction. The trie's own tests prove the data structure;
+this proves the wiring, which is a different claim: that the accounts a transaction reports
+touching are exactly the accounts whose leaves changed. An account mutated without being
+reported would pass every test in `trie.rs` and fork the chain.
+
+There is no invalidation step, and that is deliberate. Insert and remove rebuild every node
+on the path they touched and leave the rest alone, so a stale cache cannot outlive a change
+beneath it — the node that held it was replaced.

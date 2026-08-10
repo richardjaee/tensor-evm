@@ -19,8 +19,13 @@ use alloy_trie::TrieAccount;
 use revm::primitives::{B256, KECCAK_EMPTY, U256};
 
 impl super::chain::Chain {
-    /// The Merkle-Patricia root over every account this chain holds.
-    pub fn state_root(&self) -> B256 {
+    /// The root, rebuilt from every account this chain holds.
+    ///
+    /// Kept although the chain no longer uses it: it is the oracle the incremental trie is
+    /// checked against, and an implementation that agrees with a second one written a
+    /// different way is worth more than either alone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn state_root_from_scratch(&self) -> B256 {
         state_root_unhashed(self.db.cache.accounts.iter().filter_map(|(addr, acct)| {
             // EIP-161: an account with no nonce, no balance and no code is not in the trie
             // at all. Including it would give a different root from any other client for a
@@ -51,6 +56,28 @@ impl super::chain::Chain {
     }
 }
 
+/// One account's leaf, as the trie stores it, or `None` if the account is not in the trie.
+pub fn leaf(acct: &revm::database::DbAccount) -> Option<Vec<u8>> {
+    if is_empty(acct) {
+        return None;
+    }
+    let storage = storage_root_unhashed(
+        acct.storage
+            .iter()
+            .filter(|(_, v)| !v.is_zero())
+            .map(|(k, v)| (B256::from(*k), *v)),
+    );
+    let account = TrieAccount {
+        nonce: acct.info.nonce,
+        balance: acct.info.balance,
+        storage_root: storage,
+        code_hash: acct.info.code_hash,
+    };
+    let mut buf = Vec::new();
+    alloy_rlp::Encodable::encode(&account, &mut buf);
+    Some(buf)
+}
+
 fn is_empty(acct: &revm::database::DbAccount) -> bool {
     acct.info.nonce == 0
         && acct.info.balance == U256::ZERO
@@ -60,7 +87,7 @@ fn is_empty(acct: &revm::database::DbAccount) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::chain::Chain;
-    use revm::primitives::{Address, B256};
+    use revm::primitives::{Address, B256, U256};
 
     /// The storage root of an account with no storage: the empty trie. Only the measurement
     /// below builds leaves by hand, so this lives with it.
@@ -124,6 +151,61 @@ mod tests {
             let t = Instant::now();
             let _ = chain.state_root();
             println!("{n:>7} accounts  {:?} per root", t.elapsed());
+        }
+    }
+
+    /// What a block costs once the trie is kept rather than rebuilt.
+    ///
+    /// The figure that matters is not the absolute time but its shape. Rebuilding was linear
+    /// in every account that had ever existed, so an upload cost blocks times accounts and a
+    /// large model spent most of a day in the trie. Updating touched leaves should be flat
+    /// in the account count, and this is what says whether it is.
+    #[test]
+    #[ignore = "a measurement, not a check; run with --ignored"]
+    fn incremental_block_cost_is_flat_in_the_account_count() {
+        use crate::trie::Trie;
+        use alloy_trie::TrieAccount;
+        use revm::primitives::keccak256;
+        use std::time::Instant;
+
+        // What one block of a weight upload does: a few dozen new accounts.
+        const PER_BLOCK: usize = 44;
+
+        let leaf = |i: u64| {
+            let a = TrieAccount {
+                nonce: 1,
+                balance: U256::from(i),
+                storage_root: EMPTY_STORAGE_ROOT,
+                code_hash: keccak256(i.to_be_bytes()),
+            };
+            let mut buf = Vec::new();
+            alloy_rlp::Encodable::encode(&a, &mut buf);
+            buf
+        };
+
+        let mut t = Trie::new();
+        let mut next = 0u64;
+        println!("{:>10}  {:>14}  {:>14}", "accounts", "block", "per account");
+        for target in [50_000usize, 200_000, 800_000, 2_600_000] {
+            while (next as usize) < target {
+                t.insert(keccak256(next.to_be_bytes()), leaf(next));
+                next += 1;
+            }
+            let _ = t.root();
+
+            // One more block's worth, then a root, which is what a block actually does.
+            let start = Instant::now();
+            for _ in 0..PER_BLOCK {
+                t.insert(keccak256(next.to_be_bytes()), leaf(next));
+                next += 1;
+            }
+            let _ = t.root();
+            let block = start.elapsed();
+            println!(
+                "{target:>10}  {:>14.2?}  {:>14.2?}",
+                block,
+                block / PER_BLOCK as u32
+            );
         }
     }
 

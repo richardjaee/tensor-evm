@@ -21,6 +21,7 @@ mod chain;
 mod replay;
 mod root;
 mod rpc;
+mod trie;
 
 use chain::{Chain, CHAIN_ID, GAS_LIMIT, MAX_CODE_SIZE};
 use revm::primitives::Address;
