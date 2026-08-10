@@ -26,6 +26,35 @@ The question this project exists to answer is how far that goes.
 If the answer is yes, verifiable inference needs neither zero-knowledge proofs nor trusted
 hardware — just ordinary consensus over a VM that can do arithmetic at memory speed.
 
+## The answer, so far
+
+**Qwen3-30B-A3B runs on a chain.** All 60.5 GB of it, uploaded as contract code, generating
+the tokens float64 says it should, at **3.79 billion gas a token** — a number anyone can
+read off a receipt.
+
+| | measured |
+|---|---|
+| whole model on chain | Qwen3-30B-A3B, 60,465,686,912 bytes, 7,318 transactions |
+| tokens | `[353, 358, 829, 374, 20445]` — float64's, exactly |
+| cost | 3.79e9 gas a token (277M for dense Qwen3-0.6B) |
+| reproduced | twice, Intel Xeon and AMD EPYC, same state root and same gas to the digit |
+| determinism | identical digests on aarch64/macOS, x86 Intel, x86 AMD, 12 thread configurations |
+| routing | the same 8 experts of 128 chosen on all three machines, every position |
+| native speed | 0.27 s a token for the 30B model on a laptop |
+
+Fifty times the parameters of the dense model for fourteen times the gas, because a token
+reads eight experts of a hundred and twenty-eight and never touches the rest. That is the
+whole mixture-of-experts argument, measured rather than projected.
+
+**What this is not.** It is one implementation, and both reproductions were run by the same
+person. There is no peer-to-peer, no consensus and no ordering — nodes agree here because
+they were handed the same inputs, not because they gossiped and settled. So this shows a 30B
+model *fits and runs* under an ordinary Ethereum interface at a knowable cost. It does not
+show a network agreeing on it, and that is the largest thing left.
+
+Every figure above is reproducible from this repository; see
+[`docs/results.md`](docs/results.md) for the commands and the failures along the way.
+
 ## Approach
 
 - **A standalone L1, not a rollup.** Rollups must post their data to Ethereum, and the

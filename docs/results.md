@@ -3,6 +3,38 @@
 Measurements, with the commands that produce them. Every projection elsewhere in this
 repository is calibrated against these numbers rather than estimated.
 
+This file is chronological, which means it records wrong turns as well as results. That is
+deliberate: several of the numbers here replaced earlier numbers of mine that were wrong,
+and a log that quietly deleted them would suggest a straighter path than there was.
+
+## The headline numbers
+
+| | |
+|---|---|
+| Whole model on chain | Qwen3-30B-A3B — 60,465,686,912 bytes, 7,318 transactions, 17.1e12 gas |
+| Gas a token | 3.79e9 for the 30B mixture, 277M for dense Qwen3-0.6B |
+| Agreement with float64 | exact tokens, every position, both models |
+| Reproduced | Intel Xeon and AMD EPYC: same state root, same gas, same tokens |
+| Determinism | one digest across aarch64/macOS, x86 Intel, x86 AMD, 12 thread counts |
+| Routing | same 8 experts of 128, all three machines, every position |
+| Native | 0.27 s a token (30B), 21.6 tokens/sec (0.6B) |
+| Kernel | 196 GB/s, against the EVM's 63 gas per multiply-accumulate |
+
+## The four silent failures
+
+The bugs worth reading are the ones that produced plausible output rather than an error.
+None was in the arithmetic, which is where all the early design attention went.
+
+| what | how it looked | where |
+|---|---|---|
+| Requantisation shifted by `32 - s` instead of `s` | agreed with its own reference; 1137% off float64 | [Phase 0](#phase-0--native-kernel-against-the-evm-baseline) |
+| Norm vectors read as a chunk when the layer was a directory | fluent, well-formed, wrong tokens | [generating on a live chain](#a-model-generating-tokens-on-a-live-chain-and-the-bug-that-found) |
+| Deploy length wrapped at 65,536, truncating a directory | deploy succeeded, 111 of 13,219 chunks stored | [Qwen3-30B-A3B layer](#qwen3-30b-a3b-a-real-mixture-layer-on-chain) |
+| Softmax over all experts rather than the chosen | every self-consistency test passed | [MoE routing](#the-router-precompile-8x-the-experts-for-100x-the-gas) |
+
+Two of the four were in the storage format, which the original plan had no phase for. Every
+one was found by running something real rather than by testing.
+
 ## Phase 0 — native kernel against the EVM baseline
 
 **Verdict: the premise holds.** Native integer matmul is roughly four orders of magnitude
