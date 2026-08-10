@@ -259,6 +259,23 @@ async fn main() -> eyre::Result<()> {
     // it, which is the whole point of running two.
     let mines = !std::env::args().any(|a| a == "--follow");
 
+    let jwt_path = std::path::PathBuf::from(
+        arg("--jwt").unwrap_or_else(|| format!("/tmp/tensor-jwt-{auth_port}.hex")),
+    );
+
+    // reth reads this file rather than creating it, so it has to exist before launch. A
+    // secret derived from the port is fine here and would not be anywhere else: this is a
+    // development chain whose engine port is on loopback, and the alternative is a node
+    // that will not start.
+    if !jwt_path.exists() {
+        let seed = format!("tensor-evm-{auth_port}");
+        let digest = revm::primitives::keccak256(seed.as_bytes());
+        std::fs::write(
+            &jwt_path,
+            format!("0x{}", alloy_primitives::hex::encode(digest)),
+        )?;
+    }
+
     let mut network = NetworkArgs {
         port: p2p_port,
         ..Default::default()
@@ -277,6 +294,12 @@ async fn main() -> eyre::Result<()> {
             let mut rpc = RpcServerArgs::default().with_http();
             rpc.http_port = rpc_port;
             rpc.auth_port = auth_port;
+            // `debug` as well as the usual namespaces: reconstructing a block as an engine
+            // payload needs the raw signed transactions, and only `debug_getRawTransaction`
+            // gives them back. A JWT secret at a known path so a consensus client — or
+            // something standing in for one — can reach the engine port.
+            rpc.http_api = Some("eth,net,web3,debug,trace".parse().expect("module list"));
+            rpc.auth_jwtsecret = Some(jwt_path.clone());
             rpc
         })
         .with_network(network)
@@ -303,5 +326,6 @@ async fn main() -> eyre::Result<()> {
         .await?;
 
     println!("tensor-reth: chain 4242, precompiles 0x100-0x107, RPC on http");
+    println!("  jwt {}", jwt_path.display());
     node_exit_future.await
 }
