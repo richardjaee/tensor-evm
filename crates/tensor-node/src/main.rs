@@ -40,9 +40,13 @@ fn main() {
     let mut port: u16 = 8545;
     let mut journal = None;
     let mut replay_from = None;
+    let mut archive = true;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--journal" => journal = args.next().map(std::path::PathBuf::from),
+            // A bulk upload arrives as as many bytes as it stores, so keeping every
+            // transaction doubles what the node holds.
+            "--no-tx-archive" => archive = false,
             "--replay" => replay_from = args.next().map(std::path::PathBuf::from),
             other => port = other.parse().unwrap_or(port),
         }
@@ -60,6 +64,7 @@ fn main() {
 
     let mut c = Chain::new(&[Address::from(DEV_ACCOUNT)]);
     c.journal = journal.clone();
+    c.archive_txs = archive;
     let chain = Arc::new(Mutex::new(c));
     let server = tiny_http::Server::http(("127.0.0.1", port)).expect("could not bind");
 
@@ -70,6 +75,9 @@ fn main() {
     println!("  prefunded          {:#x}", Address::from(DEV_ACCOUNT));
     if let Some(j) = &journal {
         println!("  journal            {}", j.display());
+    }
+    if !archive {
+        println!("  transaction archive  off — receipts keep no signed bytes");
     }
     println!("  precompiles        0x101 matmul   0x102 swiglu   0x103 norm+rope");
     println!("                     0x104 attention 0x105 rmsnorm 0x106 classify");

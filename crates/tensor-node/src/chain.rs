@@ -66,6 +66,14 @@ pub struct Chain {
     /// The account trie, kept between blocks so a block pays for what it changed rather
     /// than for everything that has ever existed.
     pub trie: crate::trie::Trie,
+    /// Whether receipts keep the signed transaction they came from.
+    ///
+    /// On by default, because it is what lets the node answer honestly about a transaction
+    /// rather than from what a receipt happened to remember. It also means a bulk upload
+    /// keeps a second copy of everything uploaded: 61GB of weights arrive as 61GB of
+    /// transactions, and a machine that can hold the state cannot necessarily hold both.
+    /// Turning it off trades that history for the room to hold a large model.
+    pub archive_txs: bool,
     /// Where to append the raw signed transactions this node accepted, if it is recording.
     /// A journal is what lets somebody else re-execute the chain without having to trust
     /// this node's account of what happened.
@@ -90,6 +98,7 @@ impl Chain {
             blocks: Vec::new(),
             receipts: Vec::new(),
             trie: crate::trie::Trie::new(),
+            archive_txs: true,
             journal: None,
         };
         for a in prefund {
@@ -230,7 +239,7 @@ impl Chain {
             created,
             gas_used: result.tx_gas_used(),
             success: result.is_success(),
-            raw,
+            raw: if self.archive_txs { raw } else { Bytes::new() },
             output: output_of(&result),
             logs,
         });

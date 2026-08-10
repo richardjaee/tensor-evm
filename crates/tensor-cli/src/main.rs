@@ -236,6 +236,9 @@ fn run() -> Result<(), String> {
     let head_dim = meta(&mj, "head_dim")?;
     let vocab = meta(&mj, "vocab")?;
     let positions = meta(&mj, "positions")?;
+    // Zero experts is a dense model, which is what `Transformer` branches on.
+    let n_experts = meta(&mj, "n_experts").unwrap_or(0);
+    let top_k = meta(&mj, "top_k").unwrap_or(0);
     let (q_width, kv_width, half) = (n_heads * head_dim, n_kv * head_dim, head_dim / 2);
 
     say("model");
@@ -258,23 +261,23 @@ fn run() -> Result<(), String> {
     // One blob per layer: seven tensors then four norm vectors, laid out contiguously, with
     // the offset of each recorded so the contract can address into it. This is the layout a
     // 31.5MB layer uses; nothing about it is special to a fixture this small.
-    let shapes: [(&str, usize, usize); 7] = [
+    let attention: [(&str, usize, usize); 4] = [
         ("q", q_width, dim),
         ("k", kv_width, dim),
         ("v", kv_width, dim),
         ("o", dim, q_width),
-        ("gate", hidden, dim),
-        ("up", hidden, dim),
-        ("down", dim, hidden),
     ];
+    let gate_len = hidden + hidden * dim * 2;
+    let down_len = dim + dim * hidden * 2;
+    let stride = gate_len * 2 + down_len;
 
     say("uploading weights as contract code");
     let mut layer_at: Vec<Address> = Vec::with_capacity(n_layers);
-    let mut offsets = vec![[0u64; 11]; n_layers];
+    let mut offsets = vec![[0u64; 12]; n_layers];
     let mut uploaded = 0usize;
     for (l, off) in offsets.iter_mut().enumerate() {
         let mut blob = Vec::new();
-        for (i, (name, rows, cols)) in shapes.iter().enumerate() {
+        for (i, (name, rows, cols)) in attention.iter().enumerate() {
             let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
             if raw.len() != rows + rows * cols * 2 {
                 return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
@@ -282,12 +285,47 @@ fn run() -> Result<(), String> {
             off[i] = blob.len() as u64;
             blob.extend_from_slice(&raw);
         }
+
+        // A dense layer carries gate, up and down directly. A mixture carries every expert
+        // laid out expert by expert, so expert e's sit one stride past expert zero's.
+        let ffn_at = blob.len();
+        if n_experts == 0 {
+            for (i, (name, rows, cols)) in [
+                ("gate", hidden, dim),
+                ("up", hidden, dim),
+                ("down", dim, hidden),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
+                if raw.len() != rows + rows * cols * 2 {
+                    return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
+                }
+                off[4 + i] = blob.len() as u64;
+                blob.extend_from_slice(&raw);
+            }
+        } else {
+            let raw = read(&dir, &format!("l{l}_experts.bin"))?;
+            if raw.len() != n_experts * stride {
+                return Err(format!("l{l}_experts: expected {n_experts} x {stride}"));
+            }
+            off[4] = ffn_at as u64;
+            off[5] = (ffn_at + gate_len) as u64;
+            off[6] = (ffn_at + gate_len * 2) as u64;
+            blob.extend_from_slice(&raw);
+        }
+
         for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
             .iter()
             .enumerate()
         {
             off[7 + j] = blob.len() as u64;
             blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))?));
+        }
+        if n_experts != 0 {
+            off[11] = blob.len() as u64;
+            blob.extend_from_slice(&read(&dir, &format!("l{l}_router.bin"))?);
         }
         uploaded += blob.len();
 
@@ -325,7 +363,7 @@ fn run() -> Result<(), String> {
             out.extend_from_slice(&word(f as u64));
         }
         out.extend_from_slice(&signed(RMS_EPS));
-        for f in [0u64, 0, 0] {
+        for f in [n_experts as u64, top_k as u64, stride as u64] {
             out.extend_from_slice(&word(f));
         }
     };
@@ -365,8 +403,6 @@ uint32,uint32,uint32)";
             for o in off {
                 layers.extend_from_slice(&word(*o));
             }
-            // The router offset, unused by a dense model.
-            layers.extend_from_slice(&word(0));
         }
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
