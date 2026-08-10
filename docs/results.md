@@ -1149,3 +1149,35 @@ instruction sets, every position.
 The digest is deliberately *outside* the pinned `OVERALL` value, because the stage needs a
 1.25 GB export that cannot be committed — folding it in would make a pinned constant depend
 on whether somebody happened to have the weights.
+
+## The 30B chain, produced twice, on two CPU vendors
+
+The whole model running on a chain was one machine's word for it. It has now been done
+again, independently, on a different CPU vendor — from downloading the checkpoint to
+generating the tokens.
+
+| | Intel Xeon Platinum 8481C | AMD EPYC 7B13 |
+|---|---|---|
+| bytes on chain | 60,465,686,912 | 60,465,686,912 |
+| transactions | 7,318 | 7,318 |
+| total gas | 17,075,759,817,727 | 17,075,759,817,727 |
+| tokens | `[353, 358, 829, 374, 20445]` | `[353, 358, 829, 374, 20445]` |
+| **state root** | `0x29bb017eed6f828b74381a515f48b30ba9892e6dd1866810cfcdd58d8fd1ea68` | `0x29bb017eed6f828b74381a515f48b30ba9892e6dd1866810cfcdd58d8fd1ea68` |
+
+Identical, to the digit, including the gas.
+
+This turned out not to need a journal. The client signs deterministically — a fixed key,
+sequential nonces, and transaction data that is a function of the weights — so running the
+same pipeline is running the same transactions. The contract addresses gave it away before
+the roots did: layer 41 landed at `0x29d0ea43…` on both machines, and a contract address is
+derived from its sender and nonce, so identical addresses mean identical sequences.
+
+That is a stronger check than replaying a journal would have been, because it covers more.
+A journal starts after the transactions exist; this starts from the safetensors. The export
+is float64 and numpy, which is *outside* the integer determinism guarantee everything else
+here rests on — so if quantisation had rounded differently on one machine, the weights would
+have differed, and the roots with them. They did not.
+
+What it still does not cover: both runs were mine, and both ran the same binary. Two vendors
+agreeing rules out the hardware. It does not rule out a bug in the code they both ran, which
+only a second implementation would.

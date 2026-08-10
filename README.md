@@ -131,7 +131,8 @@ passing a reference and the precompile reading from state.
 
 **Qwen3-30B-A3B, whole.** All 60.5 GB uploaded to a running chain as contract code — 7,318
 transactions, 7,318 blocks — and five tokens generated over JSON-RPC, every one matching
-float64. **3.79 billion gas a token** against 277M for dense Qwen3-0.6B: fifty times the
+float64. Done twice, on an Intel Xeon and an AMD EPYC, from checkpoint to tokens: same state
+root `0x29bb017e…`, same 17,075,759,817,727 gas, same tokens. **3.79 billion gas a token** against 277M for dense Qwen3-0.6B: fifty times the
 parameters for fourteen times the gas, because a token reads 8 experts of 128 and never
 touches the rest. A token takes eight transactions, because it exceeds any single
 transaction's cap — which is the granularity knob doing what it was built for.
