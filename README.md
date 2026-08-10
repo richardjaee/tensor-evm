@@ -126,6 +126,13 @@ passing a reference and the precompile reading from state.
 
 ### Largest model verified
 
+**Qwen3-30B-A3B**, one real mixture layer — 128 experts of which 8 are visited — verified
+against float64 both natively and on a live chain, with the integer router choosing exactly
+float64's eight experts at every position. 1.25 GB uploaded as contract code in 1,207
+transactions; 137M gas a layer, reading 76 MB of 1,208 MB.
+
+
+
 **Qwen3-4B**, in the harness, every position matching float64 — 176M gas a token against
 112M for Qwen3-0.6B. Six point seven times the parameters for 1.57 times the gas, because
 arithmetic was never what a token was paying for.

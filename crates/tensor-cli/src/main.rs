@@ -17,6 +17,7 @@
 //! ```
 
 mod abi;
+mod layer;
 mod rpc;
 
 use abi::{addr_word, bytes_array, bytes_tuple, dyn_bytes, packed, selector, signed, word};
@@ -27,22 +28,29 @@ use std::process::Command;
 
 /// The account every development chain funds first; the key is public by design.
 const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const GAS: u64 = 2_000_000_000;
+pub const GAS: u64 = 2_000_000_000;
 /// Qwen3's epsilon in Q32, which is what the fixture was generated against.
 const RMS_EPS: i64 = 4_295;
 
-fn read(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+pub fn read(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
     std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
 }
 
-fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>, String> {
+pub fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>, String> {
     Ok(read(dir, name)?
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
         .collect())
 }
 
-fn meta(s: &str, key: &str) -> Result<usize, String> {
+pub fn read_f64(dir: &Path, name: &str) -> Result<Vec<f64>, String> {
+    Ok(read(dir, name)?
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect())
+}
+
+pub fn meta(s: &str, key: &str) -> Result<usize, String> {
     let at = s
         .find(&format!("\"{key}\":"))
         .ok_or_else(|| format!("meta.json has no {key}"))?;
@@ -104,7 +112,12 @@ const BATCH_BYTES: usize = 1 << 20;
 /// One chunk is stored directly; anything larger becomes several chunks and a directory
 /// listing them. The precompile resolves either, so a caller holds one address whichever
 /// happened.
-fn upload(c: &mut Client, uploader: Address, blob: &[u8], what: &str) -> Result<Address, String> {
+pub fn upload(
+    c: &mut Client,
+    uploader: Address,
+    blob: &[u8],
+    what: &str,
+) -> Result<Address, String> {
     let size = chunk_bytes();
     let parts: Vec<&[u8]> = blob.chunks(size).collect();
 
@@ -142,7 +155,7 @@ fn upload(c: &mut Client, uploader: Address, blob: &[u8], what: &str) -> Result<
     rpc::first_topic(&c.send(Some(uploader), d, &format!("{what} directory"))?)
 }
 
-fn say(s: &str) {
+pub fn say(s: &str) {
     println!("\n\x1b[1m{s}\x1b[0m");
 }
 
@@ -168,11 +181,34 @@ fn run() -> Result<(), String> {
         })
         .into();
 
+    // A directory holding one exported layer rather than a whole model. Told apart by what
+    // is in it: a model has a classifier, a layer does not.
+    let one_layer = dir.join("experts.bin").exists() && !dir.join("lm_head.bin").exists();
+
     let mut c = Client::new(&url, KEY, GAS)?;
     say("chain");
     println!("  rpc         {url}");
     println!("  sender      {:#x}", c.address());
     println!("  block       {}", c.block_number()?);
+
+    let contracts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .join("contracts/src");
+
+    // A single layer takes a different path: it has no classifier and no vocabulary, so the
+    // model fields below would not be there to read.
+    if one_layer {
+        say("deploying");
+        let up = solc_bin(&contracts.join("WeightStore.sol"), "Uploader")?;
+        let uploader = rpc::created(&c.send(None, up, "deploy Uploader")?)?;
+        println!("  uploader    {uploader:#x}");
+        let gen_bin = solc_bin(&contracts.join("Generator.sol"), "Generator")?;
+        let generator = rpc::created(&c.send(None, gen_bin, "deploy Generator")?)?;
+        println!("  generator   {generator:#x}");
+        return layer::run(&mut c, &dir, uploader, generator);
+    }
 
     // ---- the model ----
     let mj = std::fs::read_to_string(dir.join("meta.json"))
@@ -194,12 +230,6 @@ fn run() -> Result<(), String> {
     println!("  vocab       {vocab}   positions {positions}");
 
     // ---- deploy the runtime ----
-    let contracts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .join("contracts/src");
-
     say("deploying");
     let up = solc_bin(&contracts.join("WeightStore.sol"), "Uploader")?;
     let uploader = rpc::created(&c.send(None, up, "deploy Uploader")?)?;

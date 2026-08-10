@@ -134,6 +134,19 @@ impl Client {
         Ok(receipt)
     }
 
+    /// A read, which costs nothing and changes nothing.
+    pub fn call(&self, to: Address, data: Vec<u8>) -> Result<Vec<u8>, String> {
+        let out = self.call_str(
+            "eth_call",
+            json!([{
+                "to": format!("{to:#x}"),
+                "data": format!("0x{}", hex(&data)),
+                "gas": format!("{:#x}", self.gas)
+            }, "latest"]),
+        )?;
+        unhex(&out).ok_or_else(|| "eth_call returned malformed hex".to_string())
+    }
+
     /// The return data of a transaction, which an Ethereum receipt does not carry. The node
     /// keeps it and serves it under `tensor_getOutput`, because on a chain built for
     /// auditing, re-running a call to learn what it returned defeats the purpose.

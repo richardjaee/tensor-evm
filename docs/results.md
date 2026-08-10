@@ -905,3 +905,66 @@ it. Regenerating it to gain a field whose absence already means "dense" would ha
 constant that exists to catch arithmetic changes. The harness defaults the field instead.
 That is the right trade: a fixture is a fixed point, and changing one to make code tidier
 spends the thing it is for.
+
+## Qwen3-30B-A3B: a real mixture layer, on chain
+
+A 30B model is tractable here for the reason mixtures exist: 30.5B parameters stored, about
+3B read per token. Storage is the axis paid once; reading is the axis paid again by every
+node on every token.
+
+Layer 0 is 2048 wide with 128 experts of 768, eight visited. 1.25 GB, of which a token reads
+76 MB.
+
+### Natively, against float64
+
+```
+ pos         ms      rel err  experts chosen
+   0        4.6      3.11e-4  [112, 64, 77, 67, 82, 0, 12, 124]
+   1        4.6      7.80e-5  [51, 72, 44, 19, 15, 46, 64, 79]
+   2        4.6      9.53e-5  [51, 121, 89, 111, 117, 4, 19, 41]
+   3        4.4      1.37e-4  [72, 110, 64, 50, 62, 97, 43, 11]
+
+  experts chosen        exactly float64's, every position
+  whole layer error     2.78e-6
+  5.7 ms a position, so 48 layers is 0.27 s a token
+```
+
+The error figure is the lesser result. The one that matters is that the integer router chose
+the same eight experts of a hundred and twenty-eight, every time. Agreement to a tolerance
+means nothing if the token then visits different parameters, and a trained router's eighth
+and ninth experts are separated by very little — unlike a synthetic one, whose scores come
+from a random matrix and are spread far apart.
+
+### On the chain
+
+```
+uploading the layer as contract code
+  1.25 GB, 1207 transactions, 281,516,279,237 gas
+
+running the layer, on chain
+  position 0:    145,382,234 gas   rel err 2.78e-6
+  position 1:    136,970,704 gas   rel err 1.68e-6
+  position 2:    137,345,500 gas   rel err 1.18e-6
+  position 3:    137,712,272 gas   rel err 1.36e-6
+```
+
+The chain reproduces the native result to the digit: 2.78e-6 at position 0, from a layer
+whose experts were chosen inside the VM by the router precompile.
+
+137M gas a layer against 8.6M for a dense Qwen3-0.6B layer, for a model fifty times the
+size — and 76 MB read rather than 1,208 MB. Extrapolating to 48 layers puts a token near
+6.6 billion gas, which is a real number rather than an aspirational one: it is what a chain
+with these limits would charge, and it is the cost of *reading 5.5 GB per token*, which no
+scheme reduces.
+
+### What could not be done, and why
+
+The whole model is 61 GB, which this node cannot hold. Not for want of memory: every chunk
+is an account, and the state root is recomputed over all of them each block at 0.53 µs an
+account, so two and a half million accounts would spend roughly a day inside the trie rather
+than in the upload. That is a property of this development node, not of the design — real
+clients keep an incremental trie and pay only for what changed. It is now the first thing
+that would have to be built to run a whole large model rather than a layer of one.
+
+A layer was the right unit anyway. Layer 0 lives entirely in one of sixteen shards, so
+answering the question cost a 3.7 GB download rather than 61 GB.
