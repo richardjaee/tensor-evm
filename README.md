@@ -126,7 +126,14 @@ passing a reference and the precompile reading from state.
 
 ### Largest model verified
 
-**Qwen3-30B-A3B**, one real mixture layer — 128 experts of which 8 are visited — verified
+**Qwen3-30B-A3B, whole.** All 60.5 GB uploaded to a running chain as contract code — 7,318
+transactions, 7,318 blocks — and five tokens generated over JSON-RPC, every one matching
+float64. **3.79 billion gas a token** against 277M for dense Qwen3-0.6B: fifty times the
+parameters for fourteen times the gas, because a token reads 8 experts of 128 and never
+touches the rest. A token takes eight transactions, because it exceeds any single
+transaction's cap — which is the granularity knob doing what it was built for.
+
+Before that, one real mixture layer — 128 experts of which 8 are visited — verified
 against float64 both natively and on a live chain, with the integer router choosing exactly
 float64's eight experts at every position. 1.25 GB uploaded as contract code in 1,207
 transactions; 137M gas a layer, reading 76 MB of 1,208 MB.

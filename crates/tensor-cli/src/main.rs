@@ -413,13 +413,23 @@ uint32,uint32,uint32)";
         model.extend_from_slice(&layers);
         model.extend_from_slice(&rope);
 
+        // How many layers one transaction attempts. A whole token of a 48-layer mixture is
+        // about 6.6 billion gas, past any single transaction's cap, so a token is split —
+        // which is what the granularity knob is for. Splitting must not change the token,
+        // and `granularity_does_not_change_the_output` is what says it does not.
+        let max_layers: usize = std::env::var("MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(n_layers)
+            .clamp(1, n_layers);
+
         let mut done = 0usize;
         let mut steps = 0;
         while done < n_layers {
             let mut d = selector(&step_sig);
             d.extend_from_slice(&id);
             d.extend_from_slice(&word(3 * 32));
-            d.extend_from_slice(&word(n_layers as u64));
+            d.extend_from_slice(&word(max_layers as u64));
             d.extend_from_slice(&model);
             let r = c.send(Some(generator), d, &format!("step from layer {done}"))?;
             let out = c.output_of(&r)?;
