@@ -311,26 +311,25 @@ library Transformer {
         uint256 pos,
         bytes memory x
     ) private view {
-        // Two calls, deliberately. Fusing them into one precompile was tried and measured
-        // 2.4% worse: the saving is one round trip of the attention result, and the wrapper
-        // pays for it by copying the query and both caches into a freshly allocated buffer
-        // rather than the scratch the other wrappers reuse. The fused form exists at 0x109
-        // and is tested against this one; it becomes worth using when its header fits the
-        // scratch path, which needs a head wider than one word.
+        // One call. Attention returns `heads * headDim` values — twice the residual stream
+        // in Qwen3-0.6B — and nothing but the output projection ever reads them, so they
+        // never leave the VM.
         uint256 g = gasleft();
-        bytes memory attn = Tensor.attention(
-            b.s,
-            b.c.nHeads,
-            b.c.nKv,
-            b.c.headDim,
-            uint32(pos + 1),
-            Tensor.AttnArgs({q: q, k: kv.k, v: kv.v})
-        );
-        _mark(b, g);
-
-        g = gasleft();
         Tensor.addInto(
-            x, Tensor.matmul(b.s, b.c.dim, uint32(qWidth(b.c)), b.l.at, b.l.o, attn)
+            x,
+            Tensor.attnProj(
+                b.s,
+                Tensor.AttnShape({
+                    heads: b.c.nHeads,
+                    nKv: b.c.nKv,
+                    headDim: b.c.headDim,
+                    positions: pos + 1,
+                    dim: b.c.dim
+                }),
+                b.l.at,
+                b.l.o,
+                Tensor.AttnArgs({q: q, k: kv.k, v: kv.v})
+            )
         );
         _mark(b, g);
     }

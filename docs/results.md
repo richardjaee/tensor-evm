@@ -1548,7 +1548,7 @@ query, key and value projections, the rotary tables, the cache, and the output p
 each still a separate call with its own arguments. The same trick would apply, and the same
 caution: every fusion is another place where one implementation could disagree with itself.
 
-## Fusing attention: tried, measured, not adopted
+## Fusing attention: worse, then better, and why
 
 `o_proj` was the largest single line in a layer — 184,368 gas of 673,643 — and almost none of
 it arithmetic. Attention returns `heads * head_dim` values, twice the residual stream in
@@ -1563,11 +1563,28 @@ already allocated. The fused wrapper cannot: its header is 44 bytes and `_build`
 single `bytes32`, so it allocates a fresh buffer and copies the query and both caches into
 it. Those are larger than the result it saved passing.
 
-So the layer keeps the two calls. The fused precompile stays at `0x109`, tested bit-for-bit
-against the pair it would replace, because the arithmetic is right and only the plumbing is
-not — it becomes worth adopting once `_build` accepts a head wider than one word.
+So `_build` now accepts a head wider than one word — a second `bytes32`, written only when
+the header exceeds thirty-two bytes — and the fused wrapper goes through the scratch path
+like every other one.
 
-Worth recording as a result rather than deleting as a failure. Fusing is not a win in itself;
-it is a trade of one copy for another, and which side is larger has to be measured. The
-feed-forward won because it removed three round trips of `hidden`-wide intermediates and
-added one small buffer. This removes one round trip and adds a large buffer.
+| | two calls | fused, fresh buffer | fused, scratch |
+|---|---|---|---|
+| gas a layer | 547,653 | 561,069 | **525,382** |
+| memory touched | 249,312 | 265,728 | 232,992 |
+
+**4.1% off a layer**, and a 28-layer token from about 44M gas to 43M.
+
+Sizing the scratch was the other half of it. `scratchFor` reserved sixteen bytes of header
+for an attention call; the fused one needs forty-four, and the shortfall was a "scratch too
+small" revert on every layer — which showed up as the test count dropping from 123 to 77
+rather than as an error anybody would read. Counting passing tests rather than looking for
+failures is the only reason that was caught quickly, and it is the third time in this project
+that has been true.
+
+The lesson survives the eventual win, and is worth more than it. Fusing is not a saving in
+itself; it trades one copy for another, and which is larger has to be measured. This one was
+2.4% worse until the buffer it allocated was the buffer the layer already had — the fusion
+was never the problem, and measuring before adopting is what distinguished the two.
+
+Both fusions together: a layer went 673,643 to 525,382, and the precompiles still charge
+18,712 gas of it.
