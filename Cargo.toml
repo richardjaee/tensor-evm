@@ -7,6 +7,9 @@ members = [
     "crates/tensor-cli",
 ]
 resolver = "2"
+# reth is hundreds of crates and its own workspace. Keeping it out means `cargo test` and
+# `verify.sh` stay quick enough that nobody is tempted to skip them.
+exclude = ["crates/tensor-reth"]
 
 [workspace.package]
 version = "0.1.0"

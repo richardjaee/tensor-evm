@@ -1,0 +1,27 @@
+[package]
+name = "tensor-reth"
+description = "The tensor precompiles inside reth, as a real Ethereum client"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+rust-version = "1.91"
+
+# Deliberately its own workspace. reth is hundreds of crates, and folding it into the main
+# one would put that build in front of every test run — including `verify.sh`, which exists
+# to be fast enough that nobody skips it.
+[workspace]
+
+[dependencies]
+tensor-precompile = { path = "../tensor-precompile" }
+
+# Pinned to a commit rather than a tag: the v2.4.1 release still carries revm 41, and these
+# precompiles are written against 42. Main moved to 42.0.1, which is the version this
+# project already builds against, so the pin is what makes the two compatible at all.
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "c7d94e622e0cd240961de7fa15d71d33ac900d07", features = ["node", "evm", "pool"] }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "c7d94e622e0cd240961de7fa15d71d33ac900d07" }
+
+alloy-evm = "0.38"
+alloy-primitives = "1"
+revm = "42"
+eyre = "0.6"
+tokio = { version = "1", features = ["full"] }

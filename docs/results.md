@@ -1213,3 +1213,36 @@ have differed, and the roots with them. They did not.
 What it still does not cover: both runs were mine, and both ran the same binary. Two vendors
 agreeing rules out the hardware. It does not rule out a bug in the code they both ran, which
 only a second implementation would.
+
+## The precompiles inside reth
+
+Everything measured above runs revm directly, which is why none of it is a chain: no
+peer-to-peer, no consensus, no ordering. reth supplies exactly that and asks for exactly
+what this project already has — its `EvmFactory` names the precompile set as an associated
+type, so carrying a custom one is a matter of saying which.
+
+`crates/tensor-reth` does. `TensorPrecompiles` — the same provider the development node
+uses, unchanged — is reth's precompile set, and `EthEvm<DB, I, TensorPrecompiles>` compiles.
+
+The version pin is the entire reason this works. reth's latest release, v2.4.1, still
+carries revm 41; these precompiles are written against 42. reth's main branch moved to
+42.0.1, which is the version this project already builds against, so the dependency is
+pinned to a commit rather than a tag.
+
+That matters more than it sounds. Most of reth's own examples customise precompiles through
+`PrecompilesMap`, which is a table of stateless functions — the wrong shape entirely, since
+a matmul reads its weights from chain state and only a provider is handed the context to do
+that. What made this a small change rather than a fork is that `EvmFactory::Precompiles` is
+unconstrained at the trait level, so a state-reading provider is as acceptable as a table.
+
+### What this establishes, exactly
+
+That the precompile set is **compatible with a real client**, which was not obvious and is
+the question that decides whether the rest is reachable. It does not run a node. Wiring the
+executor, the chain spec with this design's raised limits, and the node builder is the work
+that follows, and only then is there something with ordering.
+
+The crate is deliberately its own workspace. reth is hundreds of crates, and folding it into
+the main one would put that build in front of every test run — including `verify.sh`, which
+exists to be quick enough that nobody skips it. The main workspace still builds and tests in
+seconds, unchanged.

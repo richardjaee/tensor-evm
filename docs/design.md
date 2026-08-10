@@ -229,7 +229,7 @@ sizes, and shared security is not the property being sought.
 | 4 | Real weights, verified against float64 | done |
 | 5 | A whole model, on a chain, over JSON-RPC | done — Qwen3-0.6B, then Qwen3-30B-A3B |
 | 6 | Mixture of experts | done — router precompile, verified on a trained router |
-| 7 | Ordering: peer-to-peer, consensus, sync | not started |
+| 7 | Ordering: peer-to-peer, consensus, sync | started — precompiles compile inside reth; no node yet |
 
 Two things about that table are worth keeping rather than tidying away.
 
