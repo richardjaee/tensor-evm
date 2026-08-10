@@ -292,8 +292,9 @@ fn main() {
     );
 
     // runLayer((uint32 x6,int256),(uint32 x7),address,uint256,(int256[] x7))
-    let sig = "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
+    let sig =
+        "runLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
 uint256,(int256[],int256[],int256[]))";
     let h = keccak256(sig.as_bytes());
     let mut data = h[..4].to_vec();
@@ -311,6 +312,10 @@ uint256,(int256[],int256[],int256[]))";
         data.extend_from_slice(&word(f));
     }
     data.extend_from_slice(&signed_word(cfg.rms_eps));
+    // A dense layer: no experts, so no routing and no stride.
+    for f in [0u64, 0, 0] {
+        data.extend_from_slice(&word(f));
+    }
     // Layer: the weight contract, then the seven tensor offsets within it.
     let mut addr = [0u8; 32];
     addr[12..].copy_from_slice(WEIGHTS.as_slice());
@@ -318,10 +323,11 @@ uint256,(int256[],int256[],int256[]))";
     for o in &offsets {
         data.extend_from_slice(&word(*o));
     }
+    data.extend_from_slice(&word(0)); // router offset, unused by a dense layer
     data.extend_from_slice(&word(0)); // pos
 
     // Inputs is dynamic: a pointer, then its own head of three pointers.
-    let head_words = 8 + 12 + 1 + 1;
+    let head_words = 11 + 13 + 1 + 1;
     data.extend_from_slice(&word(head_words as u64 * 32));
 
     let half = cfg.head_dim / 2;
@@ -413,8 +419,8 @@ uint256,(int256[],int256[],int256[]))";
     // that would otherwise be attributed to whichever operation happened to be under test.
     {
         let mut d = keccak256(
-            b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
+            b"profileLayer((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32),\
 uint256,(int256[],int256[],int256[]))",
         )[..4]
             .to_vec();

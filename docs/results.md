@@ -1423,3 +1423,33 @@ nobody asked where the gas went — every measurement in this file above it is c
 none of them prompted the question. And the cause was a constant that was right for a
 different chain: the code inherited Ethereum's limit while explicitly raising Ethereum's
 limit, twelve lines apart.
+
+## What the remaining gas is: not arithmetic
+
+With the profiler working again, a dense Qwen3-0.6B layer breaks down as:
+
+```
+o proj                                       184,368   27.4%
+down proj                                    186,805   27.7%
+swiglu                                        76,671   11.4%
+gate + up proj                                62,478    9.3%
+attention                                     38,054    5.6%
+… norms, rope, cache                          …
+measured inside the contract                 673,643
+
+  the precompiles themselves charge            18,712
+  memory touched  315,136 bytes                218,964   (33%)
+```
+
+**The precompiles are 2.8% of a layer.** The other 97.2% is Solidity handing them their
+arguments — packing activations into `bytes`, copying them across call boundaries, and
+paying the EVM's quadratic memory price for the space.
+
+That reframes what is left to optimise. The arithmetic was made native and is now
+negligible; weight access was 3.5M gas and is now a fraction of that; what remains is
+argument marshalling inside the contract. A scratch buffer is already reused, so the cost is
+not repeated allocation — it is the copying itself, and the two projections that dominate
+(`o` and `down`, 27% each) are exactly the two with the widest activations.
+
+The shape of the answer has been the same at every stage of this project: whatever was made
+fast stopped being the cost, and something nobody had measured took its place.
