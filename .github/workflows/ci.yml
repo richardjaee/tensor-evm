@@ -28,8 +28,15 @@ jobs:
         with:
           version: v0.8.30
 
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      # Determinism is the property the whole design rests on, so the tests that
-      # guard it run in release, where the optimiser is free to reassociate.
-      - run: cargo test --release --all
+      # The same script a developer runs, rather than a list that can drift from it:
+      # formatting, lint, the tests, the pinned determinism digest at two thread counts,
+      # and a model generating tokens on a node over JSON-RPC.
+      #
+      # Everything runs in release. Determinism is the property the whole design rests on
+      # and the optimiser is free to reassociate, so a debug-only check would be checking
+      # something nobody runs.
+      #
+      # This job is also a standing cross-architecture check. The digest is pinned to a
+      # value measured on aarch64/macOS, and CI is x86_64/Linux — so every push re-tests
+      # the claim that the arithmetic does not depend on either.
+      - run: ./verify.sh
