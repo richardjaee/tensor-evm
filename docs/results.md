@@ -1300,3 +1300,35 @@ The crate is deliberately its own workspace. reth is hundreds of crates, and fol
 the main one would put that build in front of every test run — including `verify.sh`, which
 exists to be quick enough that nobody skips it. The main workspace still builds and tests in
 seconds, unchanged.
+
+### Two nodes, and what gossip does not decide
+
+The node now takes `--rpc-port`, `--p2p-port`, `--peer` and `--follow`, so two can run side by
+side. They connect: the follower reports `connected_peers=1` against the sealer's enode,
+with discovery off and the peer given explicitly.
+
+The sealer produced four blocks. The follower stayed at zero.
+
+That is not a fault, and it is the most useful thing this attempt produced. **A post-merge
+Ethereum node does not choose its head from gossip.** Blocks propagate over peer-to-peer,
+but what advances the chain is a consensus client calling `engine_forkchoiceUpdated`. This
+chain's genesis sets `terminalTotalDifficulty: 0`, so it is post-merge from block zero, and
+a follower without a consensus layer has nothing to tell it which block is canonical. It
+sits at genesis holding valid blocks it has no authority to adopt.
+
+So "two nodes agreeing because they gossiped" was the wrong target — that is not how
+Ethereum has worked since the merge. There are two right ones:
+
+- **Drive the follower's engine API.** Take the sealer's blocks and feed them to the follower
+  as `engine_newPayload` plus `engine_forkchoiceUpdated`. The follower re-executes each block
+  with its own EVM and either accepts it or rejects it on the state root. That is exactly
+  independent verification, and it is what a consensus client does.
+- **Run a consensus client.** Point a real one at both nodes and let it do the same thing for
+  real.
+
+The first is a few hundred lines and needs JWT auth against the engine port; the second is
+an operational task rather than a coding one. Either produces the missing measurement:
+a second client accepting or rejecting blocks it did not produce.
+
+What is established meanwhile is that the peering works and both nodes carry the
+precompiles, which is everything up to the point where a consensus layer takes over.

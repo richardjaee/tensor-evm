@@ -19,7 +19,7 @@ use reth_ethereum::chainspec::ChainSpec;
 use reth_ethereum::evm::EthEvmConfig;
 use reth_ethereum::node::api::{FullNodeTypes, NodeTypes};
 use reth_ethereum::node::builder::{BuilderContext, NodeBuilder, NodeHandle};
-use reth_ethereum::node::core::args::RpcServerArgs;
+use reth_ethereum::node::core::args::{NetworkArgs, RpcServerArgs};
 use reth_ethereum::node::core::node_config::NodeConfig;
 use reth_ethereum::node::{EthereumAddOns, EthereumNode};
 use reth_ethereum::tasks::Runtime;
@@ -239,10 +239,43 @@ async fn main() -> eyre::Result<()> {
 
     let _guard = reth_tracing::RethTracer::new().init()?;
 
-    let config = NodeConfig::test()
-        .dev()
-        .with_rpc(RpcServerArgs::default().with_http())
+    let arg = |name: &str| -> Option<String> {
+        let mut it = std::env::args().skip_while(|a| a != name);
+        it.next()?;
+        it.next()
+    };
+    let rpc_port: u16 = arg("--rpc-port").and_then(|v| v.parse().ok()).unwrap_or(8545);
+    let p2p_port: u16 = arg("--p2p-port").and_then(|v| v.parse().ok()).unwrap_or(30303);
+    let auth_port: u16 = arg("--auth-port").and_then(|v| v.parse().ok()).unwrap_or(8551);
+    // A node that only follows does not mine. One node seals and the other must agree with
+    // it, which is the whole point of running two.
+    let mines = !std::env::args().any(|a| a == "--follow");
+
+    let mut network = NetworkArgs {
+        port: p2p_port,
+        ..Default::default()
+    };
+    // Discovery is off and peers are given explicitly: two nodes on one machine should find
+    // each other because they were told to, not because they searched a network that is not
+    // there.
+    network.discovery.disable_discovery = true;
+    if let Some(peer) = arg("--peer") {
+        network.trusted_peers = vec![peer.parse()?];
+        network.trusted_only = true;
+    }
+
+    let mut config = NodeConfig::test()
+        .with_rpc({
+            let mut rpc = RpcServerArgs::default().with_http();
+            rpc.http_port = rpc_port;
+            rpc.auth_port = auth_port;
+            rpc
+        })
+        .with_network(network)
         .with_chain(chain_spec());
+    if mines {
+        config = config.dev();
+    }
 
     let NodeHandle {
         node: _node,
