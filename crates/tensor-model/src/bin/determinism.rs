@@ -290,13 +290,121 @@ fn stage_model(dir: &Path) -> (String, usize, Vec<usize>) {
     (digest, count, tokens)
 }
 
+/// The real mixture layer, when one has been exported.
+///
+/// The stages above use synthetic weights, which is the right way to test arithmetic and
+/// the wrong way to test routing. A random router's scores are spread far apart, so its top
+/// eight of a hundred and twenty-eight are never in doubt. A trained one's are, and the
+/// question this answers is whether two machines agree about which side of that line a
+/// token falls on — because disagreeing is not a rounding difference, it sends the token
+/// through different parameters.
+///
+/// Hashes the router's scores, the experts it chose, and the mixture's output. The scores
+/// are included on purpose: if two machines ever disagree, the digest says whether they
+/// differed in the arithmetic or only in the decision it led to.
+fn stage_moe(dir: &Path) -> (String, usize, Vec<Vec<usize>>) {
+    use tensor_model::moe::{Expert, MoeScratch};
+    use tensor_model::qwen3::QTensor;
+
+    let mj = std::fs::read_to_string(dir.join("meta.json")).expect("meta.json");
+    let dim = meta(&mj, "dim");
+    let hidden = meta(&mj, "hidden");
+    let n_experts = meta(&mj, "n_experts");
+    let top_k = meta(&mj, "top_k");
+    let positions = meta(&mj, "positions");
+
+    let split = |raw: &[u8], rows: usize, cols: usize| -> (Vec<i8>, Vec<i16>) {
+        assert_eq!(raw.len(), rows + rows * cols * 2, "{rows}x{cols}");
+        (
+            raw[..rows].iter().map(|&b| b as i8).collect(),
+            raw[rows..]
+                .chunks_exact(2)
+                .map(|c| i16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        )
+    };
+
+    let router_raw = read(dir, "router.bin");
+    let (rs, rw) = split(&router_raw, n_experts, dim);
+    let experts_raw = read(dir, "experts.bin");
+
+    let gate_len = hidden + hidden * dim * 2;
+    let stride = gate_len * 2 + dim + dim * hidden * 2;
+    assert_eq!(experts_raw.len(), n_experts * stride, "expert stride");
+
+    let owned: Vec<[(Vec<i8>, Vec<i16>); 3]> = (0..n_experts)
+        .map(|e| {
+            let b = e * stride;
+            [
+                split(&experts_raw[b..b + gate_len], hidden, dim),
+                split(&experts_raw[b + gate_len..b + gate_len * 2], hidden, dim),
+                split(&experts_raw[b + gate_len * 2..b + stride], dim, hidden),
+            ]
+        })
+        .collect();
+    let experts: Vec<Expert> = owned
+        .iter()
+        .map(|[g, u, d]| Expert {
+            gate: QTensor {
+                w: &g.1,
+                scales: &g.0,
+                rows: hidden,
+                cols: dim,
+            },
+            up: QTensor {
+                w: &u.1,
+                scales: &u.0,
+                rows: hidden,
+                cols: dim,
+            },
+            down: QTensor {
+                w: &d.1,
+                scales: &d.0,
+                rows: dim,
+                cols: hidden,
+            },
+        })
+        .collect();
+    let router = QTensor {
+        w: &rw,
+        scales: &rs,
+        rows: n_experts,
+        cols: dim,
+    };
+
+    let xs = read_i64(dir, "moe_in.bin");
+    let mut h = Hasher::default();
+    let mut chosen_all = Vec::with_capacity(positions);
+
+    for p in 0..positions {
+        let x = &xs[p * dim..(p + 1) * dim];
+        let mut s = MoeScratch::new(dim, hidden, n_experts, top_k);
+        let mut out = vec![0i64; dim];
+        tensor_model::moe::forward(x, &router, &experts, top_k, &mut s, &mut out);
+
+        h.feed_all(&s.scores);
+        for &(i, w) in &s.chosen {
+            h.feed(i as i64);
+            h.feed(w);
+        }
+        h.feed_all(&out);
+        chosen_all.push(s.chosen.iter().map(|&(i, _)| i).collect());
+    }
+
+    let (digest, count) = h.finish();
+    (digest, count, chosen_all)
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut dir: Option<PathBuf> = None;
+    let mut moe: Option<PathBuf> = None;
     let mut threads: Option<usize> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--threads" => threads = args.next().and_then(|v| v.parse().ok()),
+            // A real exported mixture layer, which cannot be committed and so is optional.
+            "--moe" => moe = args.next().map(PathBuf::from),
             other => dir = Some(other.into()),
         }
     }
@@ -333,10 +441,25 @@ fn main() {
     println!("{:<10} {:>10}  {}", "fixed", f_n, f_digest);
     println!("{:<10} {:>10}  {}", "model", o_n, o_digest);
 
+    let moe_digest = moe.as_ref().map(|d| {
+        let (digest, n, chosen) = stage_moe(d);
+        println!("{:<10} {:>10}  {}", "moe", n, digest);
+        (digest, chosen)
+    });
+
     // One line to compare, so agreement is checkable by eye across two terminals.
     let mut all = Sha256::new();
     for d in [&m_digest, &f_digest, &o_digest] {
         all.update(d.as_bytes());
+    }
+    // Deliberately outside the OVERALL digest: the mixture stage needs a 1.25 GB export
+    // that cannot be committed, so folding it in would make the pinned value depend on
+    // whether somebody happened to have the weights.
+    if let Some((_, chosen)) = &moe_digest {
+        println!("\nexperts chosen, per position");
+        for (p, c) in chosen.iter().enumerate() {
+            println!("  {p}: {c:?}");
+        }
     }
     println!("\ntokens generated  {tokens:?}");
     println!("OVERALL           {}", hex(&all.finalize()));

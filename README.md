@@ -72,7 +72,10 @@ cargo run --release -p tensor-model --bin determinism
 ```
 
 It needs neither revm nor solc nor a network, so anyone can reproduce it on any machine in
-about a minute. What it shows is that the *arithmetic* is portable. It does not yet show
+about a minute. With a real mixture layer exported, `--moe <dir>` adds the harder case: all
+three machines choose the same eight experts of a hundred and twenty-eight at every
+position, which synthetic weights cannot test because a random router's top eight are never
+in doubt. What it shows is that the *arithmetic* is portable. It does not yet show
 that two nodes agree, which additionally covers block execution and gas accounting — see
 [`docs/results.md`](docs/results.md).
 

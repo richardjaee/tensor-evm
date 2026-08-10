@@ -1116,3 +1116,36 @@ scale and on the smaller models, not by a second party running this 60 GB chain.
 And it is still a development node: no peer-to-peer, no consensus, no ordering. This shows a
 30B mixture model *fits* and *runs* under an ordinary Ethereum interface at a cost anyone can
 read off a receipt. It does not show a network agreeing on it.
+
+## Determinism on a trained router
+
+The determinism digest covered synthetic weights, which is the right way to test arithmetic
+and the wrong way to test routing. A random router's scores are spread far apart, so its top
+eight of a hundred and twenty-eight are never in doubt. A trained router's are, and
+disagreeing about them is not a rounding difference — it sends the token through different
+parameters.
+
+`determinism --moe <layer>` hashes the router's scores, the experts chosen, and the
+mixture's output for a real Qwen3-30B-A3B layer. The scores are hashed as well as the
+decision on purpose: if two machines ever disagree, the digest says whether they differed in
+the arithmetic or only in what it led to.
+
+| machine | arch | moe digest |
+|---|---|---|
+| Apple M4 | aarch64 | `5cec5618…ede0` |
+| Intel Xeon Platinum 8481C | x86_64 | `5cec5618…ede0` |
+| AMD EPYC 7B13 | x86_64 | `5cec5618…ede0` |
+
+```
+0: [112, 64, 77, 67, 82, 0, 12, 124]
+1: [51, 72, 44, 19, 15, 46, 64, 79]
+2: [51, 121, 89, 111, 117, 4, 19, 41]
+3: [72, 110, 64, 50, 62, 97, 43, 11]
+```
+
+The same eight experts of a hundred and twenty-eight, on three CPU vendors and two
+instruction sets, every position.
+
+The digest is deliberately *outside* the pinned `OVERALL` value, because the stage needs a
+1.25 GB export that cannot be committed — folding it in would make a pinned constant depend
+on whether somebody happened to have the weights.
