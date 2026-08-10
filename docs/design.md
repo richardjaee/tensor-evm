@@ -218,16 +218,46 @@ sizes, and shared security is not the property being sought.
 - Model licences govern redistribution, and chain state cannot be withdrawn. Only
   permissively licensed weights should be published.
 
-## Phases
+## Phases, and where the plan was wrong
 
-| Phase | Deliverable | Gate |
+| Phase | Deliverable | State |
 |---|---|---|
-| 0 | Deterministic kernel + bandwidth measurement | Parallel path bit-identical to scalar at every thread count |
-| 1 | reth fork with a stub precompile, callable from Solidity | Devnet produces blocks; a contract can call the precompile |
-| 2 | Real matmul precompile wired to state-resident weights | Matches the Solidity implementation bit for bit on a small model |
-| 3 | Model registry, session-keyed state, arch flags | Two model families served concurrently |
-| 4 | Scale run | Measured tokens/sec with full re-execution |
-| 5 | MoE support | Router, top-k gather, dynamic address resolution |
+| 0 | Deterministic kernel + bandwidth measurement | done |
+| 1 | Precompile callable from Solidity | done — in revm directly, not a reth fork |
+| 2 | Weights read from chain state | done |
+| 3 | Model registry, session-keyed state, arch flags | done |
+| 4 | Real weights, verified against float64 | done |
+| 5 | A whole model, on a chain, over JSON-RPC | done — Qwen3-0.6B, then Qwen3-30B-A3B |
+| 6 | Mixture of experts | done — router precompile, verified on a trained router |
+| 7 | Ordering: peer-to-peer, consensus, sync | not started |
 
-Phase 0 gates everything. If native integer matmul is not dramatically faster than the
-EVM baseline, the premise is wrong and the rest should not be built.
+Two things about that table are worth keeping rather than tidying away.
+
+**Phase 1 was planned as a reth fork and was not built that way.** Precompiles went into revm
+directly and a development node was written around them. That was the right order — it
+answered whether a model could run at all before spending weeks on a client — but it means
+the thing built is a harness, not a client, and phase 7 is larger than the row suggests.
+
+**The plan had no phase for the storage format, and that is where the bugs were.** Both
+silent failures this project shipped were there: a directory read as if it were a chunk, and
+a chunk length that wrapped at 65,536. Neither was in the arithmetic, which is what all the
+early planning was about. A layer of a real model cannot be one chunk, so every real model
+takes the path that no fixture exercised, and it took uploading 1.25 GB to find out.
+
+**What the phases understated.** The measured ceiling turned out not to be gas or arithmetic
+but three things nobody planned for: the state trie being rebuilt every block, memory spent
+keeping transactions as well as state, and the float64 reference needing four times the
+model to exist at once. Each was found by trying to run something real, and each took a day
+of the schedule that the phases had allotted to inference.
+
+## What would have to be true for this to be a chain
+
+The measurements say a 30B mixture model fits, runs, and costs 3.79 billion gas a token that
+anyone can read off a receipt. They do not say it is a chain. That needs:
+
+- **Ordering.** Nodes here agree because they were handed the same transactions, not because
+  they gossiped and settled. This is reth's work and it is the largest piece left.
+- **A second implementation.** Three machines running one binary rules out hardware, threads
+  and operating system. It does not rule out a bug in that binary.
+- **Someone else running it.** The 30B chain was produced twice, on two CPU vendors, and
+  agreed. Both runs were mine.
