@@ -21,6 +21,8 @@ reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "c7d94e622e
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "c7d94e622e0cd240961de7fa15d71d33ac900d07" }
 
 alloy-evm = "0.38"
+alloy-genesis = "1"
+serde_json = "1"
 alloy-primitives = "1"
 revm = "42"
 eyre = "0.6"

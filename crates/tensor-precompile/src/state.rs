@@ -61,22 +61,46 @@ const ENTRY: usize = 24;
 /// Chunk and directory are told apart by the first byte of code rather than by a marker in
 /// the payload, because a blob's first byte is a quantisation scale and can be anything —
 /// any in-band marker could collide with real weights.
+/// How a host hands over an account's code, and whether this call was the first to touch it.
+///
+/// An indirection rather than a concrete type because there is more than one host. revm's
+/// journal is one; a client that reaches state through its own abstraction is another, and
+/// weight resolution is consensus-critical enough that the two must not each have a copy of
+/// it.
+pub type CodeSource<'a> = &'a mut dyn FnMut(Address) -> Result<(Vec<u8>, bool), String>;
+
 fn resolve<CTX: ContextTr>(
     context: &mut CTX,
     at: Address,
     offset: usize,
     len: usize,
 ) -> Result<Option<(Vec<u8>, u64)>, String> {
-    let loaded = context
-        .journal_mut()
-        .code(at)
-        .map_err(|_| "failed to load weights".to_string())?;
-    let mut charged = if loaded.is_cold {
+    let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+        let loaded = context
+            .journal_mut()
+            .code(a)
+            .map_err(|_| "failed to load weights".to_string())?;
+        Ok((loaded.data.to_vec(), loaded.is_cold))
+    };
+    resolve_with(&mut code_of, at, offset, len)
+}
+
+/// Weight resolution, against any host that can produce an account's code.
+///
+/// Handles both forms a blob takes: a single chunk, and a directory whose entries carry
+/// cumulative offsets so a reader seeks to the chunk it needs rather than walking to it.
+pub fn resolve_with(
+    code_of: CodeSource<'_>,
+    at: Address,
+    offset: usize,
+    len: usize,
+) -> Result<Option<(Vec<u8>, u64)>, String> {
+    let (code, is_cold) = code_of(at)?;
+    let mut charged = if is_cold {
         COLD_ACCOUNT_GAS
     } else {
         WARM_ACCOUNT_GAS
     };
-    let code = loaded.data;
     if code.is_empty() {
         return Ok(None);
     }
@@ -137,16 +161,12 @@ fn resolve<CTX: ContextTr>(
         let chunk_at = Address::from_slice(&entry[..20]);
         let seen = if i == 0 { 0 } else { cum(i - 1) };
 
-        let chunk = context
-            .journal_mut()
-            .code(chunk_at)
-            .map_err(|_| "failed to load chunk".to_string())?;
-        charged += if chunk.is_cold {
+        let (data, chunk_cold) = code_of(chunk_at)?;
+        charged += if chunk_cold {
             COLD_ACCOUNT_GAS
         } else {
             WARM_ACCOUNT_GAS
         };
-        let data = chunk.data;
         if data.is_empty() {
             return Ok(None);
         }
