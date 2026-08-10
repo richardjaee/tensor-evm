@@ -1267,11 +1267,34 @@ That reth's EVM **executes these precompiles correctly**, against weights in cha
 with the same result as the kernel. The executor builder is written and the raised limits
 are applied where reth builds its EVM.
 
-It does not run a node. The launcher needs reth's `test-utils` feature for an in-memory
-database, and that feature currently cannot resolve `arbitrary` against this toolchain — a
-dependency conflict rather than anything about the design. A real database path or a
-resolved conflict is what stands between this and a node with ordering, and it is the last
-structural gap.
+### And it runs as a node
+
+```
+cargo run --release -p tensor-reth          # a reth node, chain 4242, RPC on 8545
+RPC=http://127.0.0.1:8545 ./demo.sh         # the same demo, against it
+```
+
+The demo deploys the uploader, stores a tensor as contract code, deploys the registry,
+commits to the weights by hash, and multiplies by them through the precompile. The result
+matches the reference, and four blocks exist afterwards — produced by reth's own consensus
+engine, from reth's own transaction pool.
+
+Everything that makes it a chain is reth's and untouched: the network, the pool, the payload
+builder, the engine. The only substitution is the executor.
+
+Two things cost time and are worth recording.
+
+**Dev mining is a debug capability.** `launch()` starts a node that accepts transactions into
+the pool and never seals a block, which looks exactly like a stuck chain rather than a
+missing flag. `launch_with_debug_capabilities()` is what mines.
+
+**Account code is loaded lazily, and an in-memory database hides it.** `load_account` returns
+an account carrying a code hash and an empty `code`, so weights came back as nothing and
+every matmul reverted. The self-check above did not catch it, because `CacheDB` keeps code
+inline in the account — it answered the wrong question correctly. `load_account_code`
+followed by `load_code` is what actually fetches bytes, and the lesson generalises: a test
+harness that stores things more conveniently than the real thing will confirm code that
+cannot work against the real thing.
 
 The crate is deliberately its own workspace. reth is hundreds of crates, and folding it into
 the main one would put that build in front of every test run — including `verify.sh`, which

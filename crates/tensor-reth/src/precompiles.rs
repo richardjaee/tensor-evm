@@ -61,18 +61,22 @@ fn matmul_state() -> DynPrecompile {
         // forward pass hits the same weights on every call of every layer — so it is taken
         // from the host rather than assumed.
         let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
-            let loaded = input
+            // `load_account` alone is not enough: code is loaded lazily, so an account
+            // read that way carries a code hash and an empty `code`. Weights would come
+            // back as nothing and every matmul would revert — which is exactly what
+            // happened, and which an in-memory database hides, because it keeps code inline
+            // in the account and so answers the wrong question correctly.
+            let mut loaded = input
                 .internals
-                .load_account(a)
+                .load_account_code(a)
                 .map_err(|_| "failed to load weights".to_string())?;
             let is_cold = loaded.is_cold;
             let code = loaded
                 .data
-                .info
-                .code
-                .as_ref()
-                .map(|c| c.original_bytes().to_vec())
-                .unwrap_or_default();
+                .load_code()
+                .map_err(|_| "failed to load weights".to_string())?
+                .original_bytes()
+                .to_vec();
             Ok((code, is_cold))
         };
 

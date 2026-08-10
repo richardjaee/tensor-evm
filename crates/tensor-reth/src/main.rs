@@ -18,7 +18,13 @@ use alloy_evm::{EvmEnv, EvmFactory};
 use reth_ethereum::chainspec::ChainSpec;
 use reth_ethereum::evm::EthEvmConfig;
 use reth_ethereum::node::api::{FullNodeTypes, NodeTypes};
-use reth_ethereum::node::builder::BuilderContext;
+use reth_ethereum::node::builder::{BuilderContext, NodeBuilder, NodeHandle};
+use reth_ethereum::node::core::args::RpcServerArgs;
+use reth_ethereum::node::core::node_config::NodeConfig;
+use reth_ethereum::node::{EthereumAddOns, EthereumNode};
+use reth_ethereum::tasks::Runtime;
+use reth_tracing::Tracer;
+use std::sync::Arc;
 use reth_ethereum::node::builder::components::ExecutorBuilder;
 use reth_ethereum::EthPrimitives;
 use reth_ethereum::evm::primitives::Database;
@@ -98,7 +104,7 @@ const MAX_CODE_SIZE: usize = 64 * 1024 * 1024;
 /// What was in doubt is whether a precompile that reads megabytes out of state can live
 /// inside reth's EVM at all, given its configuration fixes the precompile set to a table of
 /// stateless functions. This answers that by running one.
-fn main() -> eyre::Result<()> {
+fn self_check() -> eyre::Result<()> {
     use alloy_evm::Evm;
     use revm::database::{CacheDB, EmptyDB};
     use revm::primitives::{Address, Bytes, TxKind, U256};
@@ -159,7 +165,7 @@ fn main() -> eyre::Result<()> {
     println!("tensor-reth");
     println!("  precompiles   0x100-0x107, inside an EVM reth built");
     println!("  shape         {rows}x{cols}, weights read from chain state");
-    println!("  gas           {}", out.result.gas_used());
+    println!("  gas           {}", out.result.tx_gas_used());
     println!(
         "  result        {}",
         if got == want {
@@ -190,7 +196,71 @@ where
     }
 }
 
-// The node launcher is not here yet. Wiring it needs reth's `test-utils` feature for an
-// in-memory database, and that feature currently cannot resolve `arbitrary` against this
-// toolchain — a dependency conflict rather than anything about this design. The executor
-// builder above is what a node would be given.
+/// A genesis that funds the account every development chain funds first, and a block gas
+/// limit a token can fit inside.
+///
+/// The two raised limits are applied where reth builds its EVM rather than here: a token
+/// exceeds EIP-7825's 2^24 gas cap, and a layer of a real model is tens of megabytes against
+/// EIP-170's 24KB.
+fn chain_spec() -> Arc<ChainSpec> {
+    let genesis: alloy_genesis::Genesis = serde_json::from_str(
+        r#"{
+            "nonce": "0x0",
+            "timestamp": "0x0",
+            "extraData": "0x74656e736f72",
+            "gasLimit": "0xee6b2800",
+            "difficulty": "0x0",
+            "alloc": {
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {
+                    "balance": "0x100000000000000000000000000000"
+                }
+            },
+            "config": {
+                "chainId": 4242,
+                "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
+                "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0,
+                "istanbulBlock": 0, "berlinBlock": 0, "londonBlock": 0,
+                "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0,
+                "terminalTotalDifficulty": 0
+            }
+        }"#,
+    )
+    .expect("genesis");
+    Arc::new(ChainSpec::from_genesis(genesis))
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    // The self-check runs the arithmetic through reth's EVM without a node, which is the
+    // part worth being able to run in a second rather than after a sync.
+    if std::env::args().any(|a| a == "--check") {
+        return self_check();
+    }
+
+    let _guard = reth_tracing::RethTracer::new().init()?;
+
+    let config = NodeConfig::test()
+        .dev()
+        .with_rpc(RpcServerArgs::default().with_http())
+        .with_chain(chain_spec());
+
+    let NodeHandle {
+        node: _node,
+        node_exit_future,
+    } = NodeBuilder::new(config)
+        .testing_node(Runtime::test())
+        .with_types::<EthereumNode>()
+        // Ethereum's components throughout, except the executor. Everything that makes this
+        // a chain rather than a harness — the network, the pool, the payload builder,
+        // consensus — is reth's, untouched.
+        .with_components(EthereumNode::components().executor(TensorExecutorBuilder))
+        .with_add_ons(EthereumAddOns::default())
+        // Not `launch()`. Dev mining is a debug capability, and without it the node accepts
+        // transactions into the pool and never seals a block — which looks exactly like a
+        // stuck chain rather than a missing flag.
+        .launch_with_debug_capabilities()
+        .await?;
+
+    println!("tensor-reth: chain 4242, precompiles 0x100-0x107, RPC on http");
+    node_exit_future.await
+}
