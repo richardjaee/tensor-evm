@@ -597,3 +597,151 @@ fn fused_attention_equals_attention_then_projection() {
         assert_eq!(got, want, "{heads} heads, {positions} positions, dim {dim}");
     }
 }
+
+/// The whole-layer precompile must equal `forward_layer` called directly.
+///
+/// It *is* `forward_layer`, so this is not testing the arithmetic. It tests everything
+/// around it: that the header is parsed into the shapes it names, that the cache arrives in
+/// the right slots, and that the residual stream and the new cache entry come back in the
+/// order the caller unpacks them. Marshalling is where every bug in this project has been.
+#[test]
+fn the_whole_layer_precompile_equals_calling_the_reference() {
+    use tensor_model::qwen3::{Config, KvCache, LayerWeights, QTensor, Rope, Scratch};
+    use tensor_precompile::state::{layer_state_with, Outcome, LAYER_HEADER};
+
+    let (dim, hidden, heads, n_kv, hs, positions) =
+        (16usize, 32usize, 4usize, 2usize, 8usize, 3usize);
+    let cfg = Config {
+        dim,
+        hidden,
+        n_heads: heads,
+        n_kv,
+        head_dim: hs,
+        seq_len: positions,
+        rms_eps: tensor_kernel::fixed::RMS_EPS_QWEN3,
+    };
+    let (qw, kvw, half, past) = (cfg.q_width(), cfg.kv_width(), hs / 2, positions - 1);
+
+    let shapes = [
+        (qw, dim),
+        (kvw, dim),
+        (kvw, dim),
+        (dim, qw),
+        (hidden, dim),
+        (hidden, dim),
+        (dim, hidden),
+    ];
+    let mut blob = Vec::new();
+    let mut off = Vec::new();
+    let mut owned = Vec::new();
+    for (rows, cols) in shapes {
+        let (s, w, _) = fixture(rows, cols);
+        off.push(blob.len());
+        blob.extend(weight_blob(rows, cols, &s, &w));
+        owned.push((s, w));
+    }
+    let norm = |n: usize, seed: i64| -> Vec<i64> {
+        (0..n)
+            .map(|i| (1i64 << 32) + (((i as i64 + seed) % 5) << 30))
+            .collect()
+    };
+    let norms: Vec<Vec<i64>> = [(dim, 1i64), (hs, 2), (hs, 3), (dim, 4)]
+        .iter()
+        .map(|&(n, s)| norm(n, s))
+        .collect();
+    for nv in &norms {
+        off.push(blob.len());
+        for v in nv {
+            blob.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    let vals = |n: usize, seed: i64| -> Vec<i64> {
+        (0..n)
+            .map(|i| (((i as i64 * 53 + seed) % 13) - 6) << 29)
+            .collect()
+    };
+    let (x0, cos, sin) = (vals(dim, 1), vals(half, 2), vals(half, 3));
+    let (pk, pv) = (vals(past * kvw, 4), vals(past * kvw, 5));
+
+    // The reference, called directly.
+    let t = |i: usize, rows: usize, cols: usize| QTensor {
+        w: &owned[i].1,
+        scales: &owned[i].0,
+        rows,
+        cols,
+    };
+    let w = LayerWeights {
+        input_norm: &norms[0],
+        q: t(0, qw, dim),
+        k: t(1, kvw, dim),
+        v: t(2, kvw, dim),
+        q_norm: &norms[1],
+        k_norm: &norms[2],
+        o: t(3, dim, qw),
+        post_norm: &norms[3],
+        gate: t(4, hidden, dim),
+        up: t(5, hidden, dim),
+        down: t(6, dim, hidden),
+        mixture: None,
+    };
+    let mut kv = KvCache::new(&cfg, 1);
+    kv.k[..past * kvw].copy_from_slice(&pk);
+    kv.v[..past * kvw].copy_from_slice(&pv);
+    // The reference wants the whole table; the precompile is handed one row and places it.
+    let mut cos_tab = vec![0i64; positions * half];
+    let mut sin_tab = vec![0i64; positions * half];
+    cos_tab[past * half..].copy_from_slice(&cos);
+    sin_tab[past * half..].copy_from_slice(&sin);
+    let rope = Rope {
+        cos: cos_tab,
+        sin: sin_tab,
+        head_dim: hs,
+    };
+    let mut scratch = Scratch::new(&cfg);
+    let mut want_x = x0.clone();
+    tensor_model::qwen3::forward_layer(
+        &cfg,
+        &w,
+        &rope,
+        &mut kv,
+        &mut scratch,
+        0,
+        past,
+        &mut want_x,
+    );
+    let want_k = kv.k[past * kvw..(past + 1) * kvw].to_vec();
+    let want_v = kv.v[past * kvw..(past + 1) * kvw].to_vec();
+
+    let mut input = Vec::new();
+    for f in [dim, hidden, heads, n_kv, hs, positions] {
+        input.extend_from_slice(&(f as u32).to_be_bytes());
+    }
+    input.extend_from_slice(WEIGHTS.as_slice());
+    for o in &off {
+        input.extend_from_slice(&(*o as u32).to_be_bytes());
+    }
+    input.extend_from_slice(&cfg.rms_eps.to_be_bytes());
+    for v in x0.iter().chain(&cos).chain(&sin).chain(&pk).chain(&pv) {
+        input.extend_from_slice(&v.to_be_bytes());
+    }
+    assert_eq!(
+        input.len(),
+        LAYER_HEADER + (dim + half * 2 + past * kvw * 2) * 8
+    );
+
+    let tagged_blob = tagged(blob);
+    let mut code_of =
+        |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((tagged_blob.clone(), false)) };
+    let got: Vec<i64> = match layer_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
+        Outcome::Return(bytes, _) => bytes
+            .chunks_exact(8)
+            .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
+            .collect(),
+        _ => panic!("the whole-layer precompile refused a well-formed call"),
+    };
+
+    assert_eq!(&got[..dim], &want_x[..], "residual stream");
+    assert_eq!(&got[dim..dim + kvw], &want_k[..], "cache key");
+    assert_eq!(&got[dim + kvw..], &want_v[..], "cache value");
+}

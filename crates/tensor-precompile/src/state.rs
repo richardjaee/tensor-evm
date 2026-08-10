@@ -312,6 +312,11 @@ fn eth_plus_matmuls(spec: revm::primitives::hardfork::SpecId) -> &'static Precom
                 unreachable_stub,
             ),
             Precompile::new(
+                PrecompileId::Custom("tensor-layer".into()),
+                LAYER_ADDRESS,
+                unreachable_stub,
+            ),
+            Precompile::new(
                 PrecompileId::Custom("tensor-matmul-state".into()),
                 MATMUL_STATE_ADDRESS,
                 unreachable_stub,
@@ -352,6 +357,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         }
         if inputs.bytecode_address == ATTN_PROJ_ADDRESS {
             return run_host(context, inputs, attn_proj_state_with);
+        }
+        if inputs.bytecode_address == LAYER_ADDRESS {
+            return run_host(context, inputs, layer_state_with);
         }
         if inputs.bytecode_address != MATMUL_STATE_ADDRESS {
             return PrecompileProvider::<CTX>::run(&mut self.inner, context, inputs);
@@ -394,6 +402,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
             || *address == crate::router::ROUTER_ADDRESS
             || *address == FFN_ADDRESS
             || *address == ATTN_PROJ_ADDRESS
+            || *address == LAYER_ADDRESS
             || PrecompileProvider::<CTX>::contains(&self.inner, address)
     }
 }
@@ -1039,6 +1048,211 @@ pub fn attn_proj_state_with(
     let mut packed = Vec::with_capacity(dim_u * 8);
     for value in out {
         packed.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(Outcome::Return(packed, total))
+}
+
+/// Address of the whole-layer form.
+pub const LAYER_ADDRESS: Address = revm::precompile::u64_to_address(0x10a);
+
+/// ```text
+/// [0..24)   dim, hidden, nHeads, nKv, headDim, positions — six u32
+/// [24..44)  weights address
+/// [44..88)  eleven u32 offsets: q k v o gate up down, then the four norms
+/// [88..96)  rmsEps i64
+/// [96 ..)   x (dim), cos (headDim/2), sin (headDim/2), k cache, v cache
+/// ```
+///
+/// The caches hold `positions - 1` entries; this call appends the one it computes.
+pub const LAYER_HEADER: usize = 96;
+
+/// A whole transformer block, in one call.
+///
+/// The two fused calls it replaces were 79% of a layer between them, and each was dominated
+/// by moving a residual stream in and a residual stream out. Everything between them — the
+/// query, the keys, the values, the attention result, the gate, the activation — existed
+/// only to be handed back to Solidity and handed straight into the next precompile.
+///
+/// This is `tensor_model::qwen3::forward_layer` called directly, not a reimplementation of
+/// it. That matters more than the gas: the reference is what every accuracy claim in this
+/// project is measured against, and a fused layer that computed something subtly different
+/// would invalidate all of them at once. Here it cannot differ, because it is the same code.
+pub fn layer_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    use tensor_model::qwen3::{Config, KvCache, LayerWeights, QTensor, Rope, Scratch};
+
+    if input.len() < LAYER_HEADER {
+        return Ok(Outcome::Revert);
+    }
+    let u32_at = |i: usize| u32::from_be_bytes(input[i..i + 4].try_into().expect("four")) as usize;
+    let (dim, hidden, heads, n_kv, hs, positions) = (
+        u32_at(0),
+        u32_at(4),
+        u32_at(8),
+        u32_at(12),
+        u32_at(16),
+        u32_at(20),
+    );
+    let at = Address::from_slice(&input[24..44]);
+    let off: Vec<usize> = (0..11).map(|i| u32_at(44 + i * 4)).collect();
+    let eps = i64::from_be_bytes(input[88..96].try_into().expect("eight"));
+
+    if dim == 0 || hidden == 0 || heads == 0 || n_kv == 0 || hs == 0 || positions == 0 {
+        return Ok(Outcome::Revert);
+    }
+    if dim > MAX_DIM as usize || hidden > MAX_DIM as usize || positions > MAX_DIM as usize {
+        return Ok(Outcome::Revert);
+    }
+    if !heads.is_multiple_of(n_kv) {
+        return Ok(Outcome::Revert);
+    }
+
+    let cfg = Config {
+        dim,
+        hidden,
+        n_heads: heads,
+        n_kv,
+        head_dim: hs,
+        seq_len: positions,
+        rms_eps: eps,
+    };
+    let (qw, kvw, half) = (cfg.q_width(), cfg.kv_width(), hs / 2);
+    let past = positions - 1;
+    let want = LAYER_HEADER + (dim + half * 2 + past * kvw * 2) * 8;
+    if input.len() != want {
+        return Ok(Outcome::Revert);
+    }
+
+    // Priced as the calls it replaces would have been, so fusing changes what a layer costs
+    // to run and not what it costs to buy.
+    let Some(compute) = gas_cost(qw as u64, dim as u64)
+        .and_then(|a| a.checked_add(gas_cost(kvw as u64, dim as u64)? * 2))
+        .and_then(|a| a.checked_add(gas_cost(dim as u64, qw as u64)?))
+        .and_then(|a| a.checked_add(gas_cost(hidden as u64, dim as u64)? * 2))
+        .and_then(|a| a.checked_add(gas_cost(dim as u64, hidden as u64)?))
+        .and_then(|a| {
+            a.checked_add(crate::attention::attention_gas(
+                heads as u64,
+                hs as u64,
+                positions as u64,
+            )?)
+        })
+        .and_then(|a| a.checked_add(crate::activation::gas_cost(hidden as u64)?))
+    else {
+        return Ok(Outcome::Revert);
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let read = |from: usize, n: usize| -> Vec<i64> {
+        input[from..from + n * 8]
+            .chunks_exact(8)
+            .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+            .collect()
+    };
+    let mut x = read(LAYER_HEADER, dim);
+    let cos = read(LAYER_HEADER + dim * 8, half);
+    let sin = read(LAYER_HEADER + (dim + half) * 8, half);
+    let past_k = read(LAYER_HEADER + (dim + half * 2) * 8, past * kvw);
+    let past_v = read(LAYER_HEADER + (dim + half * 2 + past * kvw) * 8, past * kvw);
+
+    // Every tensor out of one blob, through the same resolver everything else uses.
+    let shapes = [
+        (qw, dim),
+        (kvw, dim),
+        (kvw, dim),
+        (dim, qw),
+        (hidden, dim),
+        (hidden, dim),
+        (dim, hidden),
+    ];
+    let mut access = 0u64;
+    let mut owned = Vec::with_capacity(7);
+    for (i, (rows, cols)) in shapes.iter().enumerate() {
+        let span = rows + rows * cols * 2;
+        let Some((bytes, charged)) = resolve_with(code_of, at, off[i], span)? else {
+            return Ok(Outcome::Revert);
+        };
+        access = access.saturating_add(charged);
+        let scales: Vec<i8> = bytes[..*rows].iter().map(|&b| b as i8).collect();
+        let w: Vec<i16> = bytes[*rows..]
+            .chunks_exact(2)
+            .map(|c| i16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        owned.push((scales, w));
+    }
+    let mut norms = Vec::with_capacity(4);
+    for (j, n) in [dim, hs, hs, dim].into_iter().enumerate() {
+        let Some((bytes, charged)) = resolve_with(code_of, at, off[7 + j], n * 8)? else {
+            return Ok(Outcome::Revert);
+        };
+        access = access.saturating_add(charged);
+        norms.push(
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
+                .collect::<Vec<i64>>(),
+        );
+    }
+
+    let t = |i: usize, rows: usize, cols: usize| QTensor {
+        w: &owned[i].1,
+        scales: &owned[i].0,
+        rows,
+        cols,
+    };
+    let w = LayerWeights {
+        input_norm: &norms[0],
+        q: t(0, qw, dim),
+        k: t(1, kvw, dim),
+        v: t(2, kvw, dim),
+        q_norm: &norms[1],
+        k_norm: &norms[2],
+        o: t(3, dim, qw),
+        post_norm: &norms[3],
+        gate: t(4, hidden, dim),
+        up: t(5, hidden, dim),
+        down: t(6, dim, hidden),
+        mixture: None,
+    };
+
+    let mut kv = KvCache::new(&cfg, 1);
+    kv.k[..past * kvw].copy_from_slice(&past_k);
+    kv.v[..past * kvw].copy_from_slice(&past_v);
+    // `forward_layer` indexes the rotary table by position, and a caller only holds the row
+    // for the position it is running. Placing that row where the reference will look for it
+    // keeps the call small without teaching the reference a second convention.
+    let mut cos_tab = vec![0i64; positions * half];
+    let mut sin_tab = vec![0i64; positions * half];
+    cos_tab[past * half..].copy_from_slice(&cos);
+    sin_tab[past * half..].copy_from_slice(&sin);
+    let rope = Rope {
+        cos: cos_tab,
+        sin: sin_tab,
+        head_dim: hs,
+    };
+    let mut scratch = Scratch::new(&cfg);
+    tensor_model::qwen3::forward_layer(&cfg, &w, &rope, &mut kv, &mut scratch, 0, past, &mut x);
+
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    // The residual stream, then the cache entry this position added.
+    let mut packed = Vec::with_capacity((dim + kvw * 2) * 8);
+    for v in x
+        .iter()
+        .chain(&kv.k[past * kvw..(past + 1) * kvw])
+        .chain(&kv.v[past * kvw..(past + 1) * kvw])
+    {
+        packed.extend_from_slice(&v.to_be_bytes());
     }
     Ok(Outcome::Return(packed, total))
 }

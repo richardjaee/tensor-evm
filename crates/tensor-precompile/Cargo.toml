@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 tensor-kernel = { path = "../tensor-kernel" }
+# The whole-layer precompile is the reference implementation, called directly rather than
+# reimplemented — which is the only way a fused layer cannot disagree with the model it is
+# supposed to be.
+tensor-model = { path = "../tensor-model" }
 revm = "42"
 
 [dev-dependencies]
