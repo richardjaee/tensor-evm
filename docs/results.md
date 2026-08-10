@@ -1332,3 +1332,60 @@ a second client accepting or rejecting blocks it did not produce.
 
 What is established meanwhile is that the peering works and both nodes carry the
 precompiles, which is everything up to the point where a consensus layer takes over.
+
+## A model generating tokens on reth
+
+```sh
+cargo run --release -p tensor-reth                       # a reth node, chain 4242
+RPC=http://127.0.0.1:8545 GAS=16000000 MAX_LAYERS=1 \
+  cargo run --release -p tensor-cli -- testdata/tiny     # a model, generating on it
+```
+
+```
+uploading weights as contract code
+  layer 0 … 3    25,664 bytes each          lm_head  8,320 bytes
+  total         110,976 bytes on chain
+
+generating
+  position 0: token   124   6 transactions   1,501,214 gas
+  position 1: token   124   6 transactions
+  position 2: token    42   6 transactions
+
+expected    [124, 124, 42]
+chain       [124, 124, 42]
+```
+
+Thirty transactions, thirty blocks, sealed by reth's own consensus engine from reth's own
+pool. Every part of a chain is reth's; the only substitution is the executor.
+
+### Five things a real client wanted that a development node did not
+
+None was about the arithmetic, and every one was a place the harness had been quietly
+answering an easier question.
+
+**Receipts do not exist yet.** The development node seals a block inside the send, so a
+receipt was always there when it returned. A real client mines asynchronously, and reading
+the receipt immediately returns `null` — which the client read as a revert, because a
+missing status and a failed one are both "not `0x1`". It now waits, and treats absence as
+"not yet" rather than as failure.
+
+**The pool enforces the gas cap itself.** Raising `tx_gas_limit_cap` in the EVM is not
+enough: reth's transaction pool checks EIP-7825's 2^24 limit before execution, so a
+transaction asking for more is rejected before any EVM sees it. Against a stock pool, the
+granularity knob is what keeps a token inside the cap — which is what it was built for.
+
+**A pool will not take a transaction that offers nothing.** Fees were zero, which the
+development node ignored and charged nothing for either way.
+
+**`eth_call` comes from nobody.** Without an explicit `from`, a call arrives from the zero
+address, and a session that checks its owner refuses it. The development node never noticed,
+because nothing it served was owned.
+
+**Return data has to come from somewhere.** A receipt does not carry it. `tensor-node` keeps
+it and serves `tensor_getOutput`; a stock client does not. The value is now read with
+`eth_call` against the state the transaction is about to be applied to, and then the
+transaction is sent — the same state, so the same value.
+
+The pattern is worth more than the list: every one of these was a difference between a
+harness that was convenient and a client that is real, and none would have been found by
+testing against the harness.

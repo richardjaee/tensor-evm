@@ -647,3 +647,114 @@ pub fn matmul_state_with(
     }
     Ok(Outcome::Return(packed, total))
 }
+
+/// The classifier, against any host that can produce an account's code.
+pub fn classify_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    if input.len() < 32 {
+        return Ok(Outcome::Revert);
+    }
+    let rows = u32::from_be_bytes(input[0..4].try_into().expect("four")) as u64;
+    let cols = u32::from_be_bytes(input[4..8].try_into().expect("four")) as u64;
+    let at = Address::from_slice(&input[8..28]);
+    let offset = u32::from_be_bytes(input[28..32].try_into().expect("four")) as usize;
+
+    if rows == 0 || cols == 0 || cols > MAX_DIM || rows > (1 << 24) {
+        return Ok(Outcome::Revert);
+    }
+    let Some(compute) = crate::classify::gas_cost(rows, cols) else {
+        return Ok(Outcome::Revert);
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let cols_u = cols as usize;
+    if input.len() != 32 + cols_u * 8 {
+        return Ok(Outcome::Revert);
+    }
+    let x: Vec<i64> = input[32..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let Some(span) = (rows as usize)
+        .checked_mul(cols_u)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(rows as usize))
+    else {
+        return Ok(Outcome::Revert);
+    };
+    let Some((bytes, access)) = resolve_with(code_of, at, offset, span)? else {
+        return Ok(Outcome::Revert);
+    };
+    let Some((row, logit)) = crate::classify::classify(&bytes, 0, rows as usize, cols_u, &x) else {
+        return Ok(Outcome::Revert);
+    };
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+    Ok(Outcome::Return(
+        crate::classify::pack(row, logit).to_vec(),
+        total,
+    ))
+}
+
+/// The router, against any host that can produce an account's code.
+pub fn router_state_with(
+    code_of: CodeSource<'_>,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<Outcome, String> {
+    let Some((experts, cols, at, offset, k)) = crate::router::parse(input) else {
+        return Ok(Outcome::Revert);
+    };
+    let Some(compute) = crate::router::gas_cost(experts, cols) else {
+        return Ok(Outcome::Revert);
+    };
+    if compute + WARM_ACCOUNT_GAS > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+
+    let (cols_u, experts_u) = (cols as usize, experts as usize);
+    let x: Vec<i64> = input[crate::router::HEADER..]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .collect();
+
+    let Some(span) = experts_u
+        .checked_mul(cols_u)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(experts_u))
+    else {
+        return Ok(Outcome::Revert);
+    };
+    let Some((bytes, access)) = resolve_with(code_of, at, offset, span)? else {
+        return Ok(Outcome::Revert);
+    };
+
+    let scales: Vec<i8> = bytes[..experts_u].iter().map(|&b| b as i8).collect();
+    let weights: Vec<i16> = bytes[experts_u..]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    let mut scores = vec![0i64; experts_u];
+    matmul(&weights, &scales, &x, experts_u, cols_u, &mut scores);
+
+    let Some(total) = compute.checked_add(access) else {
+        return Ok(Outcome::Revert);
+    };
+    if total > gas_limit {
+        return Ok(Outcome::OutOfGas);
+    }
+    Ok(Outcome::Return(
+        crate::router::encode_output(&crate::router::route(&scores, k)),
+        total,
+    ))
+}

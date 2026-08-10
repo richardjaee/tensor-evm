@@ -99,8 +99,11 @@ impl Client {
             chain_id: self.chain_id,
             nonce: self.nonce,
             gas_limit: self.gas,
-            max_fee_per_gas: 0,
-            max_priority_fee_per_gas: 0,
+            // A real client's pool refuses a transaction that offers nothing, so these are
+            // not zero. The development node ignores them and charges no fee either way;
+            // what matters is that the same client works against both.
+            max_fee_per_gas: 2_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
             to: to.map(TxKind::Call).unwrap_or(TxKind::Create),
             value: U256::ZERO,
             input: Bytes::from(data),
@@ -120,7 +123,23 @@ impl Client {
         self.nonce += 1;
         self.sent += 1;
 
-        let receipt = self.rpc("eth_getTransactionReceipt", json!([hash]))?;
+        // The development node seals a block per transaction inside the send, so a receipt
+        // was always there by the time it returned. A real client mines asynchronously, and
+        // reading the receipt immediately gets `null` — which looked exactly like a
+        // reverted transaction, because a missing status and a failed one are both "not
+        // 0x1". So this waits, and treats absence as "not yet" rather than as failure.
+        let mut receipt = Value::Null;
+        for _ in 0..600 {
+            let r = self.rpc("eth_getTransactionReceipt", json!([hash]))?;
+            if r.get("status").is_some() {
+                receipt = r;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if receipt.is_null() {
+            return Err(format!("{what}: not mined within a minute ({hash})"));
+        }
         let status = receipt
             .get("status")
             .and_then(Value::as_str)
@@ -140,11 +159,33 @@ impl Client {
             "eth_call",
             json!([{
                 "to": format!("{to:#x}"),
+                // Without this a call comes from the zero address, and a session that
+                // checks its owner refuses it. The development node never noticed because
+                // nothing it served was owned.
+                "from": format!("{:#x}", self.address()),
                 "data": format!("0x{}", hex(&data)),
                 "gas": format!("{:#x}", self.gas)
             }, "latest"]),
         )?;
         unhex(&out).ok_or_else(|| "eth_call returned malformed hex".to_string())
+    }
+
+    /// Sends a transaction and reports what it returned.
+    ///
+    /// A receipt does not carry return data. `tensor-node` keeps it and serves it under
+    /// `tensor_getOutput`, but a stock Ethereum client does not, and this has to work
+    /// against reth. So the value is read with `eth_call` against the state the transaction
+    /// is about to be applied to, and then the transaction is sent. The call and the send
+    /// see the same state, so the value is the one the transaction produces.
+    pub fn send_reading(
+        &mut self,
+        to: Address,
+        data: Vec<u8>,
+        what: &str,
+    ) -> Result<Vec<u8>, String> {
+        let returned = self.call(to, data.clone())?;
+        self.send(Some(to), data, what)?;
+        Ok(returned)
     }
 
     /// The return data of a transaction, which an Ethereum receipt does not carry. The node

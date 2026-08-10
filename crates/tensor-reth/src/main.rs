@@ -14,19 +14,9 @@
 //! carries revm 41 and these precompiles are written against 42; main moved to 42.0.1,
 //! which is what this project builds against.
 
+use alloy_evm::eth::EthEvmContext;
 use alloy_evm::{EvmEnv, EvmFactory};
 use reth_ethereum::chainspec::ChainSpec;
-use reth_ethereum::evm::EthEvmConfig;
-use reth_ethereum::node::api::{FullNodeTypes, NodeTypes};
-use reth_ethereum::node::builder::{BuilderContext, NodeBuilder, NodeHandle};
-use reth_ethereum::node::core::args::{NetworkArgs, RpcServerArgs};
-use reth_ethereum::node::core::node_config::NodeConfig;
-use reth_ethereum::node::{EthereumAddOns, EthereumNode};
-use reth_ethereum::tasks::Runtime;
-use reth_tracing::Tracer;
-use std::sync::Arc;
-use reth_ethereum::node::builder::components::ExecutorBuilder;
-use reth_ethereum::EthPrimitives;
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::context::result::{EVMError, HaltReason};
 use reth_ethereum::evm::revm::context::{BlockEnv, Context, TxEnv};
@@ -35,8 +25,18 @@ use reth_ethereum::evm::revm::inspector::{Inspector, NoOpInspector};
 use reth_ethereum::evm::revm::interpreter::interpreter::EthInterpreter;
 use reth_ethereum::evm::revm::primitives::hardfork::SpecId;
 use reth_ethereum::evm::revm::{MainBuilder, MainContext};
-use alloy_evm::eth::EthEvmContext;
 use reth_ethereum::evm::EthEvm;
+use reth_ethereum::evm::EthEvmConfig;
+use reth_ethereum::node::api::{FullNodeTypes, NodeTypes};
+use reth_ethereum::node::builder::components::ExecutorBuilder;
+use reth_ethereum::node::builder::{BuilderContext, NodeBuilder, NodeHandle};
+use reth_ethereum::node::core::args::{NetworkArgs, RpcServerArgs};
+use reth_ethereum::node::core::node_config::NodeConfig;
+use reth_ethereum::node::{EthereumAddOns, EthereumNode};
+use reth_ethereum::tasks::Runtime;
+use reth_ethereum::EthPrimitives;
+use reth_tracing::Tracer;
+use std::sync::Arc;
 mod precompiles;
 
 use alloy_evm::precompiles::PrecompilesMap;
@@ -75,9 +75,9 @@ impl EvmFactory for TensorEvmFactory {
             .with_cfg(cfg)
             .with_block(input.block_env)
             .build_mainnet_with_inspector(NoOpInspector {})
-            .with_precompiles(precompiles::tensor_precompiles(PrecompilesMap::from_static(
-                EthPrecompiles::new(spec).precompiles,
-            )));
+            .with_precompiles(precompiles::tensor_precompiles(
+                PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles),
+            ));
         EthEvm::new(evm, false)
     }
 
@@ -88,7 +88,9 @@ impl EvmFactory for TensorEvmFactory {
         inspector: I,
     ) -> Self::Evm<DB, I> {
         EthEvm::new(
-            self.create_evm(db, input).into_inner().with_inspector(inspector),
+            self.create_evm(db, input)
+                .into_inner()
+                .with_inspector(inspector),
             true,
         )
     }
@@ -244,9 +246,15 @@ async fn main() -> eyre::Result<()> {
         it.next()?;
         it.next()
     };
-    let rpc_port: u16 = arg("--rpc-port").and_then(|v| v.parse().ok()).unwrap_or(8545);
-    let p2p_port: u16 = arg("--p2p-port").and_then(|v| v.parse().ok()).unwrap_or(30303);
-    let auth_port: u16 = arg("--auth-port").and_then(|v| v.parse().ok()).unwrap_or(8551);
+    let rpc_port: u16 = arg("--rpc-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8545);
+    let p2p_port: u16 = arg("--p2p-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30303);
+    let auth_port: u16 = arg("--auth-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8551);
     // A node that only follows does not mine. One node seals and the other must agree with
     // it, which is the whole point of running two.
     let mines = !std::env::args().any(|a| a == "--follow");

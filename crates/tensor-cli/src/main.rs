@@ -31,6 +31,19 @@ const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f
 /// Gas offered per transaction. Above Ethereum's cap by design — a token exceeds
 /// EIP-7825's 2^24 — and high enough to carry an 8MB upload batch at 226 gas a byte.
 pub const GAS: u64 = 3_500_000_000;
+
+/// Gas offered per transaction, overridable.
+///
+/// Raising the EVM's cap is not enough on a real client: reth's transaction pool enforces
+/// EIP-7825's 2^24 limit itself, before execution, so a transaction asking for more is
+/// rejected before any EVM sees it. A chain that meant to serve models would raise both;
+/// against a stock pool, the granularity knob is what keeps a token inside the cap.
+pub fn gas() -> u64 {
+    std::env::var("GAS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GAS)
+}
 /// Qwen3's epsilon in Q32, which is what the fixture was generated against.
 const RMS_EPS: i64 = 4_295;
 
@@ -200,7 +213,7 @@ fn run() -> Result<(), String> {
     // is in it: a model has a classifier, a layer does not.
     let one_layer = dir.join("experts.bin").exists() && !dir.join("lm_head.bin").exists();
 
-    let mut c = Client::new(&url, KEY, GAS)?;
+    let mut c = Client::new(&url, KEY, gas())?;
     say("chain");
     println!("  rpc         {url}");
     println!("  sender      {:#x}", c.address());
@@ -431,8 +444,7 @@ uint32,uint32,uint32)";
             d.extend_from_slice(&word(3 * 32));
             d.extend_from_slice(&word(max_layers as u64));
             d.extend_from_slice(&model);
-            let r = c.send(Some(generator), d, &format!("step from layer {done}"))?;
-            let out = c.output_of(&r)?;
+            let out = c.send_reading(generator, d, &format!("step from layer {done}"))?;
             let next = rpc::word_at(&out, 0).ok_or("step returned no layer")? as usize;
             if next <= done {
                 return Err(format!("step did not advance past layer {done}"));
@@ -450,8 +462,7 @@ uint32,uint32,uint32)";
         d.extend_from_slice(&word(0));
         d.extend_from_slice(&word(vocab as u64));
         d.extend_from_slice(&dyn_bytes(&packed(&final_norm)));
-        let r = c.send(Some(generator), d, "emitToken")?;
-        let out = c.output_of(&r)?;
+        let out = c.send_reading(generator, d, "emitToken")?;
         let token = rpc::word_at(&out, 0).ok_or("emitToken returned no token")? as u32;
         tokens.push(token);
 

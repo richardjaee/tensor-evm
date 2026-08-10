@@ -18,14 +18,27 @@ use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use alloy_primitives::Address;
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 use revm::primitives::Bytes;
-use tensor_precompile::state::{matmul_state_with, Outcome, MATMUL_STATE_ADDRESS};
+use tensor_precompile::state::{
+    classify_state_with, matmul_state_with, router_state_with, Outcome, MATMUL_STATE_ADDRESS,
+};
 
 /// Ethereum's precompiles, plus the tensor set.
 pub fn tensor_precompiles(base: PrecompilesMap) -> PrecompilesMap {
     let mut map = base;
     map.extend_precompiles([
-        (MATMUL_STATE_ADDRESS, matmul_state()),
-        (tensor_precompile::MATMUL_ADDRESS, stateless(tensor_precompile::matmul_precompile)),
+        (MATMUL_STATE_ADDRESS, state_reading(matmul_state_with)),
+        (
+            tensor_precompile::classify::CLASSIFY_ADDRESS,
+            state_reading(classify_state_with),
+        ),
+        (
+            tensor_precompile::router::ROUTER_ADDRESS,
+            state_reading(router_state_with),
+        ),
+        (
+            tensor_precompile::MATMUL_ADDRESS,
+            stateless(tensor_precompile::matmul_precompile),
+        ),
         (
             tensor_precompile::activation::SWIGLU_ADDRESS,
             stateless(tensor_precompile::activation::swiglu_precompile),
@@ -51,9 +64,14 @@ fn stateless(f: fn(&[u8], u64, u64) -> PrecompileResult) -> DynPrecompile {
     DynPrecompile::from(move |input: PrecompileInput<'_>| f(input.data, input.gas, 0))
 }
 
-/// The state-reading matmul: weights by reference, resolved through the host.
-fn matmul_state() -> DynPrecompile {
-    DynPrecompile::from(|mut input: PrecompileInput<'_>| -> PrecompileResult {
+/// A precompile whose operands live in chain state, wrapped for alloy-evm.
+///
+/// The three of them — matmul, classifier, router — differ only in which function they
+/// call, so they share the adapter. Each is the same function the development node runs.
+fn state_reading(
+    run: fn(tensor_precompile::state::CodeSource<'_>, &[u8], u64) -> Result<Outcome, String>,
+) -> DynPrecompile {
+    DynPrecompile::from(move |mut input: PrecompileInput<'_>| -> PrecompileResult {
         let data = input.data.to_vec();
         let gas_limit = input.gas;
 
@@ -61,11 +79,10 @@ fn matmul_state() -> DynPrecompile {
         // forward pass hits the same weights on every call of every layer — so it is taken
         // from the host rather than assumed.
         let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
-            // `load_account` alone is not enough: code is loaded lazily, so an account
-            // read that way carries a code hash and an empty `code`. Weights would come
-            // back as nothing and every matmul would revert — which is exactly what
-            // happened, and which an in-memory database hides, because it keeps code inline
-            // in the account and so answers the wrong question correctly.
+            // `load_account` alone is not enough: code is loaded lazily, so an account read
+            // that way carries a code hash and an empty `code`. Weights would come back as
+            // nothing and every call would revert — which an in-memory database hides,
+            // because it keeps code inline in the account.
             let mut loaded = input
                 .internals
                 .load_account_code(a)
@@ -80,15 +97,17 @@ fn matmul_state() -> DynPrecompile {
             Ok((code, is_cold))
         };
 
-        match matmul_state_with(&mut code_of, &data, gas_limit) {
+        match run(&mut code_of, &data, gas_limit) {
             Ok(Outcome::Return(bytes, used)) => {
                 Ok(PrecompileOutput::new(used, Bytes::from(bytes), 0))
             }
             // A revert here is a caller error — a shape the blob cannot hold, or a
             // directory that does not span the range asked for.
-            Ok(Outcome::Revert) | Err(_) => {
-                Ok(PrecompileOutput::revert(tensor_precompile::BASE_GAS, Bytes::new(), 0))
-            }
+            Ok(Outcome::Revert) | Err(_) => Ok(PrecompileOutput::revert(
+                tensor_precompile::BASE_GAS,
+                Bytes::new(),
+                0,
+            )),
             Ok(Outcome::OutOfGas) => Ok(PrecompileOutput::halt(
                 revm::precompile::PrecompileHalt::OutOfGas,
                 0,
