@@ -212,11 +212,14 @@ fn a_chunk_deploys_at_its_stated_size() {
 }
 
 /// Past the cap it must revert rather than store a truncated chunk.
+///
+/// The cap is the chain's code limit rather than Ethereum's — a chunk is an account, and
+/// fewer, larger accounts is most of what reading a layer costs.
 #[test]
 fn an_oversized_chunk_is_refused() {
     let mut h = Harness::new();
     let mut d = keccak256(b"store(bytes)")[..4].to_vec();
-    let n = 24_001usize;
+    let n = 1_000_001usize;
     d.extend_from_slice(&word(32));
     d.extend_from_slice(&word(n as u64));
     let mut body = vec![0xa5u8; n];

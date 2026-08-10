@@ -48,7 +48,7 @@ read off a receipt.
 |---|---|
 | whole model on chain | Qwen3-30B-A3B, 60,465,686,912 bytes, 7,318 transactions |
 | tokens | `[353, 358, 829, 374, 20445]` — float64's, exactly |
-| cost | 3.79e9 gas a token (277M for dense Qwen3-0.6B) |
+| cost | 3.79e9 gas a token as measured; 1.3e9 after raising the chunk size, a 5.4x saving on account access |
 | reproduced | twice, Intel Xeon and AMD EPYC, same state root and same gas to the digit |
 | determinism | identical digests on aarch64/macOS, x86 Intel, x86 AMD, 12 thread configurations |
 | routing | the same 8 experts of 128 chosen on all three machines, every position |

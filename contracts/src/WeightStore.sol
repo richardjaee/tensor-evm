@@ -28,7 +28,15 @@ library WeightStore {
     /// @dev A chain running this raises the limit, but chunking is required regardless —
     ///      not by the code size cap but by what a transaction can carry — so the stock
     ///      value is what the uploader targets.
-    uint256 internal constant MAX_CHUNK = 24_000;
+    /// @dev Bounded by the chain's contract code limit, not Ethereum's.
+    ///
+    ///      This was 24,000, which is EIP-170's 24,576 with room for the tag — a limit this
+    ///      chain does not have, since it raises the code size to 64MB to hold a layer at
+    ///      all. Inheriting it cost more than it looks: every chunk is an account, a cold
+    ///      touch is 2,600 gas, and a 31.5MB layer at 24,000 bytes is 1,337 accounts, so
+    ///      reading a layer spent about 3.5M gas on account access against 15,360 gas of
+    ///      arithmetic. Larger chunks trade nothing for that.
+    uint256 internal constant MAX_CHUNK = 1_000_000;
 
     /// @dev Bytes per directory entry: a 20-byte address then a 4-byte cumulative offset.
     uint256 internal constant ENTRY = 24;

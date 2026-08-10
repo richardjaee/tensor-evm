@@ -1389,3 +1389,37 @@ transaction is sent — the same state, so the same value.
 The pattern is worth more than the list: every one of these was a difference between a
 harness that was convenient and a client that is real, and none would have been found by
 testing against the harness.
+
+## Where a token's gas actually went: 5.4x from one constant
+
+A Qwen3-0.6B layer costs 15.73M multiply-accumulates, which at 1,024 MACs a gas is **15,360
+gas of arithmetic**. It was measured at 8.6M. Fifty-seven times the arithmetic was going
+somewhere else, and it had never been attributed.
+
+It was account access. Every chunk of weights is an account, a cold touch is 2,600 gas, and
+a 31.5MB layer stored in 24,000-byte chunks is 1,337 accounts — about 3.5M gas of touching
+accounts to do 15,360 gas of arithmetic.
+
+The chunk size was 24,000 because that is EIP-170's 24,576 with room for a tag byte. **This
+chain does not have EIP-170's limit.** It raises the contract code size to 64MB, because a
+layer of a real model cannot fit in 24KB — and then inherited the constant that limit
+implies anyway.
+
+Raised to 1,000,000 bytes, measured on the real Qwen3-30B-A3B layer, same weights and the
+same answer to the digit:
+
+| | 24,000-byte chunks | 1,000,000-byte chunks |
+|---|---|---|
+| chunks in the layer | 52,936 | 1,248 |
+| upload transactions | 1,207 | 159 |
+| **gas a position** | **145,382,234** | **27,050,044** |
+| relative error | 2.78e-6 | 2.78e-6 |
+
+**5.4x.** Extrapolated across 48 layers, a token goes from about 6.98 billion gas to 1.30
+billion.
+
+Two things about this are worth keeping. The optimisation was invisible for as long as
+nobody asked where the gas went — every measurement in this file above it is correct and
+none of them prompted the question. And the cause was a constant that was right for a
+different chain: the code inherited Ethereum's limit while explicitly raising Ethereum's
+limit, twelve lines apart.
