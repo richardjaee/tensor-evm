@@ -1621,3 +1621,32 @@ It is also where the caution bites hardest. Each fusion so far has been checked 
 against the calls it replaced, and that gets harder as the fused thing gets larger: a
 whole-layer precompile would be checked against `forward_layer`, which is the reference the
 whole project is measured against. Worth doing, and not worth doing quickly.
+
+## Everything together, on the real 30B layer
+
+The same Qwen3-30B-A3B layer, same weights, same answer to the digit, with the chunk size
+raised and both fusions in place:
+
+| | before | after |
+|---|---|---|
+| first position | 145,382,234 | 26,802,436 |
+| steady state | ~137,000,000 | **18,133,826** |
+| relative error | 2.78e-6 | 2.78e-6 |
+
+**7.6x** on the cost of a layer once the weight accounts are warm. Across 48 layers that puts
+a token near **0.87 billion gas** rather than 3.79 billion.
+
+The first position costs more than the rest and always will: it is the one that touches every
+weight account cold, at 2,600 gas each against 100 warm. That gap is now visible precisely
+because the rest got cheaper — at 137M a position it was noise.
+
+Three changes did it, and none touched the arithmetic:
+
+- **The chunk size**, which was Ethereum's code limit on a chain that does not have it. Fewer,
+  larger accounts.
+- **The feed-forward fused**, so `hidden`-wide intermediates never leave the VM.
+- **Attention fused with its projection**, once the scratch buffer could carry a wider header.
+
+Every one was found by asking where the gas went rather than by guessing, and the answer was
+never the multiply-accumulates. They were 15,360 gas of a layer at the start and they are
+15,360 gas of it now.
