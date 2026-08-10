@@ -459,17 +459,18 @@ uint256,(int256[],int256[],int256[]))",
 
         let msize = *vals.last().expect("msize slot");
         let vals = &vals[..vals.len() - 1];
+        // One name per `_mark` in `forwardLayer`, in order. Two of these cover fused
+        // precompiles that used to be several calls, and the names say so — a label left
+        // reading "rmsnorm" while its number was the whole feed-forward is how a profile
+        // starts lying.
         let names = [
             "rmsnorm (attn)",
             "k/v proj + QK-norm + rope + cache",
             "q proj",
             "QK-norm + rope (q)",
-            "attention",
-            "o proj",
+            "attention + o proj  (fused, 0x109)",
             "rmsnorm (ffn)",
-            "gate + up proj",
-            "swiglu",
-            "down proj",
+            "gate + up + swiglu + down  (fused, 0x108)",
         ];
         let total: u64 = vals.iter().sum();
         println!("\nwhere a layer's gas goes\n");

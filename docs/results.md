@@ -1588,3 +1588,36 @@ was never the problem, and measuring before adopting is what distinguished the t
 
 Both fusions together: a layer went 673,643 to 525,382, and the precompiles still charge
 18,712 gas of it.
+
+## The profile, once the labels were honest
+
+Fusing moved work without moving the `_mark` boundaries, so the profile kept printing
+"rmsnorm (ffn)" against a number that was the whole feed-forward. Corrected:
+
+```
+rmsnorm (attn)                                25,239    4.8%
+k/v proj + QK-norm + rope + cache             31,408    6.0%
+q proj                                        19,167    3.6%
+QK-norm + rope (q)                            25,314    4.8%
+attention + o proj  (fused, 0x109)           216,250   41.2%
+rmsnorm (ffn)                                  8,560    1.6%
+gate + up + swiglu + down  (fused, 0x108)    199,444   38.0%
+                                             -------
+                                             525,382
+```
+
+The two fused calls are 79% of the layer, and the precompiles inside them charge 18,712 gas
+in total. So what is left is not many small costs but two large ones, each dominated by
+moving a residual stream in and a residual stream out.
+
+That points at the end of this line rather than another step along it: **a layer is one
+precompile**. Input the residual stream, the cache, the rotary tables and the weight
+offsets; output the new residual stream and the cache extension. Every intermediate — the
+query, the keys, the values, the attention result, the gate, the activation — stays inside
+the VM, and Solidity carries 8KB in and 8KB out instead of the hundred kilobytes it moves
+now.
+
+It is also where the caution bites hardest. Each fusion so far has been checked bit-for-bit
+against the calls it replaced, and that gets harder as the fused thing gets larger: a
+whole-layer precompile would be checked against `forward_layer`, which is the reference the
+whole project is measured against. Worth doing, and not worth doing quickly.
