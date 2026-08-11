@@ -89,10 +89,23 @@ def main():
         bufsize=1,
     )
     lines = []
+    seen = 0
+    stop_id = tok.token_to_id("<|im_end|>")
     for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
         lines.append(line)
+        # Decode each token as it lands rather than at the end. Watching ids appear tells
+        # you transactions are going through; watching words appear tells you what the
+        # model is saying, and there is no reason to wait for the last one to find out.
+        hit = re.match(r"\s*position (\d+): token\s+(\d+)", line)
+        if hit:
+            pos, tid = int(hit.group(1)), int(hit.group(2))
+            if pos >= len(ids) - 1 and tid != stop_id:
+                sys.stdout.write(tok.decode([tid]))
+                sys.stdout.flush()
+                seen += 1
+        elif not hit and seen == 0:
+            sys.stdout.write(line)
+            sys.stdout.flush()
     if proc.wait() != 0:
         raise SystemExit("the chain did not finish the generation")
     out = type("Run", (), {"stdout": "".join(lines)})()
@@ -114,7 +127,7 @@ def main():
     if stop in tail:
         tail = tail[: tail.index(stop)]
     reply = tok.decode(tail)
-    print(f'\n\033[1mreply\033[0m  "{reply}"')
+    print(f'\n\n\033[1mreply\033[0m  "{reply}"')
     print(f'\033[1mwhole\033[0m  "{a.prompt}{reply}"')
 
 

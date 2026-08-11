@@ -200,6 +200,18 @@ impl Client {
         unhex(&out).ok_or_else(|| "tensor_getOutput returned malformed hex".to_string())
     }
 
+    /// The state root of block zero, which identifies the chain a model was uploaded to.
+    ///
+    /// Two chains started from different saved state have different genesis roots, and that
+    /// is what stops a note written against one being believed by the other.
+    pub fn genesis_root(&self) -> Result<String, String> {
+        let b = self.rpc("eth_getBlockByNumber", json!(["0x0", false]))?;
+        b.get("stateRoot")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "block zero has no stateRoot".to_string())
+    }
+
     /// Whether an account already carries code, which is how a model uploaded by an
     /// earlier run is recognised.
     pub fn has_code(&self, at: Address) -> Result<bool, String> {
