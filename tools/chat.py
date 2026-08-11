@@ -33,7 +33,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--generate", type=int, default=8)
-    ap.add_argument("--model", default="models/chat")
+    ap.add_argument("--raw", action="store_true", help="no chat template; pure autocomplete")
+    ap.add_argument("--model", default="models/chat128")
     ap.add_argument("--rpc", default=os.environ.get("RPC", "http://127.0.0.1:8545"))
     ap.add_argument("--chunk-bytes", default="999424")
     a = ap.parse_args()
@@ -43,7 +44,20 @@ def main():
     tok = Tokenizer.from_file(os.path.join(model, "tokenizer.json"))
     meta = json.load(open(os.path.join(model, "meta.json")))
 
-    ids = tok.encode(a.prompt, add_special_tokens=False).ids
+    # Qwen3 is instruction-tuned and expects its turn markers. Without them it behaves like
+    # a base model and autocompletes the question instead of answering it — which looked
+    # like a weak model and was mostly a missing wrapper. The empty <think> block is how
+    # Qwen3 is told to answer directly rather than reason first.
+    text = (
+        a.prompt
+        if a.raw
+        else (
+            "<|im_start|>user\n"
+            f"{a.prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+    )
+    ids = tok.encode(text, add_special_tokens=False).ids
     room = meta["positions"]
     if len(ids) + a.generate > room:
         raise SystemExit(
@@ -93,7 +107,13 @@ def main():
     # The continuation starts at the token predicted after the last prompt token. Earlier
     # entries are the model's prediction at each prompt position, which it was not asked for
     # and which are not part of the reply.
-    reply = tok.decode(produced[len(ids) - 1 :])
+    tail = produced[len(ids) - 1 :]
+    # <|im_end|> ends the assistant's turn; anything after it is the model starting a new
+    # one, which is not part of the answer.
+    stop = tok.token_to_id("<|im_end|>")
+    if stop in tail:
+        tail = tail[: tail.index(stop)]
+    reply = tok.decode(tail)
     print(f'\n\033[1mreply\033[0m  "{reply}"')
     print(f'\033[1mwhole\033[0m  "{a.prompt}{reply}"')
 

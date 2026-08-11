@@ -1838,3 +1838,41 @@ Streaming the output fixed the complaint entirely without touching the chain.
 
 That is worth recording next to the optimisations, which took a layer from 673,643 gas to
 51,183. Only one of the two was ever visible to somebody sitting in front of it.
+
+## The model was not the problem
+
+Asked to write code, the chain produced ` and return the head of the` — a continuation of the
+question rather than an answer. That looks like a weak model and mostly was not one.
+
+Qwen3 is instruction-tuned and expects its turn markers. Fed raw text it behaves like a base
+model and autocompletes. With the template — and an empty `<think>` block, which is how Qwen3
+is told to answer directly rather than reason first — the same weights, unchanged, produce:
+
+```
+"What is the capital of France?"
+  → "The capital of France is **Paris**."
+
+"Write a python function to reverse a linked list."
+  → Here's a Python function that reverses a linked list:
+    def reverse_linked_list(head):
+        prev = None
+        current = head
+        while current:
+            next_node = current.next
+            current.next = prev
+            prev = current
+            current = next_node
+        return prev
+```
+
+Correct code, from a 0.6B model, one token per three transactions.
+
+Two other things were needed. The export has to cover the whole conversation, because the
+rotary tables are precomputed — the template alone costs about twenty tokens, so
+`models/chat128` covers a hundred and twenty-eight positions rather than thirty-two. And
+generation stops at `<|im_end|>` rather than filling the budget, since anything past it is
+the model starting a turn nobody asked for.
+
+Worth recording because it is the second time in a row the visible problem was not where the
+engineering had been. The gas work took a layer from 673,643 to 51,183 and nobody watching
+would notice; a missing prompt wrapper made the whole thing look broken.
