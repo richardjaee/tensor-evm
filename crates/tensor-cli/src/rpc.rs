@@ -200,6 +200,15 @@ impl Client {
         unhex(&out).ok_or_else(|| "tensor_getOutput returned malformed hex".to_string())
     }
 
+    /// Whether an account already carries code, which is how a model uploaded by an
+    /// earlier run is recognised.
+    pub fn has_code(&self, at: Address) -> Result<bool, String> {
+        Ok(self
+            .call_str("eth_getCode", json!([format!("{at:#x}"), "latest"]))?
+            .len()
+            > 2)
+    }
+
     pub fn block_number(&self) -> Result<u64, String> {
         Ok(u64::from_str_radix(
             self.call_str("eth_blockNumber", json!([]))?

@@ -58,6 +58,26 @@ pub fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>, String> {
         .collect())
 }
 
+/// The addresses an earlier run recorded: the classifier, then one per layer.
+fn parse_placed(text: &str) -> Option<(Vec<Address>, Address)> {
+    let head: Address = text
+        .split("\"lm_head\":\"")
+        .nth(1)?
+        .split('"')
+        .next()?
+        .parse()
+        .ok()?;
+    let layers: Vec<Address> = text
+        .split("\"layers\":[")
+        .nth(1)?
+        .split(']')
+        .next()?
+        .split(',')
+        .filter_map(|t| t.trim().trim_matches('"').parse().ok())
+        .collect();
+    (!layers.is_empty()).then_some((layers, head))
+}
+
 pub fn read_f64(dir: &Path, name: &str) -> Result<Vec<f64>, String> {
     Ok(read(dir, name)?
         .chunks_exact(8)
@@ -284,83 +304,158 @@ fn run() -> Result<(), String> {
     let down_len = dim + dim * hidden * 2;
     let stride = gate_len * 2 + down_len;
 
-    say("uploading weights as contract code");
+    // Where a layer's tensors sit inside its blob is arithmetic — the shapes decide it —
+    // so it can be worked out without reading a gigabyte back off disk. That is what lets a
+    // second run skip the upload entirely.
+    let layout = |off: &mut [u64; 12]| {
+        let mut at = 0u64;
+        for (i, (_, rows, cols)) in attention.iter().enumerate() {
+            off[i] = at;
+            at += (rows + rows * cols * 2) as u64;
+        }
+        if n_experts == 0 {
+            for (i, (rows, cols)) in [(hidden, dim), (hidden, dim), (dim, hidden)]
+                .iter()
+                .enumerate()
+            {
+                off[4 + i] = at;
+                at += (rows + rows * cols * 2) as u64;
+            }
+        } else {
+            off[4] = at;
+            off[5] = at + gate_len as u64;
+            off[6] = at + (gate_len * 2) as u64;
+            at += (n_experts * stride) as u64;
+        }
+        for (j, n) in [dim, head_dim, head_dim, dim].into_iter().enumerate() {
+            off[7 + j] = at;
+            at += (n * 8) as u64;
+        }
+        if n_experts != 0 {
+            off[11] = at;
+        }
+    };
+
+    // A model already on this chain does not need uploading again. Where it landed is
+    // written beside the weights, and a later run reads it — which is the difference
+    // between a demonstration and something somebody would sit in front of, since the
+    // upload takes minutes and answering a prompt takes seconds.
+    let placed = dir.join("placed.json");
     let mut layer_at: Vec<Address> = Vec::with_capacity(n_layers);
     let mut offsets = vec![[0u64; 12]; n_layers];
-    let mut uploaded = 0usize;
-    for (l, off) in offsets.iter_mut().enumerate() {
-        let mut blob = Vec::new();
-        for (i, (name, rows, cols)) in attention.iter().enumerate() {
-            let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
-            if raw.len() != rows + rows * cols * 2 {
-                return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
-            }
-            off[i] = blob.len() as u64;
-            blob.extend_from_slice(&raw);
-        }
+    let mut head = Address::ZERO;
+    let mut reused = false;
 
-        // A dense layer carries gate, up and down directly. A mixture carries every expert
-        // laid out expert by expert, so expert e's sit one stride past expert zero's.
-        let ffn_at = blob.len();
-        if n_experts == 0 {
-            for (i, (name, rows, cols)) in [
-                ("gate", hidden, dim),
-                ("up", hidden, dim),
-                ("down", dim, hidden),
-            ]
-            .iter()
-            .enumerate()
-            {
+    if let Some((saved_layers, saved_head)) = std::fs::read_to_string(&placed)
+        .ok()
+        .and_then(|t| parse_placed(&t))
+    {
+        if saved_layers.len() == n_layers && c.has_code(saved_head)? {
+            say("model already on this chain");
+            println!("  layers      {}", saved_layers.len());
+            println!("  lm_head     {saved_head:#x}");
+            layer_at = saved_layers;
+            head = saved_head;
+            for off in offsets.iter_mut() {
+                layout(off);
+            }
+            reused = true;
+        }
+    }
+
+    if reused {
+        // Nothing to upload.
+    } else {
+        say("uploading weights as contract code");
+        let mut uploaded = 0usize;
+        for (l, off) in offsets.iter_mut().enumerate() {
+            let mut blob = Vec::new();
+            for (i, (name, rows, cols)) in attention.iter().enumerate() {
                 let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
                 if raw.len() != rows + rows * cols * 2 {
                     return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
                 }
-                off[4 + i] = blob.len() as u64;
+                off[i] = blob.len() as u64;
                 blob.extend_from_slice(&raw);
             }
-        } else {
-            let raw = read(&dir, &format!("l{l}_experts.bin"))?;
-            if raw.len() != n_experts * stride {
-                return Err(format!("l{l}_experts: expected {n_experts} x {stride}"));
+
+            // A dense layer carries gate, up and down directly. A mixture carries every expert
+            // laid out expert by expert, so expert e's sit one stride past expert zero's.
+            let ffn_at = blob.len();
+            if n_experts == 0 {
+                for (i, (name, rows, cols)) in [
+                    ("gate", hidden, dim),
+                    ("up", hidden, dim),
+                    ("down", dim, hidden),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let raw = read(&dir, &format!("l{l}_{name}.bin"))?;
+                    if raw.len() != rows + rows * cols * 2 {
+                        return Err(format!("l{l}_{name}: expected {rows}x{cols}"));
+                    }
+                    off[4 + i] = blob.len() as u64;
+                    blob.extend_from_slice(&raw);
+                }
+            } else {
+                let raw = read(&dir, &format!("l{l}_experts.bin"))?;
+                if raw.len() != n_experts * stride {
+                    return Err(format!("l{l}_experts: expected {n_experts} x {stride}"));
+                }
+                off[4] = ffn_at as u64;
+                off[5] = (ffn_at + gate_len) as u64;
+                off[6] = (ffn_at + gate_len * 2) as u64;
+                blob.extend_from_slice(&raw);
             }
-            off[4] = ffn_at as u64;
-            off[5] = (ffn_at + gate_len) as u64;
-            off[6] = (ffn_at + gate_len * 2) as u64;
-            blob.extend_from_slice(&raw);
+
+            for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
+                .iter()
+                .enumerate()
+            {
+                off[7 + j] = blob.len() as u64;
+                blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))?));
+            }
+            if n_experts != 0 {
+                off[11] = blob.len() as u64;
+                blob.extend_from_slice(&read(&dir, &format!("l{l}_router.bin"))?);
+            }
+            uploaded += blob.len();
+
+            let parts = blob.len().div_ceil(chunk_bytes());
+            let at = upload(&mut c, uploader, &blob, &format!("layer {l}"))?;
+            println!(
+                "  layer {l}     {at:#x}  {} bytes in {parts} chunk{}",
+                blob.len(),
+                if parts == 1 { "" } else { "s" }
+            );
+            layer_at.push(at);
         }
 
-        for (j, name) in ["input_norm", "q_norm", "k_norm", "post_norm"]
-            .iter()
-            .enumerate()
-        {
-            off[7 + j] = blob.len() as u64;
-            blob.extend(packed(&read_i64(&dir, &format!("l{l}_{name}.bin"))?));
-        }
-        if n_experts != 0 {
-            off[11] = blob.len() as u64;
-            blob.extend_from_slice(&read(&dir, &format!("l{l}_router.bin"))?);
-        }
-        uploaded += blob.len();
-
-        let parts = blob.len().div_ceil(chunk_bytes());
-        let at = upload(&mut c, uploader, &blob, &format!("layer {l}"))?;
+        let head_blob = read(&dir, "lm_head.bin")?;
+        head = upload(&mut c, uploader, &head_blob, "lm_head")?;
+        uploaded += head_blob.len();
         println!(
-            "  layer {l}     {at:#x}  {} bytes in {parts} chunk{}",
-            blob.len(),
-            if parts == 1 { "" } else { "s" }
+            "  lm_head     {head:#x}  {} bytes in {} chunks",
+            head_blob.len(),
+            head_blob.len().div_ceil(chunk_bytes())
         );
-        layer_at.push(at);
-    }
+        println!("  total       {uploaded} bytes on chain");
 
-    let head_blob = read(&dir, "lm_head.bin")?;
-    let head = upload(&mut c, uploader, &head_blob, "lm_head")?;
-    uploaded += head_blob.len();
-    println!(
-        "  lm_head     {head:#x}  {} bytes in {} chunks",
-        head_blob.len(),
-        head_blob.len().div_ceil(chunk_bytes())
-    );
-    println!("  total       {uploaded} bytes on chain");
+        // Written after the fact, so a run that failed part way through does not leave a note
+        // claiming a model is somewhere it is not.
+        let mut note = String::from("{\"lm_head\":\"");
+        note.push_str(&format!("{head:#x}"));
+        note.push_str("\",\"layers\":[");
+        for (i, a) in layer_at.iter().enumerate() {
+            if i > 0 {
+                note.push(',');
+            }
+            note.push_str(&format!("\"{a:#x}\""));
+        }
+        note.push_str("]}");
+        let _ = std::fs::write(&placed, note);
+    }
 
     // ---- generate ----
     let final_norm = read_i64(&dir, "final_norm.bin")?;

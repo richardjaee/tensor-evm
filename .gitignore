@@ -13,6 +13,9 @@
 !/testdata/**/*.bin
 !/testdata/*.bin
 
+# Where a run recorded the model it uploaded — specific to one chain's state
+placed.json
+
 # Chain data
 /datadir/
 /genesis-out/
