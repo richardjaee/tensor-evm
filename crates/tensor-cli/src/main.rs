@@ -59,13 +59,15 @@ pub fn read_i64(dir: &Path, name: &str) -> Result<Vec<i64>, String> {
 }
 
 /// The addresses an earlier run recorded: the classifier, then one per layer.
-fn parse_placed(text: &str) -> Option<(Vec<Address>, Address, String)> {
-    let chain = text
-        .split("\"chain\":\"")
+fn parse_placed(text: &str) -> Option<(Vec<Address>, Address, usize)> {
+    let size: usize = text
+        .split("\"size\":")
         .nth(1)?
-        .split('"')
+        .split(',')
         .next()?
-        .to_string();
+        .trim()
+        .parse()
+        .ok()?;
     let head: Address = text
         .split("\"lm_head\":\"")
         .nth(1)?
@@ -81,7 +83,7 @@ fn parse_placed(text: &str) -> Option<(Vec<Address>, Address, String)> {
         .split(',')
         .filter_map(|t| t.trim().trim_matches('"').parse().ok())
         .collect();
-    (!layers.is_empty()).then_some((layers, head, chain))
+    (!layers.is_empty()).then_some((layers, head, size))
 }
 
 pub fn read_f64(dir: &Path, name: &str) -> Result<Vec<f64>, String> {
@@ -352,16 +354,17 @@ fn run() -> Result<(), String> {
     let mut head = Address::ZERO;
     let mut reused = false;
 
-    let genesis = c.genesis_root()?;
-    if let Some((saved_layers, saved_head, saved_chain)) = std::fs::read_to_string(&placed)
+    if let Some((saved_layers, saved_head, saved_size)) = std::fs::read_to_string(&placed)
         .ok()
         .and_then(|t| parse_placed(&t))
     {
-        // The chain has to be the one the note was written against. Checking only that code
-        // exists at the address is not enough: addresses come from a sender and a nonce, so
-        // a different model uploaded in the same order lands in the same places — and a
-        // 0.6B run happily reused a 4B model's weights until this check existed.
-        if saved_chain == genesis && saved_layers.len() == n_layers && c.has_code(saved_head)? {
+        // The classifier's code has to be the size this model's would be. Checking only
+        // that code exists is not enough: addresses come from a sender and a nonce, so a
+        // different model uploaded in the same order lands in exactly the same places, and
+        // a 0.6B run reused a 4B model's weights until this check existed. Size survives a
+        // node restart, which a genesis root does not.
+        if saved_layers.len() == n_layers && saved_size > 0 && c.code_len(saved_head)? == saved_size
+        {
             say("model already on this chain");
             println!("  layers      {}", saved_layers.len());
             println!("  lm_head     {saved_head:#x}");
@@ -455,7 +458,12 @@ fn run() -> Result<(), String> {
 
         // Written after the fact, so a run that failed part way through does not leave a note
         // claiming a model is somewhere it is not.
-        let mut note = String::from("{\"lm_head\":\"");
+        // The classifier's code size goes in too: addresses come from a sender and a
+        // nonce, so a different model uploaded in the same order lands in the same places,
+        // and size is what tells them apart. It survives a node restart, which a genesis
+        // root does not.
+        let mut note = format!("{{\"size\":{},", c.code_len(head)?);
+        note.push_str("\"lm_head\":\"");
         note.push_str(&format!("{head:#x}"));
         note.push_str("\",\"layers\":[");
         for (i, a) in layer_at.iter().enumerate() {

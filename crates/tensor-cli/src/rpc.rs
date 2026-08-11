@@ -212,13 +212,16 @@ impl Client {
             .ok_or_else(|| "block zero has no stateRoot".to_string())
     }
 
-    /// Whether an account already carries code, which is how a model uploaded by an
-    /// earlier run is recognised.
-    pub fn has_code(&self, at: Address) -> Result<bool, String> {
-        Ok(self
-            .call_str("eth_getCode", json!([format!("{at:#x}"), "latest"]))?
-            .len()
-            > 2)
+    /// How many bytes of code an account carries.
+    ///
+    /// Used to recognise a model uploaded by an earlier run. The address alone is not
+    /// enough — addresses come from a sender and a nonce, so a different model uploaded in
+    /// the same order lands in the same places — and the classifier is stored as a
+    /// directory, so its code is a few kilobytes of chunk addresses rather than the whole
+    /// table. Cheap to fetch and specific to the model.
+    pub fn code_len(&self, at: Address) -> Result<usize, String> {
+        let hex = self.call_str("eth_getCode", json!([format!("{at:#x}"), "latest"]))?;
+        Ok(hex.trim_start_matches("0x").len() / 2)
     }
 
     pub fn block_number(&self) -> Result<u64, String> {
