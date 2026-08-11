@@ -33,6 +33,17 @@ hardware — just ordinary consensus over a VM that can do arithmetic at memory 
 ./demo-network.sh    # and a second node re-executing every block, with a verdict
 ```
 
+Or talk to it:
+
+```sh
+cargo run --release -p tensor-node -- 8545 --state /tmp/chain.state &
+python3 tools/chat.py --prompt "The capital of France is" --generate 5
+# → " Paris."
+```
+
+The first prompt uploads the model, about a minute; every prompt after it answers in around
+three seconds, and `--state` means that holds across restarts.
+
 One command. It starts [reth](https://github.com/paradigmxyz/reth) carrying the tensor
 precompiles, uploads a transformer as contract code, and generates tokens by signed
 transactions over JSON-RPC — checked against what float64 says the model emits. Every part

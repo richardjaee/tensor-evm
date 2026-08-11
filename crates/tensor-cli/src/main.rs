@@ -455,6 +455,13 @@ fn run() -> Result<(), String> {
         }
         note.push_str("]}");
         let _ = std::fs::write(&placed, note);
+
+        // Ask the node to write the chain down, so the model outlives the process that is
+        // serving it. A node without somewhere to write says so and nothing is lost.
+        match c.rpc("tensor_saveState", serde_json::json!([])) {
+            Ok(n) => println!("  saved       {n} accounts to the node's state file"),
+            Err(_) => println!("  not saved   start the node with --state to keep this upload"),
+        }
     }
 
     // ---- generate ----

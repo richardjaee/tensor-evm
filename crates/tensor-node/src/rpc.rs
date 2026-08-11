@@ -335,6 +335,17 @@ pub fn handle(chain: &mut Chain, req: &Value) -> Value {
         // Ethereum a caller who wants it re-runs the call — which is exactly the thing a
         // chain built for auditing should not require, since re-running is what the record
         // exists to make unnecessary.
+        // Not an Ethereum method. Writing the chain down is not something a node is
+        // normally asked to do mid-flight, and here it is the difference between uploading
+        // a model once and uploading it once a restart.
+        "tensor_saveState" => match chain.state_file.clone() {
+            Some(path) => match chain.save(&path) {
+                Ok(n) => ok(&id, json!(n)),
+                Err(e) => err(&id, -32000, &e),
+            },
+            None => err(&id, -32000, "this node was not given a --state file"),
+        },
+
         "tensor_getOutput" => {
             let Some(h) = params
                 .first()

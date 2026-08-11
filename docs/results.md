@@ -1808,3 +1808,33 @@ the tokens out of what the run printed, and a failed run prints nothing to parse
 The export needs to cover as many positions as the conversation uses, because the rotary
 tables are precomputed — `models/chat` covers thirty-two. That is an export flag rather than
 a design limit, and the error says so when a prompt exceeds it.
+
+## Keeping the chain across restarts
+
+Uploading a model is the expensive part — 1.19 GB and about a minute — and it only ever
+needed to happen once per chain. It was happening once per *process*, because this node held
+everything in memory and a restart took the contract with it. That is not a property of
+chains; it is a property of a node that had never learned to write anything down.
+
+`--state <path>` reads accounts at startup, and `tensor_saveState` writes them when the
+client asks — which it does once, after an upload finishes.
+
+```
+first prompt   uploads 1.19 GB, saves 1,241 accounts     ~51 s
+node killed and restarted, 1,241 accounts restored
+next prompt    "Water boils at" → " 100°C"               3.0 s
+```
+
+Blocks are deliberately not restored. A chain resuming from saved state starts its numbering
+again, which is honest about what the file is: the weights are there, the history is not, and
+putting a block number on something that never happened would be worse than admitting the
+gap.
+
+### On the thing that looked slow
+
+It was not slow, it was silent. `chat.py` captured the run and printed it at the end, so a
+three-second generation and a fifty-second upload looked identical from outside — frozen.
+Streaming the output fixed the complaint entirely without touching the chain.
+
+That is worth recording next to the optimisations, which took a layer from 673,643 gas to
+51,183. Only one of the two was ever visible to somebody sitting in front of it.

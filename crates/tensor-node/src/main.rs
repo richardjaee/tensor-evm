@@ -18,6 +18,7 @@
 //! ```
 
 mod chain;
+mod persist;
 mod replay;
 mod root;
 mod rpc;
@@ -41,12 +42,16 @@ fn main() {
     let mut journal = None;
     let mut replay_from = None;
     let mut archive = true;
+    let mut state: Option<std::path::PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--journal" => journal = args.next().map(std::path::PathBuf::from),
             // A bulk upload arrives as as many bytes as it stores, so keeping every
             // transaction doubles what the node holds.
             "--no-tx-archive" => archive = false,
+            // Where to keep the chain between runs, so a model uploaded once stays
+            // uploaded. Saved when asked over RPC, read at startup.
+            "--state" => state = args.next().map(std::path::PathBuf::from),
             "--replay" => replay_from = args.next().map(std::path::PathBuf::from),
             other => port = other.parse().unwrap_or(port),
         }
@@ -65,6 +70,17 @@ fn main() {
     let mut c = Chain::new(&[Address::from(DEV_ACCOUNT)]);
     c.journal = journal.clone();
     c.archive_txs = archive;
+    c.state_file = state.clone();
+    if let Some(path) = &state {
+        match c.load(path) {
+            Ok(0) => println!("  state              {} (new)", path.display()),
+            Ok(n) => println!(
+                "  state              {} ({n} accounts restored)",
+                path.display()
+            ),
+            Err(e) => println!("  state              {} (unreadable: {e})", path.display()),
+        }
+    }
     let chain = Arc::new(Mutex::new(c));
     let server = tiny_http::Server::http(("127.0.0.1", port)).expect("could not bind");
 

@@ -74,6 +74,8 @@ pub struct Chain {
     /// transactions, and a machine that can hold the state cannot necessarily hold both.
     /// Turning it off trades that history for the room to hold a large model.
     pub archive_txs: bool,
+    /// Where `tensor_saveState` writes, if this node was given somewhere to write.
+    pub state_file: Option<std::path::PathBuf>,
     /// Where to append the raw signed transactions this node accepted, if it is recording.
     /// A journal is what lets somebody else re-execute the chain without having to trust
     /// this node's account of what happened.
@@ -99,6 +101,7 @@ impl Chain {
             receipts: Vec::new(),
             trie: crate::trie::Trie::new(),
             archive_txs: true,
+            state_file: None,
             journal: None,
         };
         for a in prefund {
