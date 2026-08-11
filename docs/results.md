@@ -1734,3 +1734,45 @@ rather than a second implementation of it. A fused mixture that reimplemented ro
 give that up.
 
 Noted in `Mixture`'s own doc comment, where whoever does it will be looking.
+
+## Real generation: a prompt in, text out
+
+Until now the chain replayed positions an exporter had baked in. It now generates: given
+token ids, it feeds the model its own output and keeps going.
+
+```
+PROMPT_IDS=9707,11 GENERATE=3 tensor-cli models/full
+
+position 2: token  2776   3 transactions   102,551,651 gas
+position 3: token  4460   3 transactions   102,927,017 gas
+position 4: token   311   3 transactions   103,311,623 gas
+
+prompt      [9707, 11]          "Hello,"
+generated   [358, 2776, 4460, 311]   " I'm trying to"
+```
+
+Qwen3-0.6B, all 1.19 GB of it on chain, continuing a prompt in English. Every token is a
+transaction; the gas is on the receipt.
+
+Two details make it real rather than staged. The first two positions reproduce the baked
+run's tokens exactly — 21806 and 358 — because the prompt begins with the same two ids, and
+then the sequences diverge at the first position where the model is fed its own output
+instead of a scripted one. And the embedding for each generated token is read from the
+classifier table, which for a model with tied weights *is* the embedding table and is
+already on chain. Dequantising a row is `q << (32 - scale)`, exact, and it agrees with what
+the exporter wrote for the prompt to within 9 elements of 1024 at 1.9e-6 — the difference
+being that the exporter quantised from the original floats while this reads what the chain
+actually holds.
+
+A row lookup is a table read rather than a multiply, which is why the contract takes the row
+rather than fetching it — `Generator.feed` was built that way from the start.
+
+### What is left for a prompt box
+
+A tokenizer, and a page. Both are off-chain glue: text to ids with Qwen3's `tokenizer.json`,
+ids to text on the way back, and a form that posts to the RPC. The chain needs no changes —
+it already does the part that is hard to believe.
+
+The one real constraint is that the rotary tables cover a fixed number of positions, so a
+model exported for five cannot generate a hundred. That is an export flag, not a design
+limit.

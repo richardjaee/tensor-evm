@@ -364,6 +364,40 @@ fn run() -> Result<(), String> {
 
     // ---- generate ----
     let final_norm = read_i64(&dir, "final_norm.bin")?;
+
+    // A prompt given as token ids turns this into real generation: the model is fed its own
+    // output and keeps going. Without one it replays the positions the exporter baked in,
+    // which is what every measurement above used.
+    let prompt: Vec<usize> = std::env::var("PROMPT_IDS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let generate: usize = std::env::var("GENERATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // The embedding table, which for a model with tied weights is the classifier — already
+    // on chain, and read here only to look up a row. That is a table lookup rather than a
+    // multiply, which is why the row is supplied to the contract rather than fetched by it.
+    let embed_table = if prompt.is_empty() {
+        Vec::new()
+    } else {
+        read(&dir, "lm_head.bin")?
+    };
+    let embed_row = |t: usize| -> Result<Vec<i64>, String> {
+        if t >= vocab {
+            return Err(format!("token {t} is outside a vocabulary of {vocab}"));
+        }
+        let scale = embed_table[t] as i8;
+        let at = vocab + t * dim * 2;
+        // `q * 2^-scale` as a Q32 activation is `q << (32 - scale)`, exactly.
+        Ok(embed_table[at..at + dim * 2]
+            .chunks_exact(2)
+            .map(|c| (i16::from_be_bytes([c[0], c[1]]) as i64) << (32 - scale as i64))
+            .collect())
+    };
+
     let embed = read_i64(&dir, "embed.bin")?;
     let cos = read_i64(&dir, "cos.bin")?;
     let sin = read_i64(&dir, "sin.bin")?;
@@ -392,8 +426,20 @@ uint32,uint32,uint32)";
 
     say("generating");
     println!("  each position: seed, run every layer, classify\n");
-    let mut tokens = Vec::with_capacity(positions);
-    for pos in 0..positions {
+    let steps = if prompt.is_empty() {
+        positions
+    } else {
+        prompt.len() + generate
+    };
+    if steps > positions {
+        return Err(format!(
+            "asked for {steps} positions but the rotary tables cover {positions}; \
+             export with --positions {steps}"
+        ));
+    }
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(steps);
+    for pos in 0..steps {
         let before = c.gas_used;
 
         let mut d = selector(if pos == 0 {
@@ -403,7 +449,17 @@ uint32,uint32,uint32)";
         });
         d.extend_from_slice(&id);
         d.extend_from_slice(&word(2 * 32));
-        d.extend_from_slice(&dyn_bytes(&packed(&embed[pos * dim..(pos + 1) * dim])));
+        // The row for this position: a prompt token while the prompt lasts, and after that
+        // the token the chain itself just produced. That feedback is what makes this
+        // generation rather than replay.
+        let row: Vec<i64> = if prompt.is_empty() {
+            embed[pos * dim..(pos + 1) * dim].to_vec()
+        } else if pos < prompt.len() {
+            embed_row(prompt[pos])?
+        } else {
+            embed_row(tokens[pos - 1] as usize)?
+        };
+        d.extend_from_slice(&dyn_bytes(&packed(&row)));
         c.send(Some(generator), d, "seed")?;
 
         // The model, re-encoded per position: the rotary table is the only part that
@@ -471,6 +527,19 @@ uint32,uint32,uint32)";
             steps + 2,
             c.gas_used - before
         );
+    }
+
+    if !prompt.is_empty() {
+        say("generated");
+        println!("  prompt      {prompt:?}");
+        println!("  continued   {:?}", &tokens[prompt.len()..]);
+        println!("  all         {tokens:?}");
+        say("chain state");
+        println!("  blocks      {}", c.block_number()?);
+        println!("  sent        {} transactions", c.sent);
+        println!("  gas         {}", c.gas_used);
+        println!("  state root  {}", c.state_root()?);
+        return Ok(());
     }
 
     // ---- against what float64 says ----
