@@ -93,6 +93,17 @@ pub struct LayerWeights<'a> {
 }
 
 /// A router and the experts it chooses between.
+///
+/// The experts are materialised, all of them, which is fine for a caller that already holds
+/// the model in memory and is the one thing stopping a mixture layer being fused into a
+/// single precompile. Fusing means resolving weights out of chain state inside the call, and
+/// which experts to resolve is not known until the router has run — which happens here,
+/// after attention, inside this very function.
+///
+/// So a fused mixture block needs this to produce an expert on demand rather than hold a
+/// slice of all of them: a closure or a trait, resolving from the blob when asked. Handing
+/// the precompile every expert first would mean reading 1.2 GB to use 76 MB, which is the
+/// exact cost routing exists to avoid.
 pub struct Mixture<'a> {
     pub router: QTensor<'a>,
     pub experts: Vec<crate::moe::Expert<'a>>,

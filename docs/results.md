@@ -1713,3 +1713,24 @@ the result, the residual stream, both caches and the widths at once. Both split 
 The check that mattered throughout: 124 tests, including a whole model generating the tokens
 float64 produces. Counting them passing rather than scanning for failures is the only reason
 a change this broad could be made quickly.
+
+## What a fused mixture block needs first
+
+Fusing a dense layer was worth 10.3x, and the same change for a mixture layer is worth more —
+Qwen3-30B-A3B is 18.1M gas a position and every bit of it is marshalling. It is blocked on
+something structural rather than fiddly.
+
+`Mixture` holds `Vec<Expert>`: every expert, materialised. That is fine for a caller holding
+the model in memory, and impossible for a precompile that resolves weights out of chain
+state, because **which experts to resolve is not known until the router has run** — and the
+router runs inside the layer, after attention. Handing the precompile all of them first would
+mean reading 1.2 GB to use 76 MB, which is precisely the cost routing exists to avoid.
+
+So the prerequisite is that a mixture produces an expert on demand — a closure or a trait
+resolving from the blob when asked — rather than holding a slice of all of them. That is a
+change to `tensor-model`'s API, and it has to be made there rather than worked around in the
+precompile, because the whole value of the fused dense block is that it *is* `forward_layer`
+rather than a second implementation of it. A fused mixture that reimplemented routing would
+give that up.
+
+Noted in `Mixture`'s own doc comment, where whoever does it will be looking.
