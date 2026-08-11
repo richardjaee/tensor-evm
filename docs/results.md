@@ -1673,3 +1673,43 @@ The second is right, and it is a change to the contract rather than to the preco
 also exactly the kind of change that was worth stopping in front of: the last time the layer
 was rewired, a scratch buffer sized for the old call showed up as the test count dropping
 from 123 to 77 rather than as an error, and that was caught only by counting passing tests.
+
+## A whole block in one call: 10.3x on a dense layer
+
+`0x10a` is now what a dense layer calls. One precompile: residual stream, cache, rotary row
+and weight offsets in; new residual stream and the cache entry this position added, out.
+Every intermediate — query, keys, values, attention result, gate, activation — stays inside
+the VM.
+
+| | separate calls | two fusions | one call |
+|---|---|---|---|
+| gas a layer | 673,643 | 525,382 | **51,183** |
+| memory touched | 315,136 | 232,992 | 139,552 |
+
+**10.3x against the fused form, 13.2x against where this started.** The precompiles still
+charge 18,712 gas of it, which is now 37% of a layer rather than 2.8% — the marshalling that
+dominated has mostly gone, and what is left is one call's arguments.
+
+**Mixture layers are unchanged and still go step by step.** Which experts a token visits is
+decided in the middle of a layer, and the fused form has no router — so Qwen3-30B-A3B still
+measures 18.1M gas a position, exactly as before. The fusion helps dense models; a fused
+mixture block would be a separate precompile that resolves its experts internally, and it is
+the obvious next one.
+
+### Three things it took
+
+The header is ninety-six bytes, which is three words, and `_build` carries two. Building it
+with `abi.encodePacked` and passing it as the first *part* avoids packing eleven offsets and
+an address across word boundaries by hand.
+
+The caches go in whole rather than sliced. A contract holds `kv.k` with room for the entry
+being computed; the precompile reads the earlier entries, ignores the last slot, and returns
+what belongs there. Slicing in Solidity is a copy, and copying the cache is most of what
+fusing was for.
+
+And nineteen arguments in one `encodePacked` is past what the stack can reach, as is holding
+the result, the residual stream, both caches and the widths at once. Both split into two.
+
+The check that mattered throughout: 124 tests, including a whole model generating the tokens
+float64 produces. Counting them passing rather than scanning for failures is the only reason
+a change this broad could be made quickly.

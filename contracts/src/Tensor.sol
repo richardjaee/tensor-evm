@@ -43,6 +43,10 @@ library Tensor {
     ///      residual stream wide, which made `o_proj` the most expensive line in a layer.
     address internal constant ATTN_PROJ = address(0x109);
 
+    /// @dev A whole transformer block. The two fused calls it replaces were 79% of a layer
+    ///      between them, each dominated by moving a residual stream in and out.
+    address internal constant LAYER = address(0x10a);
+
     /// @notice Operand bundles.
     /// @dev Not tidiness: the EVM's stack is what limits how a transformer block can be
     ///      written, and seven loose arguments leave a caller no room for the values it
@@ -96,6 +100,10 @@ library Tensor {
         uint256 attn = 44 + (qw + cacheDepth * 2) * W;
         if (attn > n) n = attn;
         uint256 mm = 32 + (hidden > dim ? hidden : dim) * W;
+        // The whole-layer call: ninety-six bytes of header, the residual stream, one rotary
+        // row, and both caches whole.
+        uint256 whole = 96 + (dim + qw / 2 + cacheDepth * 2) * W;
+        if (whole > n) n = whole;
         if (mm > n) n = mm;
     }
 
@@ -399,6 +407,42 @@ library Tensor {
             // The logit occupies bytes 4..12; shift it to the top of a word, then down
             // arithmetically so the sign extends.
             logit := sar(192, shl(32, word))
+        }
+    }
+
+    /// @notice A whole transformer block, in one call
+    ///
+    /// @dev The header is ninety-six bytes — three words — so it is built with
+    ///      `abi.encodePacked` and passed as the first part rather than shifted into place
+    ///      by hand. Eleven offsets and an address across word boundaries is a bug waiting
+    ///      to happen, and the packed form is exactly the layout the precompile reads.
+    ///
+    ///      The caches go in whole, with room for the entry this call computes; it comes
+    ///      back appended to the residual stream and the caller writes it into the slot.
+    function layer(
+        Scratch memory s,
+        bytes memory header,
+        bytes memory x,
+        bytes memory cos,
+        bytes memory sin,
+        bytes memory kCache,
+        bytes memory vCache
+    ) internal view returns (bytes memory) {
+        bytes[] memory parts = new bytes[](6);
+        parts[0] = header;
+        parts[1] = x;
+        parts[2] = cos;
+        parts[3] = sin;
+        parts[4] = kCache;
+        parts[5] = vCache;
+        uint256 want = x.length + kCache.length / _positions(header) * 2;
+        return _call(LAYER, _build(s, 0, bytes32(0), parts), want);
+    }
+
+    /// @dev Positions, read back out of the packed header so the caller need not repeat it.
+    function _positions(bytes memory header) private pure returns (uint256 n) {
+        assembly ("memory-safe") {
+            n := shr(224, mload(add(add(header, 0x20), 20)))
         }
     }
 

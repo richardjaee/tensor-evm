@@ -662,7 +662,8 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
             .collect()
     };
     let (x0, cos, sin) = (vals(dim, 1), vals(half, 2), vals(half, 3));
-    let (pk, pv) = (vals(past * kvw, 4), vals(past * kvw, 5));
+    // With room for the entry this call computes, as a contract's buffer has.
+    let (pk, pv) = (vals(positions * kvw, 4), vals(positions * kvw, 5));
 
     // The reference, called directly.
     let t = |i: usize, rows: usize, cols: usize| QTensor {
@@ -686,8 +687,8 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
         mixture: None,
     };
     let mut kv = KvCache::new(&cfg, 1);
-    kv.k[..past * kvw].copy_from_slice(&pk);
-    kv.v[..past * kvw].copy_from_slice(&pv);
+    kv.k[..past * kvw].copy_from_slice(&pk[..past * kvw]);
+    kv.v[..past * kvw].copy_from_slice(&pv[..past * kvw]);
     // The reference wants the whole table; the precompile is handed one row and places it.
     let mut cos_tab = vec![0i64; positions * half];
     let mut sin_tab = vec![0i64; positions * half];
@@ -727,7 +728,7 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
     }
     assert_eq!(
         input.len(),
-        LAYER_HEADER + (dim + half * 2 + past * kvw * 2) * 8
+        LAYER_HEADER + (dim + half * 2 + positions * kvw * 2) * 8
     );
 
     let tagged_blob = tagged(blob);

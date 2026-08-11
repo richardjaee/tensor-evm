@@ -1141,7 +1141,11 @@ pub fn layer_state_with(
     };
     let (qw, kvw, half) = (cfg.q_width(), cfg.kv_width(), hs / 2);
     let past = positions - 1;
-    let want = LAYER_HEADER + (dim + half * 2 + past * kvw * 2) * 8;
+    // The caches arrive with room for the entry this call computes — `positions` slots, of
+    // which the last is ignored on the way in and returned filled. That is the shape a
+    // contract already holds, so taking it avoids a copy of the whole cache, which is a
+    // good part of what fusing the layer was for.
+    let want = LAYER_HEADER + (dim + half * 2 + positions * kvw * 2) * 8;
     if input.len() != want {
         return Ok(Outcome::Revert);
     }
@@ -1178,7 +1182,10 @@ pub fn layer_state_with(
     let cos = read(LAYER_HEADER + dim * 8, half);
     let sin = read(LAYER_HEADER + (dim + half) * 8, half);
     let past_k = read(LAYER_HEADER + (dim + half * 2) * 8, past * kvw);
-    let past_v = read(LAYER_HEADER + (dim + half * 2 + past * kvw) * 8, past * kvw);
+    let past_v = read(
+        LAYER_HEADER + (dim + half * 2 + positions * kvw) * 8,
+        past * kvw,
+    );
 
     // Every tensor out of one blob, through the same resolver everything else uses.
     let shapes = [

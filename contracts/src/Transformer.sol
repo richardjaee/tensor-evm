@@ -266,9 +266,73 @@ library Transformer {
         uint256 pos,
         bytes memory x
     ) internal view returns (bytes memory) {
-        _attention(b, kv, rope, pos, x);
-        _feedForward(b, x);
+        // A mixture layer still goes step by step: which experts a token visits is decided
+        // mid-layer, and the fused form has no router.
+        if (b.c.nExperts != 0) {
+            _attention(b, kv, rope, pos, x);
+            _feedForward(b, x);
+            return x;
+        }
+
+        uint256 g = gasleft();
+        _scatter(
+            Tensor.layer(b.s, _header(b, pos), x, rope.cos, rope.sin, kv.k, kv.v),
+            x,
+            kv,
+            uint256(b.c.dim) * 8,
+            kvWidth(b.c) * 8,
+            pos
+        );
+        _mark(b, g);
         return x;
+    }
+
+    /// @dev Unpacks what the whole-layer call returned: the residual stream, then the cache
+    ///      entry this position added. Its own function because the stack cannot hold the
+    ///      result, the stream, both caches and the widths at once.
+    function _scatter(
+        bytes memory out,
+        bytes memory x,
+        Kv memory kv,
+        uint256 dimBytes,
+        uint256 kvBytes,
+        uint256 pos
+    ) private pure {
+        uint256 at = pos * kvBytes;
+        bytes memory kc = kv.k;
+        bytes memory vc = kv.v;
+        assembly ("memory-safe") {
+            let src := add(out, 0x20)
+            mcopy(add(x, 0x20), src, dimBytes)
+            mcopy(add(add(kc, 0x20), at), add(src, dimBytes), kvBytes)
+            mcopy(add(add(vc, 0x20), at), add(add(src, dimBytes), kvBytes), kvBytes)
+        }
+    }
+
+    /// @dev The whole-layer call's header: six widths, the weights account, eleven offsets
+    ///      and the epsilon. Packed rather than shifted into place by hand — ninety-six
+    ///      bytes is three words, and eleven offsets across word boundaries is a bug waiting
+    ///      to happen.
+    function _header(Block memory b, uint256 pos) private pure returns (bytes memory) {
+        // Two halves, concatenated. Nineteen arguments in one `encodePacked` is past what
+        // the stack can address from a caller this size.
+        return bytes.concat(
+            abi.encodePacked(
+                b.c.dim,
+                b.c.hidden,
+                b.c.nHeads,
+                b.c.nKv,
+                b.c.headDim,
+                uint32(pos + 1),
+                b.l.at
+            ),
+            abi.encodePacked(
+                b.l.q, b.l.k, b.l.v, b.l.o, b.l.gate, b.l.up, b.l.down
+            ),
+            abi.encodePacked(
+                b.l.inputNorm, b.l.qNorm, b.l.kNorm, b.l.postNorm, int64(b.c.rmsEps)
+            )
+        );
     }
 
     function _attention(
