@@ -1776,3 +1776,35 @@ it already does the part that is hard to believe.
 The one real constraint is that the rotary tables cover a fixed number of positions, so a
 model exported for five cannot generate a hundred. That is an export flag, not a design
 limit.
+
+## A prompt box
+
+```sh
+cargo run --release -p tensor-node -- 8545 &
+python3 tools/chat.py --prompt "The capital of France is" --generate 5
+```
+
+```
+prompt   "The capital of France is"
+  tokens [785, 6722, 315, 9625, 374]
+
+position 5: token 12095   3 transactions   103,203,527 gas
+position 6: token    13   3 transactions   103,584,371 gas
+...
+
+reply  " Paris. The capital of Italy"
+whole  "The capital of France is Paris. The capital of Italy"
+```
+
+Qwen3-0.6B, 1.19 GB of contract code, answering a factual question. Each token is a
+transaction with a receipt.
+
+Two things are off chain and both are lookups rather than computation: text to token ids,
+and ids back to text. Everything between them — twenty-eight layers, attention, the
+classifier — happened inside the EVM against weights held in state. There is no path in
+`chat.py` that produces a token without a transaction having produced it first: it parses
+the tokens out of what the run printed, and a failed run prints nothing to parse.
+
+The export needs to cover as many positions as the conversation uses, because the rotary
+tables are precomputed — `models/chat` covers thirty-two. That is an export flag rather than
+a design limit, and the error says so when a prompt exceeds it.
