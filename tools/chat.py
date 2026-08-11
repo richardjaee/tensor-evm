@@ -62,16 +62,26 @@ def main():
         GENERATE=str(a.generate),
         CHUNK_BYTES=a.chunk_bytes,
     )
-    out = subprocess.run(
+    # Streamed rather than captured. A run takes seconds when the model is already on the
+    # chain and a minute when it is not, and buffering the output until the end makes both
+    # look identical: frozen. Watching the positions land is also the only way to see that
+    # transactions are going through at all.
+    proc = subprocess.Popen(
         [os.path.join(root, "target/release/tensor-cli"), model],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
-    sys.stdout.write(out.stdout)
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        lines.append(line)
+    if proc.wait() != 0:
         raise SystemExit("the chain did not finish the generation")
+    out = type("Run", (), {"stdout": "".join(lines)})()
 
     # The tokens the chain emitted, read back out of what it printed. Nothing here can
     # invent one: if the run failed there is no line to parse.

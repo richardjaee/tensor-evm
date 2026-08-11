@@ -31,3 +31,6 @@ placed.json
 # Python
 __pycache__/
 *.pyc
+
+# A prompt box for looking at, not part of the project
+/frontend.py
