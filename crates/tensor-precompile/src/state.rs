@@ -660,15 +660,6 @@ pub fn matmul_state_with(
     let mut out = vec![0i64; rows_u];
     matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
 
-    let scales: Vec<i8> = bytes[..rows_u].iter().map(|&b| b as i8).collect();
-    let weights: Vec<i16> = bytes[rows_u..]
-        .chunks_exact(2)
-        .map(|c| i16::from_be_bytes([c[0], c[1]]))
-        .collect();
-
-    let mut out = vec![0i64; rows_u];
-    matmul(&weights, &scales, &acts, rows_u, cols_u, &mut out);
-
     let mut packed = Vec::with_capacity(rows_u * 8);
     for v in out {
         packed.extend_from_slice(&v.to_be_bytes());
