@@ -69,7 +69,7 @@ fn resolve<CTX: ContextTr>(
     at: Address,
     offset: usize,
     len: usize,
-) -> Result<Option<(Vec<u8>, u64)>, String> {
+) -> Result<Option<(Bytes, u64)>, String> {
     let mut code_of = |a: Address| -> Result<(Bytes, bool), String> {
         let loaded = context
             .journal_mut()
@@ -89,7 +89,7 @@ pub fn resolve_with(
     at: Address,
     offset: usize,
     len: usize,
-) -> Result<Option<(Vec<u8>, u64)>, String> {
+) -> Result<Option<(Bytes, u64)>, String> {
     let (code, is_cold) = code_of(at)?;
     let mut charged = if is_cold {
         COLD_ACCOUNT_GAS
@@ -108,7 +108,11 @@ pub fn resolve_with(
         if end > code.len() {
             return Ok(None);
         }
-        return Ok(Some((code[offset + 1..end].to_vec(), charged)));
+        // A view into the chunk rather than a copy of it. `Bytes` is refcounted, so this
+        // costs nothing and the matmul streams straight out of the code the EVM already
+        // holds — which is the whole cost of a token, avoided, whenever a tensor does not
+        // straddle a chunk boundary.
+        return Ok(Some((code.slice(offset + 1..end), charged)));
     }
     if code[0] != TAG_DIRECTORY {
         return Ok(None);
@@ -182,7 +186,9 @@ pub fn resolve_with(
     if left != 0 {
         return Ok(None); // the directory does not span the range asked for
     }
-    Ok(Some((out, charged)))
+    // Spanning chunks leaves no choice but to stitch, since the pieces are not adjacent in
+    // memory. Sizing chunks so a tensor fits inside one is what avoids this path.
+    Ok(Some((out.into(), charged)))
 }
 
 /// Address of the state-reading matmul.
@@ -850,7 +856,7 @@ pub fn ffn_state_with(
     let tall = dim_u + dim_u * hidden_u * 2;
     let mut access = 0u64;
     let mut read =
-        |code_of: CodeSource<'_>, off: usize, span: usize| -> Result<Option<Vec<u8>>, String> {
+        |code_of: CodeSource<'_>, off: usize, span: usize| -> Result<Option<Bytes>, String> {
             match resolve_with(code_of, at, off, span)? {
                 Some((bytes, charged)) => {
                     access = access.saturating_add(charged);
