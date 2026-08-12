@@ -532,7 +532,7 @@ fn the_fused_feed_forward_equals_the_calls_it_replaces() {
 
         let tagged_blob = tagged(blob);
         let mut code_of =
-            |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((tagged_blob.clone(), false)) };
+            |_a: Address| -> Result<(Bytes, bool), String> { Ok((tagged_blob.clone().into(), false)) };
         let got = match ffn_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
             Outcome::Return(bytes, _) => bytes
                 .chunks_exact(8)
@@ -586,7 +586,7 @@ fn fused_attention_equals_attention_then_projection() {
 
         let blob = tagged(weight_blob(dim, q_len, &os, &ow));
         let mut code_of =
-            |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((blob.clone(), false)) };
+            |_a: Address| -> Result<(Bytes, bool), String> { Ok((blob.clone().into(), false)) };
         let got = match attn_proj_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
             Outcome::Return(bytes, _) => bytes
                 .chunks_exact(8)
@@ -733,7 +733,7 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
 
     let tagged_blob = tagged(blob);
     let mut code_of =
-        |_a: Address| -> Result<(Vec<u8>, bool), String> { Ok((tagged_blob.clone(), false)) };
+        |_a: Address| -> Result<(Bytes, bool), String> { Ok((tagged_blob.clone().into(), false)) };
     let got: Vec<i64> = match layer_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
         Outcome::Return(bytes, _) => bytes
             .chunks_exact(8)

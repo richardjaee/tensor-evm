@@ -50,24 +50,19 @@ const TAG_DIRECTORY: u8 = 0x01;
 /// Bytes per directory entry: a 20-byte address then a 4-byte cumulative blob offset.
 const ENTRY: usize = 24;
 
-/// Resolves `len` bytes at `offset` within a weight blob, following a directory if the
-/// address is one.
-///
-/// A model arrives in chunks because no transaction carries 31.5MB, so a tensor is a byte
-/// range spanning several contracts and something has to stitch it back. Doing it here
-/// rather than in the contract keeps the caller's view of a tensor as an address and an
-/// offset, whichever way the bytes were uploaded.
-///
-/// Chunk and directory are told apart by the first byte of code rather than by a marker in
-/// the payload, because a blob's first byte is a quantisation scale and can be anything —
-/// any in-band marker could collide with real weights.
 /// How a host hands over an account's code, and whether this call was the first to touch it.
 ///
 /// An indirection rather than a concrete type because there is more than one host. revm's
 /// journal is one; a client that reaches state through its own abstraction is another, and
 /// weight resolution is consensus-critical enough that the two must not each have a copy of
 /// it.
-pub type CodeSource<'a> = &'a mut dyn FnMut(Address) -> Result<(Vec<u8>, bool), String>;
+///
+/// `Bytes` rather than `Vec<u8>` on purpose. Code is refcounted inside the EVM, so handing
+/// it over costs a refcount bump; copying it out costs the length of the chunk. Reading
+/// weights is the dominant cost of a token — a 4B model moves 8 GB of them per token, over
+/// a hundred times what the attention cache moves — so a deep copy per touch was doubling
+/// the one thing worth making cheap.
+pub type CodeSource<'a> = &'a mut dyn FnMut(Address) -> Result<(Bytes, bool), String>;
 
 fn resolve<CTX: ContextTr>(
     context: &mut CTX,
@@ -75,12 +70,12 @@ fn resolve<CTX: ContextTr>(
     offset: usize,
     len: usize,
 ) -> Result<Option<(Vec<u8>, u64)>, String> {
-    let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+    let mut code_of = |a: Address| -> Result<(Bytes, bool), String> {
         let loaded = context
             .journal_mut()
             .code(a)
             .map_err(|_| "failed to load weights".to_string())?;
-        Ok((loaded.data.to_vec(), loaded.is_cold))
+        Ok((loaded.data.clone(), loaded.is_cold))
     };
     resolve_with(&mut code_of, at, offset, len)
 }
@@ -368,12 +363,12 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TensorPrecompiles {
         let gas_limit = inputs.gas_limit;
         let input = inputs.input.as_bytes(context).to_vec();
 
-        let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+        let mut code_of = |a: Address| -> Result<(Bytes, bool), String> {
             let loaded = context
                 .journal_mut()
                 .code(a)
                 .map_err(|_| "failed to load weights".to_string())?;
-            Ok((loaded.data.to_vec(), loaded.is_cold))
+            Ok((loaded.data.clone(), loaded.is_cold))
         };
         match matmul_state_with(&mut code_of, &input, gas_limit)? {
             Outcome::Revert => Ok(Some(revert(gas_limit))),
@@ -917,12 +912,12 @@ fn run_host<CTX: ContextTr>(
 ) -> Result<Option<InterpreterResult>, String> {
     let gas_limit = inputs.gas_limit;
     let input = inputs.input.as_bytes(context).to_vec();
-    let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+    let mut code_of = |a: Address| -> Result<(Bytes, bool), String> {
         let loaded = context
             .journal_mut()
             .code(a)
             .map_err(|_| "failed to load weights".to_string())?;
-        Ok((loaded.data.to_vec(), loaded.is_cold))
+        Ok((loaded.data.clone(), loaded.is_cold))
     };
     match run(&mut code_of, &input, gas_limit)? {
         Outcome::Revert => Ok(Some(revert(gas_limit))),

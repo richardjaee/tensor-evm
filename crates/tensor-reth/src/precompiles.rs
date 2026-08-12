@@ -83,7 +83,7 @@ fn state_reading(
         // Whether a touch was cold is the difference between 2,600 gas and 100, and a
         // forward pass hits the same weights on every call of every layer — so it is taken
         // from the host rather than assumed.
-        let mut code_of = |a: Address| -> Result<(Vec<u8>, bool), String> {
+        let mut code_of = |a: Address| -> Result<(Bytes, bool), String> {
             // `load_account` alone is not enough: code is loaded lazily, so an account read
             // that way carries a code hash and an empty `code`. Weights would come back as
             // nothing and every call would revert — which an in-memory database hides,
@@ -97,8 +97,7 @@ fn state_reading(
                 .data
                 .load_code()
                 .map_err(|_| "failed to load weights".to_string())?
-                .original_bytes()
-                .to_vec();
+                .original_bytes();
             Ok((code, is_cold))
         };
 
