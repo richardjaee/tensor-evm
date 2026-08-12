@@ -152,6 +152,54 @@ pub fn matmul(w: &[i16], scales: &[i8], x: &[i64], rows: usize, cols: usize, out
         });
 }
 
+/// The same weights against several activation vectors at once.
+///
+/// The loop order is the entire point. A weight row is read once and multiplied against
+/// every vector in the batch while it is still in cache; calling [`matmul`] `batch` times
+/// instead streams the whole weight matrix `batch` times over. Since this kernel is bound
+/// by reading weights rather than by forming products, that is close to the difference
+/// between doing the work once and doing it `batch` times.
+///
+/// It is what makes a prompt cheap. Prompt positions do not depend on each other — only
+/// generated ones do — so all of them can go through a layer together, and the weights get
+/// read once for the whole prompt rather than once per token in it.
+///
+/// `xs` is `batch * cols`, one vector after another. `out` is `rows * batch`, laid out by
+/// row rather than by batch entry, so each row's results are contiguous and the parallel
+/// split has no write that crosses a boundary.
+pub fn matmul_batch(
+    w: &[i16],
+    scales: &[i8],
+    xs: &[i64],
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    out: &mut [i64],
+) {
+    assert_eq!(w.len(), rows * cols, "weight length must be rows*cols");
+    assert_eq!(scales.len(), rows, "one scale per row");
+    assert_eq!(xs.len(), batch * cols, "activations must be batch*cols");
+    assert_eq!(out.len(), rows * batch, "output length must be rows*batch");
+
+    let row_of = |r: usize, o: &mut [i64]| {
+        let row = &w[r * cols..(r + 1) * cols];
+        let s = scales[r];
+        for b in 0..batch {
+            o[b] = finish(dot(row, &xs[b * cols..(b + 1) * cols]), s);
+        }
+    };
+
+    if rows * cols < PARALLEL_THRESHOLD {
+        for (r, o) in out.chunks_mut(batch).enumerate() {
+            row_of(r, o);
+        }
+        return;
+    }
+    out.par_chunks_mut(batch)
+        .enumerate()
+        .for_each(|(r, o)| row_of(r, o));
+}
+
 /// Bytes of weight touched by one matmul. The figure that actually predicts runtime:
 /// above a few hundred million parameters this kernel is bound by how fast weights can
 /// be read, not by how fast products can be formed.
@@ -321,5 +369,76 @@ mod tests {
         let mut out = vec![0i64; 2];
         matmul_scalar(&w, &scales, &x, 2, 3, &mut out);
         assert_eq!(out, vec![140, 320]); // 10+40+90, 40+100+180
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Deterministic filler; the values only need to be varied and reproducible.
+    fn fill(n: usize, seed: i64) -> Vec<i64> {
+        (0..n).map(|i| ((i as i64 * 2654435761 + seed) % 4096) - 2048).collect()
+    }
+
+    /// Batching must be a performance change and nothing else. If a batched row differed
+    /// from the same row computed alone, prompt positions would depend on how many of them
+    /// were submitted together — and two nodes batching differently would disagree.
+    #[test]
+    fn batch_matches_one_at_a_time() {
+        for &(rows, cols, batch) in &[(1, 1, 1), (7, 5, 3), (64, 96, 4), (300, 700, 8)] {
+            let w: Vec<i16> = (0..rows * cols).map(|i| ((i * 7919) % 601) as i16 - 300).collect();
+            let scales: Vec<i8> = (0..rows).map(|r| (r % 5) as i8).collect();
+            let xs = fill(batch * cols, 11);
+
+            let mut got = vec![0i64; rows * batch];
+            matmul_batch(&w, &scales, &xs, rows, cols, batch, &mut got);
+
+            for b in 0..batch {
+                let mut want = vec![0i64; rows];
+                matmul(&w, &scales, &xs[b * cols..(b + 1) * cols], rows, cols, &mut want);
+                for r in 0..rows {
+                    assert_eq!(
+                        got[r * batch + b], want[r],
+                        "rows {rows} cols {cols} batch {batch}, row {r} entry {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What batching actually buys, on the two shapes Qwen3-4B is made of.
+    ///
+    /// Ignored because it is a measurement rather than an assertion — it prints, and what
+    /// counts as fast depends on the machine. Run it with
+    /// `cargo test --release -p tensor-kernel -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_batching_buys() {
+        use std::time::Instant;
+        for &(rows, cols, name) in &[(2560usize, 2560usize, "attention proj"), (9728, 2560, "ffn gate")] {
+            let w: Vec<i16> = (0..rows * cols).map(|i| ((i * 7919) % 601) as i16 - 300).collect();
+            let scales: Vec<i8> = (0..rows).map(|r| (r % 5) as i8).collect();
+            println!("\n{name}  {rows}x{cols}  ({:.1} MB of weights)", weight_bytes(rows, cols) as f64 / 1e6);
+            for &batch in &[1usize, 4, 16] {
+                let xs = fill(batch * cols, 3);
+                let t = Instant::now();
+                let mut one = vec![0i64; rows];
+                for b in 0..batch {
+                    matmul(&w, &scales, &xs[b * cols..(b + 1) * cols], rows, cols, &mut one);
+                }
+                let sep = t.elapsed();
+                let t = Instant::now();
+                let mut all = vec![0i64; rows * batch];
+                matmul_batch(&w, &scales, &xs, rows, cols, batch, &mut all);
+                let bat = t.elapsed();
+                println!(
+                    "  batch {batch:>2}   separate {:>7.1}ms   batched {:>7.1}ms   {:.2}x",
+                    sep.as_secs_f64() * 1e3,
+                    bat.as_secs_f64() * 1e3,
+                    sep.as_secs_f64() / bat.as_secs_f64()
+                );
+            }
+        }
     }
 }
