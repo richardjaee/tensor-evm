@@ -325,8 +325,10 @@ fn main() {
     // ---- step ----
     // step(bytes32, Model, uint16). Model's members are a static Config, a Layer array, and
     // two tuples of bytes, so the tuple is dynamic and encodes behind an offset.
-    let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],(bytes,bytes)),uint16)";
+    let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,\
+uint32,uint32,uint32),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
+(bytes,bytes)),uint16)";
     let mut d = keccak256(sig.as_bytes())[..4].to_vec();
     d.extend_from_slice(&ID);
     d.extend_from_slice(&word(3 * 32)); // offset to Model
@@ -346,6 +348,10 @@ fn main() {
         model.extend_from_slice(&word(f));
     }
     model.extend_from_slice(&signed(cfg.rms_eps));
+    // nExperts, topK, expertStride. Zero is what dense means, and this example is dense.
+    for _ in 0..3 {
+        model.extend_from_slice(&word(0));
+    }
 
     let mut layers = word(1).to_vec(); // one Layer
     let mut la = [0u8; 32];
@@ -354,10 +360,11 @@ fn main() {
     for o in &offsets {
         layers.extend_from_slice(&word(*o));
     }
+    layers.extend_from_slice(&word(0)); // router, unused when dense
     let ropes = bytes_tuple(&[&packed(&cos[..half]), &packed(&sin[..half])]);
 
-    // Config's eight words, then offsets to the layer array and the rotary tables.
-    let head = 10 * 32;
+    // Config's eleven words, then offsets to the layer array and the rotary tables.
+    let head = 13 * 32;
     model.extend_from_slice(&word(head as u64));
     model.extend_from_slice(&word((head + layers.len()) as u64));
     model.extend_from_slice(&layers);

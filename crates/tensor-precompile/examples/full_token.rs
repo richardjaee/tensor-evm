@@ -309,6 +309,10 @@ fn main() {
             m.extend_from_slice(&word(f as u64));
         }
         m.extend_from_slice(&signed(tensor_kernel::fixed::RMS_EPS_QWEN3));
+        // nExperts, topK, expertStride. Zero is what dense means, and this model is dense.
+        for _ in 0..3 {
+            m.extend_from_slice(&word(0));
+        }
 
         let mut layers = word(n_layers as u64).to_vec();
         for (l, off) in offsets.iter().enumerate() {
@@ -316,12 +320,13 @@ fn main() {
             for o in off {
                 layers.extend_from_slice(&word(*o));
             }
+            layers.extend_from_slice(&word(0)); // router, unused when dense
         }
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
 
-        // Config's eight words, then offsets to the layer array and the rotary tables.
-        let head = 10 * 32;
+        // Config's eleven words, then offsets to the layer array and the rotary tables.
+        let head = 13 * 32;
         m.extend_from_slice(&word(head as u64));
         m.extend_from_slice(&word((head + layers.len()) as u64));
         m.extend_from_slice(&layers);
@@ -329,8 +334,9 @@ fn main() {
         m
     };
 
-    let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
+    let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,\
+uint32,uint32,uint32),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
 (bytes,bytes)),uint16)";
 
     println!(
@@ -371,7 +377,7 @@ fn main() {
 
         // Final norm, classifier, argmax.
         let mut d = keccak256(
-            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),bytes,address,uint32,uint32)",
+            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),bytes,address,uint32,uint32)",
         )[..4]
             .to_vec();
         d.extend_from_slice(&ID);
@@ -379,7 +385,12 @@ fn main() {
             d.extend_from_slice(&word(f as u64));
         }
         d.extend_from_slice(&signed(tensor_kernel::fixed::RMS_EPS_QWEN3));
-        d.extend_from_slice(&word(13 * 32)); // offset to finalNorm
+        // nExperts, topK, expertStride. Zero is what dense means, and this model is dense.
+        for _ in 0..3 {
+            d.extend_from_slice(&word(0));
+        }
+        // Three words further along than it was, the config having grown by three.
+        d.extend_from_slice(&word(16 * 32)); // offset to finalNorm
         d.extend_from_slice(&addr_word(HEAD));
         d.extend_from_slice(&word(0)); // offset within the classifier blob
         d.extend_from_slice(&word(vocab as u64));

@@ -249,6 +249,10 @@ fn main() {
             out.extend_from_slice(&word(f as u64));
         }
         out.extend_from_slice(&signed(eps));
+        // nExperts, topK, expertStride. Zero is what dense means, and this model is dense.
+        for _ in 0..3 {
+            out.extend_from_slice(&word(0));
+        }
     };
 
     let mut nonce = 0u64;
@@ -312,17 +316,19 @@ fn main() {
             for o in off {
                 layers.extend_from_slice(&word(*o));
             }
+            layers.extend_from_slice(&word(0)); // router, unused when dense
         }
         let a = pos * half;
         let rope = bytes_tuple(&[&packed(&cos[a..a + half]), &packed(&sin[a..a + half])]);
-        let head = 10 * 32;
+        let head = 13 * 32;
         model.extend_from_slice(&word(head as u64));
         model.extend_from_slice(&word((head + layers.len()) as u64));
         model.extend_from_slice(&layers);
         model.extend_from_slice(&rope);
 
-        let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
+        let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,\
+uint32,uint32,uint32),\
+(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
 (bytes,bytes)),uint16)";
         let mut d = keccak256(sig.as_bytes())[..4].to_vec();
         d.extend_from_slice(&ID);
@@ -332,12 +338,13 @@ fn main() {
         let (_, step_gas) = send(&mut db, d, &format!("step at {pos}"));
 
         let mut d = keccak256(
-            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256),bytes,address,uint32,uint32)",
+            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),bytes,address,uint32,uint32)",
         )[..4]
             .to_vec();
         d.extend_from_slice(&ID);
         config(&mut d);
-        d.extend_from_slice(&word(13 * 32));
+        // Three words further along than it was, the config having grown by three.
+        d.extend_from_slice(&word(16 * 32));
         d.extend_from_slice(&addr_word(HEAD));
         d.extend_from_slice(&word(0));
         d.extend_from_slice(&word(vocab as u64));
