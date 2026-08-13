@@ -33,6 +33,19 @@
 //! speed barely moves the number this project is measured by, while a wrapped accumulator
 //! would be a consensus failure rather than a slow one.
 //!
+//! Splitting the multiply to avoid the 128-bit one was tried, and is slower. A weight is
+//! `i16` and an activation `i64`, so `x = (x >> 32) * 2^32 + (x as u32)` puts both halves
+//! within an `i64` product — exact for negative `x` too, assuming nothing about magnitude,
+//! which is what made it look safe where the three bounded attempts above were not. It cost
+//! 20%: 89.1 seconds of node CPU for a Qwen3-4B reply became 104.6, 115.7, 109.0. LLVM
+//! already lowers a widened `i16 * i64` to a single widening multiply, so the split traded
+//! one multiply for two plus a shift and a cast, and the vectorisation it was meant to
+//! unlock never arrived.
+//!
+//! Which leaves the arithmetic where it is. What does scale is threads: 88.0ms at one, 46.0
+//! at two, 23.3 at four, 12.2 at eight, near-linear, because the kernel is bound by forming
+//! products rather than by fetching weights. Cores are the lever, not cleverness here.
+//!
 //! This mirrors the representation used by the Solidity implementation it is meant to
 //! replace, so outputs can be compared directly rather than approximately.
 
