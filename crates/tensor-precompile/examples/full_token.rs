@@ -334,10 +334,7 @@ fn main() {
         m
     };
 
-    let step_sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,\
-uint32,uint32,uint32),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
-(bytes,bytes)),uint16)";
+    let step_sig = tensor_precompile::abi::step();
 
     println!(
         "{:<10} {:>14} {:>10} {:>10}",
@@ -376,10 +373,7 @@ uint32,uint32,uint32),\
         }
 
         // Final norm, classifier, argmax.
-        let mut d = keccak256(
-            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),bytes,address,uint32,uint32)",
-        )[..4]
-            .to_vec();
+        let mut d = keccak256(tensor_precompile::abi::emit_token().as_bytes())[..4].to_vec();
         d.extend_from_slice(&ID);
         for f in [dim, hidden, n_heads, n_kv, head_dim, positions, n_layers] {
             d.extend_from_slice(&word(f as u64));

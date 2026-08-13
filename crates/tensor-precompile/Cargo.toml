@@ -16,4 +16,5 @@ tensor-model = { path = "../tensor-model" }
 revm = "42"
 
 [dev-dependencies]
+serde_json = "1"
 tensor-model = { path = "../tensor-model" }

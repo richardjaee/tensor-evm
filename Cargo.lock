@@ -3385,6 +3385,7 @@ dependencies = [
  "alloy-signer",
  "alloy-signer-local",
  "serde_json",
+ "tensor-precompile",
  "ureq",
 ]
 
@@ -3422,6 +3423,7 @@ name = "tensor-precompile"
 version = "0.1.0"
 dependencies = [
  "revm",
+ "serde_json",
  "tensor-kernel",
  "tensor-model",
 ]

@@ -536,11 +536,11 @@ fn run() -> Result<(), String> {
         }
     };
 
-    let cfg_ty = "(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32)";
-    let layer_ty = "(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,\
-uint32,uint32,uint32)";
-    let step_sig = format!("step(bytes32,({cfg_ty},{layer_ty}[],(bytes,bytes)),uint16)");
-    let emit_sig = format!("emitToken(bytes32,{cfg_ty},bytes,address,uint32,uint32)");
+    // Shared with the examples, and checked against the compiled contract by a test in
+    // tensor-precompile. Four hand-copied versions of these strings is how three examples
+    // ended up hashing a selector the contract had stopped answering to.
+    let step_sig = tensor_precompile::abi::step();
+    let emit_sig = tensor_precompile::abi::emit_token();
     // A session id nobody else is using. Sessions are owned and keyed, so two generations
     // can run at once without one destroying the other.
     let id = [0x7au8; 32];

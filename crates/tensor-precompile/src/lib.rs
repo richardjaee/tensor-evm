@@ -313,6 +313,7 @@ mod tests {
     }
 }
 
+pub mod abi;
 pub mod state;
 
 pub mod activation;

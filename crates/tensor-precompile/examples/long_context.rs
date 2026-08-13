@@ -326,10 +326,7 @@ fn main() {
         model.extend_from_slice(&layers);
         model.extend_from_slice(&rope);
 
-        let sig = "step(bytes32,((uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,\
-uint32,uint32,uint32),\
-(address,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32,uint32)[],\
-(bytes,bytes)),uint16)";
+        let sig = tensor_precompile::abi::step();
         let mut d = keccak256(sig.as_bytes())[..4].to_vec();
         d.extend_from_slice(&ID);
         d.extend_from_slice(&word(3 * 32));
@@ -337,10 +334,7 @@ uint32,uint32,uint32),\
         d.extend_from_slice(&model);
         let (_, step_gas) = send(&mut db, d, &format!("step at {pos}"));
 
-        let mut d = keccak256(
-            b"emitToken(bytes32,(uint32,uint32,uint32,uint32,uint32,uint32,uint32,int256,uint32,uint32,uint32),bytes,address,uint32,uint32)",
-        )[..4]
-            .to_vec();
+        let mut d = keccak256(tensor_precompile::abi::emit_token().as_bytes())[..4].to_vec();
         d.extend_from_slice(&ID);
         config(&mut d);
         // Three words further along than it was, the config having grown by three.
