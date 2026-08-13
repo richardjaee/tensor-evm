@@ -391,7 +391,9 @@ mod batch_tests {
 
     /// Deterministic filler; the values only need to be varied and reproducible.
     fn fill(n: usize, seed: i64) -> Vec<i64> {
-        (0..n).map(|i| ((i as i64 * 2654435761 + seed) % 4096) - 2048).collect()
+        (0..n)
+            .map(|i| ((i as i64 * 2654435761 + seed) % 4096) - 2048)
+            .collect()
     }
 
     /// Batching must be a performance change and nothing else. If a batched row differed
@@ -400,7 +402,9 @@ mod batch_tests {
     #[test]
     fn batch_matches_one_at_a_time() {
         for &(rows, cols, batch) in &[(1, 1, 1), (7, 5, 3), (64, 96, 4), (300, 700, 8)] {
-            let w: Vec<i16> = (0..rows * cols).map(|i| ((i * 7919) % 601) as i16 - 300).collect();
+            let w: Vec<i16> = (0..rows * cols)
+                .map(|i| ((i * 7919) % 601) as i16 - 300)
+                .collect();
             let scales: Vec<i8> = (0..rows).map(|r| (r % 5) as i8).collect();
             let xs = fill(batch * cols, 11);
 
@@ -409,10 +413,18 @@ mod batch_tests {
 
             for b in 0..batch {
                 let mut want = vec![0i64; rows];
-                matmul(&w, &scales, &xs[b * cols..(b + 1) * cols], rows, cols, &mut want);
+                matmul(
+                    &w,
+                    &scales,
+                    &xs[b * cols..(b + 1) * cols],
+                    rows,
+                    cols,
+                    &mut want,
+                );
                 for r in 0..rows {
                     assert_eq!(
-                        got[r * batch + b], want[r],
+                        got[r * batch + b],
+                        want[r],
                         "rows {rows} cols {cols} batch {batch}, row {r} entry {b}"
                     );
                 }
@@ -429,16 +441,31 @@ mod batch_tests {
     #[ignore]
     fn what_batching_buys() {
         use std::time::Instant;
-        for &(rows, cols, name) in &[(2560usize, 2560usize, "attention proj"), (9728, 2560, "ffn gate")] {
-            let w: Vec<i16> = (0..rows * cols).map(|i| ((i * 7919) % 601) as i16 - 300).collect();
+        for &(rows, cols, name) in &[
+            (2560usize, 2560usize, "attention proj"),
+            (9728, 2560, "ffn gate"),
+        ] {
+            let w: Vec<i16> = (0..rows * cols)
+                .map(|i| ((i * 7919) % 601) as i16 - 300)
+                .collect();
             let scales: Vec<i8> = (0..rows).map(|r| (r % 5) as i8).collect();
-            println!("\n{name}  {rows}x{cols}  ({:.1} MB of weights)", weight_bytes(rows, cols) as f64 / 1e6);
+            println!(
+                "\n{name}  {rows}x{cols}  ({:.1} MB of weights)",
+                weight_bytes(rows, cols) as f64 / 1e6
+            );
             for &batch in &[1usize, 4, 16] {
                 let xs = fill(batch * cols, 3);
                 let t = Instant::now();
                 let mut one = vec![0i64; rows];
                 for b in 0..batch {
-                    matmul(&w, &scales, &xs[b * cols..(b + 1) * cols], rows, cols, &mut one);
+                    matmul(
+                        &w,
+                        &scales,
+                        &xs[b * cols..(b + 1) * cols],
+                        rows,
+                        cols,
+                        &mut one,
+                    );
                 }
                 let sep = t.elapsed();
                 let t = Instant::now();

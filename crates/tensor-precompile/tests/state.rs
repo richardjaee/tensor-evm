@@ -531,8 +531,9 @@ fn the_fused_feed_forward_equals_the_calls_it_replaces() {
         }
 
         let tagged_blob = tagged(blob);
-        let mut code_of =
-            |_a: Address| -> Result<(Bytes, bool), String> { Ok((tagged_blob.clone().into(), false)) };
+        let mut code_of = |_a: Address| -> Result<(Bytes, bool), String> {
+            Ok((tagged_blob.clone().into(), false))
+        };
         let got = match ffn_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
             Outcome::Return(bytes, _) => bytes
                 .chunks_exact(8)
