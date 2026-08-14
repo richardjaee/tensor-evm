@@ -14,7 +14,7 @@
 //! Everything is Q32 fixed point. Nothing here uses floating point, and none of it may:
 //! the whole design rests on every node computing identical bits.
 
-use crate::ops::{add_into, rmsnorm, rope, scaled_dot, softmax, swiglu};
+use crate::ops::{add_into, rmsnorm, rope, scaled_dot_kv, softmax, swiglu};
 use tensor_kernel::fixed::ONE;
 use tensor_kernel::matmul;
 
@@ -134,9 +134,36 @@ impl Rope {
 /// Laid out as `[layer][pos][kv_width]`. This is the state that grows with generation, and
 /// at long context it dominates everything else a chain would have to hold — which is why
 /// it is the thing to compress first if this design is ever pushed to real sequence lengths.
+/// Fractional bits a cached key or value keeps.
+///
+/// Activations are Q32 in `i64` everywhere else; the cache alone is Q16 in `i32`. It is the
+/// one buffer big enough for its width to be the cost rather than a detail — depositing it
+/// is two thirds of a step at position zero, at 200 gas a byte, and halving the element
+/// takes 59M gas off a Qwen3-4B position.
+///
+/// Q16 rather than something tighter because range has to hold against models and prompts
+/// nobody has run yet. Measured on real Qwen3-0.6B, keys reach 439.7 and values 39.1; Q16
+/// in `i32` spans ±32,768, which is 74x over the worst of that, where Q20 would leave 4.6x.
+/// This project's kernel already records three bounds that were wrong precisely because
+/// they assumed activations stayed small, and an overflow here is a consensus failure
+/// rather than a rounding error. The precision given up is ~1.5e-5 absolute.
+pub const KV_FRAC: u32 = 16;
+
+/// Q32 down to Q16, saturating. See [`KV_FRAC`] for why this cannot wrap.
+#[inline]
+pub fn narrow_kv(x: i64) -> i32 {
+    (x >> (32 - KV_FRAC)).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Q16 back up to Q32, exactly.
+#[inline]
+pub fn widen_kv(x: i32) -> i64 {
+    (x as i64) << (32 - KV_FRAC)
+}
+
 pub struct KvCache {
-    pub k: Vec<i64>,
-    pub v: Vec<i64>,
+    pub k: Vec<i32>,
+    pub v: Vec<i32>,
     kv_width: usize,
     seq_len: usize,
 }
@@ -236,8 +263,12 @@ pub fn forward_layer(
     }
 
     let at = kv.slot(layer, pos);
-    kv.k[at..at + cfg.kv_width()].copy_from_slice(&s.k);
-    kv.v[at..at + cfg.kv_width()].copy_from_slice(&s.v);
+    for (dst, &src) in kv.k[at..at + cfg.kv_width()].iter_mut().zip(&s.k) {
+        *dst = narrow_kv(src);
+    }
+    for (dst, &src) in kv.v[at..at + cfg.kv_width()].iter_mut().zip(&s.v) {
+        *dst = narrow_kv(src);
+    }
 
     let scale = cfg.attn_scale();
     let group = cfg.group();
@@ -248,7 +279,7 @@ pub fn forward_layer(
         // Causal: only positions up to and including this one are visible.
         for t in 0..=pos {
             let base = kv.slot(layer, t) + kvh * hs;
-            s.scores[t] = scaled_dot(q, &kv.k[base..base + hs], scale);
+            s.scores[t] = scaled_dot_kv(q, &kv.k[base..base + hs], scale);
         }
         softmax(&mut s.scores[..=pos]);
 
@@ -258,7 +289,7 @@ pub fn forward_layer(
             let base = kv.slot(layer, t) + kvh * hs;
             let weight = s.scores[t] as i128;
             for (o, v) in out.iter_mut().zip(&kv.v[base..base + hs]) {
-                *o += ((weight * *v as i128) >> 32) as i64;
+                *o += ((weight * widen_kv(*v) as i128) >> 32) as i64;
             }
         }
     }

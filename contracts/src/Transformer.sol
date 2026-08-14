@@ -280,7 +280,10 @@ library Transformer {
             x,
             kv,
             uint256(b.c.dim) * 8,
-            kvWidth(b.c) * 8,
+            // The cache is Q16 in four bytes where the residual is Q32 in eight. Halving
+            // the element halves what each position deposits and what every later position
+            // reads back, and the deposit is two thirds of a step at position zero.
+            kvWidth(b.c) * 4,
             pos
         );
         _mark(b, g);
@@ -403,6 +406,36 @@ library Transformer {
     ///      The cache is exactly `pos + 1` positions deep when attention reads it, which is
     ///      what makes the mask causal: the precompile has no notion of position and
     ///      attends to everything it is given.
+    /// @dev Q32 in eight bytes down to Q16 in four, saturating, matching `narrow_kv` in the
+    ///      Rust reference. The fused layer returns its cache entry already narrowed; this is
+    ///      the mixture path, which still assembles keys and values from separate matmuls and
+    ///      so has to narrow them itself.
+    ///
+    ///      Written through a padded scratch buffer because each element is stored with a
+    ///      word-wide `mstore`, which writes 32 bytes to place 4. Ascending order means every
+    ///      store preserves the four bytes written before it, and the slack absorbs the
+    ///      overrun of the last one rather than letting it run into the next allocation.
+    function _narrowKv(bytes memory src) private pure returns (bytes memory out) {
+        uint256 n = src.length / 8;
+        bytes memory buf = new bytes(n * 4 + 32);
+        out = new bytes(n * 4);
+        assembly ("memory-safe") {
+            let s := add(src, 0x20)
+            let d := add(buf, 0x20)
+            let hi := sub(shl(31, 1), 1)
+            let lo := sub(0, shl(31, 1))
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                // The value occupies the top eight bytes of the loaded word, so shifting
+                // right by 192 sign-extends it into a full-width signed integer.
+                let val := sar(16, sar(192, mload(add(s, mul(i, 8)))))
+                if sgt(val, hi) { val := hi }
+                if slt(val, lo) { val := lo }
+                mstore(add(d, mul(i, 4)), shl(224, val))
+            }
+            mcopy(add(out, 0x20), add(buf, 0x20), mul(n, 4))
+        }
+    }
+
     function _extendCache(
         Block memory b,
         Kv memory kv,
@@ -417,7 +450,9 @@ library Transformer {
         k = _normRope(b, rope, k, b.c.nKv, b.l.kNorm);
         bytes memory v = Tensor.matmul(b.s, kvw, c.dim, b.l.at, b.l.v, normed);
 
-        uint256 at = pos * uint256(kvw) * 8;
+        k = _narrowKv(k);
+        v = _narrowKv(v);
+        uint256 at = pos * uint256(kvw) * 4;
         bytes memory kc = kv.k;
         bytes memory vc = kv.v;
         assembly ("memory-safe") {

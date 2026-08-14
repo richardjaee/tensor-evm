@@ -155,10 +155,11 @@ contract Generator {
         uint32 pos,
         uint256 kvw
     ) private view returns (Transformer.Kv memory kv) {
-        uint256 width = kvw * 8;
+        // Four bytes an entry, not eight: the cache is Q16 where activations are Q32.
+        uint256 width = kvw * 4;
         kv = Transformer.Kv({
-            k: Tensor.alloc((uint256(pos) + 1) * kvw),
-            v: Tensor.alloc((uint256(pos) + 1) * kvw)
+            k: new bytes((uint256(pos) + 1) * width),
+            v: new bytes((uint256(pos) + 1) * width)
         });
         // One deployment per earlier position, read whole. The account access dominates
         // the copy — 2,600 against 3 gas a word — so this grows with context in account
@@ -188,7 +189,7 @@ contract Generator {
     ) private {
         // This position's slice only. Keys and values go into one deployment so a read
         // costs one account access rather than two.
-        uint256 width = kvw * 8;
+        uint256 width = kvw * 4;
         bytes memory blob = new bytes(width * 2);
         uint256 from = uint256(pos) * width;
         bytes memory k = kv.k;

@@ -992,7 +992,9 @@ pub fn attn_proj_state_with(
     );
     let q_len = heads_u * hs_u;
     let cache = pos_u * n_kv_u * hs_u;
-    if input.len() != ATTN_PROJ_HEADER + (q_len + cache + cache) * 8 {
+    // The query is Q32 in eight bytes; the cache is Q16 in four, the width it is deposited
+    // and read back at.
+    if input.len() != ATTN_PROJ_HEADER + q_len * 8 + cache * 2 * 4 {
         return Ok(Outcome::Revert);
     }
 
@@ -1011,9 +1013,22 @@ pub fn attn_proj_state_with(
             .map(|c| i64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
             .collect()
     };
+    // Widened back to Q32 on the way in, exactly as the reference does when it reads its
+    // own cache, so attending to a narrowed cache and attending to the values it was made
+    // from are the same computation.
+    let read_kv = |at_byte: usize, n: usize| -> Vec<i64> {
+        input[at_byte..at_byte + n * 4]
+            .chunks_exact(4)
+            .map(|c| {
+                tensor_model::qwen3::widen_kv(i32::from_be_bytes(
+                    c.try_into().expect("chunks_exact(4)"),
+                ))
+            })
+            .collect()
+    };
     let q = read(ATTN_PROJ_HEADER, q_len);
-    let k = read(ATTN_PROJ_HEADER + q_len * 8, cache);
-    let v = read(ATTN_PROJ_HEADER + (q_len + cache) * 8, cache);
+    let k = read_kv(ATTN_PROJ_HEADER + q_len * 8, cache);
+    let v = read_kv(ATTN_PROJ_HEADER + q_len * 8 + cache * 4, cache);
 
     let attn = crate::attention::attend(q, k, v, heads_u, n_kv_u, hs_u, pos_u);
 
@@ -1137,7 +1152,10 @@ pub fn layer_state_with(
     // which the last is ignored on the way in and returned filled. That is the shape a
     // contract already holds, so taking it avoids a copy of the whole cache, which is a
     // good part of what fusing the layer was for.
-    let want = LAYER_HEADER + (dim + half * 2 + positions * kvw * 2) * 8;
+    // The residual and the rotary row are Q32 in eight bytes; the cache is Q16 in four.
+    // Halving the element halves what a position deposits and what every later position
+    // reads back, and depositing this cache is two thirds of a step at position zero.
+    let want = LAYER_HEADER + (dim + half * 2) * 8 + positions * kvw * 2 * 4;
     if input.len() != want {
         return Ok(Outcome::Revert);
     }
@@ -1173,11 +1191,15 @@ pub fn layer_state_with(
     let mut x = read(LAYER_HEADER, dim);
     let cos = read(LAYER_HEADER + dim * 8, half);
     let sin = read(LAYER_HEADER + (dim + half) * 8, half);
-    let past_k = read(LAYER_HEADER + (dim + half * 2) * 8, past * kvw);
-    let past_v = read(
-        LAYER_HEADER + (dim + half * 2 + positions * kvw) * 8,
-        past * kvw,
-    );
+    let read_kv = |from: usize, n: usize| -> Vec<i32> {
+        input[from..from + n * 4]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes(c.try_into().expect("chunks_exact(4)")))
+            .collect()
+    };
+    let kv_base = LAYER_HEADER + (dim + half * 2) * 8;
+    let past_k = read_kv(kv_base, past * kvw);
+    let past_v = read_kv(kv_base + positions * kvw * 4, past * kvw);
 
     // Every tensor out of one blob, through the same resolver everything else uses.
     let shapes = [
@@ -1264,14 +1286,17 @@ pub fn layer_state_with(
         return Ok(Outcome::OutOfGas);
     }
 
-    // The residual stream, then the cache entry this position added.
-    let mut packed = Vec::with_capacity((dim + kvw * 2) * 8);
-    for v in x
+    // The residual stream at eight bytes a value, then the cache entry this position added
+    // at four, matching the widths this call was handed.
+    let mut packed = Vec::with_capacity(dim * 8 + kvw * 2 * 4);
+    for v in x.iter() {
+        packed.extend_from_slice(&v.to_be_bytes());
+    }
+    for e in kv.k[past * kvw..(past + 1) * kvw]
         .iter()
-        .chain(&kv.k[past * kvw..(past + 1) * kvw])
         .chain(&kv.v[past * kvw..(past + 1) * kvw])
     {
-        packed.extend_from_slice(&v.to_be_bytes());
+        packed.extend_from_slice(&e.to_be_bytes());
     }
     Ok(Outcome::Return(packed, total))
 }

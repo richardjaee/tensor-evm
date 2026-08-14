@@ -567,9 +567,26 @@ fn fused_attention_equals_attention_then_projection() {
                 .map(|i| ((i as i64 * 40503 + seed) % 131071) - 65535)
                 .collect()
         };
-        let (q, k, v) = (vals(q_len, 7), vals(cache, 11), vals(cache, 13));
+        // Keys and values are scaled up before narrowing so the Q16 round trip keeps
+        // something: at the raw magnitudes these seeds produce, shedding sixteen fractional
+        // bits would leave nearly every entry zero and the comparison would prove nothing.
+        let q = vals(q_len, 7);
+        let narrow = |v: Vec<i64>| -> Vec<i32> {
+            v.into_iter()
+                .map(|x| tensor_model::qwen3::narrow_kv(x << 16))
+                .collect()
+        };
+        let (kn, vn) = (narrow(vals(cache, 11)), narrow(vals(cache, 13)));
+        let widen = |v: &[i32]| -> Vec<i64> {
+            v.iter()
+                .copied()
+                .map(tensor_model::qwen3::widen_kv)
+                .collect()
+        };
+        let (k, v) = (widen(&kn), widen(&vn));
 
-        // The two calls, separately.
+        // The two calls, separately. The reference is given what the cache actually holds,
+        // which is the narrowed values widened back, not the values they were made from.
         let attn = attend(q.clone(), k.clone(), v.clone(), heads, n_kv, hs, positions);
         let mut want = vec![0i64; dim];
         matmul_scalar(&ow, &os, &attn, dim, q_len, &mut want);
@@ -580,10 +597,13 @@ fn fused_attention_equals_attention_then_projection() {
         }
         input.extend_from_slice(WEIGHTS.as_slice());
         input.extend_from_slice(&0u32.to_be_bytes());
-        for value in q.iter().chain(&k).chain(&v) {
+        for value in q.iter() {
             input.extend_from_slice(&value.to_be_bytes());
         }
-        assert_eq!(input.len(), ATTN_PROJ_HEADER + (q_len + cache * 2) * 8);
+        for e in kn.iter().chain(&vn) {
+            input.extend_from_slice(&e.to_be_bytes());
+        }
+        assert_eq!(input.len(), ATTN_PROJ_HEADER + q_len * 8 + cache * 2 * 4);
 
         let blob = tagged(weight_blob(dim, q_len, &os, &ow));
         let mut code_of =
@@ -664,7 +684,13 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
     };
     let (x0, cos, sin) = (vals(dim, 1), vals(half, 2), vals(half, 3));
     // With room for the entry this call computes, as a contract's buffer has.
-    let (pk, pv) = (vals(positions * kvw, 4), vals(positions * kvw, 5));
+    // The cache is Q16 in i32, narrower than the Q32 activations around it.
+    let narrow =
+        |v: Vec<i64>| -> Vec<i32> { v.into_iter().map(tensor_model::qwen3::narrow_kv).collect() };
+    let (pk, pv) = (
+        narrow(vals(positions * kvw, 4)),
+        narrow(vals(positions * kvw, 5)),
+    );
 
     // The reference, called directly.
     let t = |i: usize, rows: usize, cols: usize| QTensor {
@@ -724,26 +750,35 @@ fn the_whole_layer_precompile_equals_calling_the_reference() {
         input.extend_from_slice(&(*o as u32).to_be_bytes());
     }
     input.extend_from_slice(&cfg.rms_eps.to_be_bytes());
-    for v in x0.iter().chain(&cos).chain(&sin).chain(&pk).chain(&pv) {
+    for v in x0.iter().chain(&cos).chain(&sin) {
         input.extend_from_slice(&v.to_be_bytes());
+    }
+    for e in pk.iter().chain(&pv) {
+        input.extend_from_slice(&e.to_be_bytes());
     }
     assert_eq!(
         input.len(),
-        LAYER_HEADER + (dim + half * 2 + positions * kvw * 2) * 8
+        LAYER_HEADER + (dim + half * 2) * 8 + positions * kvw * 2 * 4
     );
 
     let tagged_blob = tagged(blob);
     let mut code_of =
         |_a: Address| -> Result<(Bytes, bool), String> { Ok((tagged_blob.clone().into(), false)) };
-    let got: Vec<i64> = match layer_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
-        Outcome::Return(bytes, _) => bytes
-            .chunks_exact(8)
-            .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
-            .collect(),
+    let out = match layer_state_with(&mut code_of, &input, 1_000_000_000).expect("runs") {
+        Outcome::Return(bytes, _) => bytes,
         _ => panic!("the whole-layer precompile refused a well-formed call"),
     };
+    // The residual at eight bytes a value, the cache entry it appended at four.
+    let got: Vec<i64> = out[..dim * 8]
+        .chunks_exact(8)
+        .map(|c| i64::from_be_bytes(c.try_into().expect("eight")))
+        .collect();
+    let got_kv: Vec<i32> = out[dim * 8..]
+        .chunks_exact(4)
+        .map(|c| i32::from_be_bytes(c.try_into().expect("four")))
+        .collect();
 
-    assert_eq!(&got[..dim], &want_x[..], "residual stream");
-    assert_eq!(&got[dim..dim + kvw], &want_k[..], "cache key");
-    assert_eq!(&got[dim + kvw..], &want_v[..], "cache value");
+    assert_eq!(&got[..], &want_x[..], "residual stream");
+    assert_eq!(&got_kv[..kvw], &want_k[..], "cache key");
+    assert_eq!(&got_kv[kvw..], &want_v[..], "cache value");
 }

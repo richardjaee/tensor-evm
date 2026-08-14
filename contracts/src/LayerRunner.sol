@@ -64,9 +64,10 @@ contract LayerRunner {
         // The cache holds exactly the positions this call writes. A generation loop carries
         // it between calls; measuring one block does not need to, and pretending otherwise
         // would hide the cache's cost rather than reveal it.
-        uint256 depth = (pos + 1) * Transformer.kvWidth(c);
+        // Four bytes an entry: the cache is Q16 where activations are Q32.
+        uint256 depth = (pos + 1) * Transformer.kvWidth(c) * 4;
         Transformer.Kv memory kv =
-            Transformer.Kv({k: Tensor.alloc(depth), v: Tensor.alloc(depth)});
+            Transformer.Kv({k: new bytes(depth), v: new bytes(depth)});
 
         // Sized before the block is assembled, so the expression does not have to live on
         // the stack alongside everything else the constructor needs.

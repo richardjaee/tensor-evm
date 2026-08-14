@@ -117,6 +117,20 @@ pub fn add_into(dst: &mut [i64], src: &[i64]) {
 /// Scaled dot product of two Q32 vectors, returning Q32.
 ///
 /// `scale` is Q32 and multiplies the result — for attention it carries `1/sqrt(head_dim)`.
+/// [`scaled_dot`] against a cache held at Q16 in `i32`.
+///
+/// The widening is exact and happens per element rather than by materialising a converted
+/// slice, so narrowing the cache costs no allocation on the path that reads it every
+/// position of every head.
+pub fn scaled_dot_kv(a: &[i64], b: &[i32], scale: i64) -> i64 {
+    assert_eq!(a.len(), b.len(), "widths must match");
+    let mut acc: i128 = 0;
+    for i in 0..a.len() {
+        acc += (a[i] as i128) * (crate::qwen3::widen_kv(b[i]) as i128); // Q64
+    }
+    (((acc >> F) * scale as i128) >> F) as i64
+}
+
 pub fn scaled_dot(a: &[i64], b: &[i64], scale: i64) -> i64 {
     assert_eq!(a.len(), b.len(), "widths must match");
     let mut acc: i128 = 0;
