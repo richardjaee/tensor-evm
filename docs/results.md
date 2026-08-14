@@ -82,6 +82,43 @@ A single core saturates near 40 GB/s and stays there regardless of shape, which 
 signature of a memory-bound kernel rather than a compute-bound one. Parallelism only helps
 once the working set exceeds cache — hence the threshold below.
 
+**This stopped being true when the accumulator widened to `i128`.** The table above was
+measured with products formed in `i64`, and `tensor-kernel`'s own header notes that `i128`
+costs roughly a quarter of the throughput. It cost more than that: the kernel is now bound
+by forming products, not by fetching weights, and three separate measurements say so.
+
+Batching sixteen activation vectors through one weight matrix reads the weights once
+instead of sixteen times. If loads were the cost that is most of a 16×. On Qwen3-4B's own
+shapes:
+
+| shape | 16 separate | batched | |
+|---|---|---|---|
+| attention proj 2560×2560, 13.1 MB | 6.1 ms | 3.8 ms | 1.62× |
+| ffn gate 9728×2560, 49.8 MB | 13.1 ms | 11.3 ms | 1.16× |
+
+Both do the same 398M multiply-accumulates. Collapsing sixteen passes over 49.8 MB into one
+saved 1.8 ms, so the reads were never what was being paid for.
+
+Thread scaling says the same thing from the other side — a bandwidth-bound kernel plateaus
+when the memory system saturates, and this one does not:
+
+| threads | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| ffn gate, batch 16 | 88.0 ms | 46.0 ms | 23.3 ms | 12.2 ms |
+
+Near-linear to 8, which is this machine's performance-core count. **Cores are the lever.**
+
+And the arithmetic does not want cleverness. Splitting the multiply to avoid the 128-bit one
+— `x = (x >> 32) * 2^32 + (x as u32)`, exact for negative `x` and assuming nothing about
+magnitude, unlike the three bounded attempts the kernel header records — ran 20% slower:
+89.1 s of node CPU for a Qwen3-4B reply became 104.6, 115.7, 109.0. LLVM already lowers a
+widened `i16 * i64` to a single widening multiply.
+
+The practical consequences are that prefill batching is not worth its contract surface, that
+int8 weights would not help either since quantising operands does not reduce the number of
+multiply-accumulates, and that a machine with more performance cores is the cheapest real
+speedup available and needs no code change at all.
+
 ### Speedup
 
 Two comparisons, measuring different things, both worth stating.

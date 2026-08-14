@@ -150,6 +150,18 @@ entire story, so the governing number is **bandwidth, not FLOPs**:
 seconds per token ≈ active_parameters × 2 bytes / achieved GB/s
 ```
 
+This governs what has to be *stored* and where, which is what the rest of this section is
+about, and it is why weights live in contract code. It stopped predicting *runtime* when the
+accumulator widened to `i128`. The kernel is now bound by forming products rather than by
+fetching weights — batching sixteen positions through one weight matrix reads the weights
+one time instead of sixteen and saves 14%, and thread scaling is near-linear where a
+bandwidth-bound kernel would plateau. See `results.md`, "196 GB/s at the large shapes".
+
+Worth stating because the formula is persuasive and was wrong four times in one afternoon:
+it predicted prefill batching would recover most of a 16× (it recovers 1.16–1.9×), that
+splitting the 128-bit multiply would pay (20% slower), that int8 weights would help (they do
+not reduce multiply-accumulates), and that more cores would not (they scale near-linearly).
+
 `crates/tensor-kernel`'s benchmark measures the right-hand side directly and projects the
 left. Everything downstream is calibrated against that measurement rather than estimated.
 
