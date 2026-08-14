@@ -74,6 +74,24 @@ overhead left to remove. This is what the operation costs in the EVM.
 | Qwen3-32B dim 5120 | 50.0 | — | 161.2 | — |
 | Qwen3-32B ffn | 250.0 | — | 196.3 | — |
 
+### Narrowing the kv cache
+
+Keys and values are held at Q16 in `i32` where every other activation is Q32 in `i64`.
+Measured on the live chain, Qwen3-4B, gas for one position of a real generation:
+
+| | position 0 | position 1 |
+|---|---|---|
+| Q32 in i64 | 166,693,150 | 156,140,042 |
+| Q16 in i32 | 107,358,450 | 96,684,252 |
+| | −35.6% | **−38.1%** |
+
+59.46M gas a position, against 59.0M predicted from 36 layers × 8,192 bytes saved × 200 gas
+a byte — 0.8% out. The same cost model put Qwen3-0.6B at 588,857 against 586,688 measured.
+
+The format was chosen from measurement rather than headroom-by-assumption: on real
+Qwen3-0.6B keys reach 439.7 and values 39.1, and Q16 in `i32` spans ±32,768. Both float64
+argmax checks still pass, as do the mixture end-to-end tests.
+
 **196 GB/s at the large shapes** — about 72% of the machine's theoretical peak, so the
 kernel is genuinely memory-bound rather than leaving headroom on the table. At two bytes
 per weight that is **98 billion multiply-accumulates per second**.
