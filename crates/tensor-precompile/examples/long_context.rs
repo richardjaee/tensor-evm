@@ -388,9 +388,19 @@ fn main() {
          context from account touches alone, so a long prompt costs more per token than a\n\
          short one by a margin that grows without bound.\n\
          \n\
-         Two things would flatten it. Packing several positions into one deployment trades\n\
-         touches for rewriting, and is only worth it in batches. Latent attention shrinks\n\
-         what is read at all. Neither is a change to this contract; both are changes to what\n\
-         the cache is."
+         Packing several positions into one deployment is the obvious answer and it loses.\n\
+         An entry has to be readable by the very next position, so it is written once alone\n\
+         and again inside its pack, and a second write of an entry costs 200 gas a byte\n\
+         against the 2,600 a saved touch is worth. Packing pays only once an entry is read\n\
+         enough times to earn that back: past 90 positions at this toy width, past 2,881 for\n\
+         Qwen3-4B, whose 1,024-wide cache makes an entry 16KB. Nobody is running 2,881\n\
+         positions here.\n\
+         \n\
+         What is left is the entry itself. Two thirds of a step at position zero is depositing\n\
+         this cache, at 200 gas a byte for values held as Q32 in i64, and both the deposit and\n\
+         every later read scale with that width. Narrowing what a cached key and value are\n\
+         worth costs, or dropping to latent attention so there is less to hold, changes the\n\
+         term that actually dominates. Neither is a change to this contract; both are changes\n\
+         to what the cache is."
     );
 }
