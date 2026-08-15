@@ -93,11 +93,19 @@ Qwen3-0.6B keys reach 439.7 and values 39.1, and Q16 in `i32` spans ±32,768. Bo
 argmax checks still pass, as do the mixture end-to-end tests.
 
 This changed the determinism digest, necessarily — the model computes something different
-now — so the three-machine agreement below was established for the value it replaced. The
-new digest has been confirmed on aarch64 and on an x86_64 build under Rosetta, one and three
-threads, all four digests identical. That exercises x86_64 instruction selection and
-vectorisation, which is where a divergence would come from, but it is one physical CPU:
-the Intel and AMD runs have not been repeated.
+now — so the agreement below had to be re-established rather than inherited. It was, on the
+same three architectures:
+
+| | OVERALL |
+|---|---|
+| Apple M4, aarch64 | `168febfc534015d705e80c45e8543c51d9629c14b086fd1f9550f8edaea5f589` |
+| Intel Xeon @ 2.80GHz | `168febfc534015d705e80c45e8543c51d9629c14b086fd1f9550f8edaea5f589` |
+| AMD EPYC 7B13 | `168febfc534015d705e80c45e8543c51d9629c14b086fd1f9550f8edaea5f589` |
+
+One and three threads on each, all four component digests identical as well. The two x86_64
+machines were `n2-standard-4` and `n2d-standard-4` instances, built from source and torn down
+after; an x86_64 build under Rosetta agrees too, which is the cheap way to catch a codegen
+divergence without leaving the desk.
 
 **196 GB/s at the large shapes** — about 72% of the machine's theoretical peak, so the
 kernel is genuinely memory-bound rather than leaving headroom on the table. At two bytes

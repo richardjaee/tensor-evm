@@ -49,13 +49,9 @@ step "formatting" cargo fmt --all --check
 # rounding rule, a shift, an accumulator width — moves it, and moving it is exactly the
 # event that would fork a chain, so it should require someone to consciously update a
 # constant rather than pass quietly. Narrowing the kv cache to Q16 changed what the model
-# computes and so changed this value; the three-architecture agreement recorded in
-# docs/results.md was established for the digest it replaces.
-#
-# Re-confirmed so far on aarch64 and on an x86_64 build run under Rosetta, at one and three
-# threads, all four digests identical. That covers the risk worth covering — x86_64 codegen
-# selects different instructions and different vectorisation, and that is what would diverge
-# — but it is still one physical CPU. Real Intel and AMD silicon has not re-run this.
+# computes and so changed this value, and it has been re-established the same way the one it
+# replaces was: aarch64 on an Apple M4, an Intel Xeon at 2.80GHz, and an AMD EPYC 7B13, at
+# one and three threads on each. All four digests identical everywhere. See docs/results.md.
 DIGEST=168febfc534015d705e80c45e8543c51d9629c14b086fd1f9550f8edaea5f589
 EXPECT="$DIGEST" step "determinism digest" \
   cargo run --release --quiet -p tensor-model --bin determinism
