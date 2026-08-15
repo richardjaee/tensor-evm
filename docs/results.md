@@ -92,6 +92,13 @@ The format was chosen from measurement rather than headroom-by-assumption: on re
 Qwen3-0.6B keys reach 439.7 and values 39.1, and Q16 in `i32` spans ±32,768. Both float64
 argmax checks still pass, as do the mixture end-to-end tests.
 
+This changed the determinism digest, necessarily — the model computes something different
+now — so the three-machine agreement below was established for the value it replaced. The
+new digest has been confirmed on aarch64 and on an x86_64 build under Rosetta, one and three
+threads, all four digests identical. That exercises x86_64 instruction selection and
+vectorisation, which is where a divergence would come from, but it is one physical CPU:
+the Intel and AMD runs have not been repeated.
+
 **196 GB/s at the large shapes** — about 72% of the machine's theoretical peak, so the
 kernel is genuinely memory-bound rather than leaving headroom on the table. At two bytes
 per weight that is **98 billion multiply-accumulates per second**.
