@@ -49,6 +49,16 @@ def main():
         default=[9707, 11, 847, 829, 374],
         help="token ids to run through the model",
     )
+    ap.add_argument(
+        "--batched-reference",
+        action="store_true",
+        help="compute the float64 reference masked-and-batched; needed past ~64 positions",
+    )
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="read tensors from disk per use; needed for models past about 1B",
+    )
     a = ap.parse_args()
 
     cfg = json.load(open(a.config))
@@ -70,7 +80,12 @@ def main():
     print(f"  prompt: {P} tokens {ids}")
 
     print("  reading checkpoint...")
-    t = read_safetensors(a.model)
+    if a.stream:
+        from ppl_f64 import Lazy
+
+        t = Lazy(a.model)
+    else:
+        t = read_safetensors(a.model)
     g = lambda n: t[n].astype(np.float64)
 
     os.makedirs(a.out, exist_ok=True)
@@ -91,7 +106,10 @@ def main():
     # Only the rows the prompt touches. The full table is 311 MB quantised and the forward
     # pass reads five rows of it; exporting all of it would make the artifact unusable for
     # no gain.
-    emb = g("model.embed_tokens.weight")
+    # Left in its stored precision. It is written out as Q32 rows and handed to the
+    # quantiser as float32, neither of which wants a 3.1 GB float64 copy of a table
+    # whose promotion is exact either way. The reference loop promotes the row it uses.
+    emb = t["model.embed_tokens.weight"]
     write("embed.bin", to_q32(emb[ids].reshape(-1)).astype("<i8").tobytes())
 
     # ---- per-layer weights ----
@@ -131,62 +149,81 @@ def main():
     vc = [[] for _ in range(L)]
     logits = None
 
-    for p_ix in range(P):
-        x = emb[ids[p_ix]].copy()
-        for l in range(L):
-            pre = f"model.layers.{l}."
-            h = x.copy()
-            n = rmsnorm(h, g(pre + "input_layernorm.weight"), eps)
-            q = g(pre + "self_attn.q_proj.weight") @ n
-            k = g(pre + "self_attn.k_proj.weight") @ n
-            v = g(pre + "self_attn.v_proj.weight") @ n
+    if a.batched_reference:
+        # The loop below is O(P^2 * H) in Python, which is nothing at five positions and
+        # impossible at five hundred. A perplexity run needs the latter, so the same
+        # mathematics is available masked and batched instead. The two agree exactly —
+        # `python3 tools/ppl_f64.py --verify` reproduces this script's top-ten logits —
+        # and the loop stays the default because it is the one written independently of
+        # the integer path, which is what makes it evidence.
+        #
+        # Agreement is mathematical, not bit-level: summing a dot product in a different
+        # order moves the last bits of a float64. Measured on the default prompt, the two
+        # differ by at most 1.8e-14 absolute with identical argmax and top ten. That is
+        # irrelevant to a perplexity figure and fatal to a pinned fixture, so `logits.bin`
+        # from this path must not be committed as a golden vector.
+        from ppl_f64 import forward as batched_forward
 
-            qn = g(pre + "self_attn.q_norm.weight")
-            kn = g(pre + "self_attn.k_norm.weight")
-            for i in range(H):
-                s = slice(i * hs, (i + 1) * hs)
-                q[s] = rmsnorm(q[s], qn, eps)
-                a_, b_ = q[s][:half].copy(), q[s][half:].copy()
-                q[s] = np.concatenate(
-                    [a_ * cos[p_ix] - b_ * sin[p_ix], a_ * sin[p_ix] + b_ * cos[p_ix]]
-                )
-            for i in range(KV):
-                s = slice(i * hs, (i + 1) * hs)
-                k[s] = rmsnorm(k[s], kn, eps)
-                a_, b_ = k[s][:half].copy(), k[s][half:].copy()
-                k[s] = np.concatenate(
-                    [a_ * cos[p_ix] - b_ * sin[p_ix], a_ * sin[p_ix] + b_ * cos[p_ix]]
-                )
-            kc[l].append(k)
-            vc[l].append(v)
+        lg = batched_forward(t, cfg, ids)
+        per_position = [int(r.argmax()) for r in lg]
+        logits = lg[-1]
+    else:
+        for p_ix in range(P):
+            x = emb[ids[p_ix]].astype(np.float64)
+            for l in range(L):
+                pre = f"model.layers.{l}."
+                h = x.copy()
+                n = rmsnorm(h, g(pre + "input_layernorm.weight"), eps)
+                q = g(pre + "self_attn.q_proj.weight") @ n
+                k = g(pre + "self_attn.k_proj.weight") @ n
+                v = g(pre + "self_attn.v_proj.weight") @ n
 
-            attn = np.zeros(H * hs)
-            for i in range(H):
-                kvh = i // group
-                qi = q[i * hs : (i + 1) * hs]
-                sc = np.array(
-                    [
-                        qi @ kc[l][tt][kvh * hs : (kvh + 1) * hs] / np.sqrt(hs)
-                        for tt in range(p_ix + 1)
-                    ]
-                )
-                pr = softmax(sc)
-                for tt in range(p_ix + 1):
-                    attn[i * hs : (i + 1) * hs] += pr[tt] * vc[l][tt][kvh * hs : (kvh + 1) * hs]
+                qn = g(pre + "self_attn.q_norm.weight")
+                kn = g(pre + "self_attn.k_norm.weight")
+                for i in range(H):
+                    s = slice(i * hs, (i + 1) * hs)
+                    q[s] = rmsnorm(q[s], qn, eps)
+                    a_, b_ = q[s][:half].copy(), q[s][half:].copy()
+                    q[s] = np.concatenate(
+                        [a_ * cos[p_ix] - b_ * sin[p_ix], a_ * sin[p_ix] + b_ * cos[p_ix]]
+                    )
+                for i in range(KV):
+                    s = slice(i * hs, (i + 1) * hs)
+                    k[s] = rmsnorm(k[s], kn, eps)
+                    a_, b_ = k[s][:half].copy(), k[s][half:].copy()
+                    k[s] = np.concatenate(
+                        [a_ * cos[p_ix] - b_ * sin[p_ix], a_ * sin[p_ix] + b_ * cos[p_ix]]
+                    )
+                kc[l].append(k)
+                vc[l].append(v)
 
-            h = h + g(pre + "self_attn.o_proj.weight") @ attn
-            n = rmsnorm(h, g(pre + "post_attention_layernorm.weight"), eps)
-            gt = g(pre + "mlp.gate_proj.weight") @ n
-            up = g(pre + "mlp.up_proj.weight") @ n
-            h = h + g(pre + "mlp.down_proj.weight") @ ((gt / (1.0 + np.exp(-gt))) * up)
-            x = h
-        # Every position, not just the last. A chain that emits the right final token
-        # having taken a wrong path to it would look identical from the outside, and only
-        # per-position tokens distinguish the two.
-        lg = head @ rmsnorm(x, g("model.norm.weight"), eps)
-        per_position.append(int(np.argmax(lg)))
-        if p_ix == P - 1:
-            logits = lg
+                attn = np.zeros(H * hs)
+                for i in range(H):
+                    kvh = i // group
+                    qi = q[i * hs : (i + 1) * hs]
+                    sc = np.array(
+                        [
+                            qi @ kc[l][tt][kvh * hs : (kvh + 1) * hs] / np.sqrt(hs)
+                            for tt in range(p_ix + 1)
+                        ]
+                    )
+                    pr = softmax(sc)
+                    for tt in range(p_ix + 1):
+                        attn[i * hs : (i + 1) * hs] += pr[tt] * vc[l][tt][kvh * hs : (kvh + 1) * hs]
+
+                h = h + g(pre + "self_attn.o_proj.weight") @ attn
+                n = rmsnorm(h, g(pre + "post_attention_layernorm.weight"), eps)
+                gt = g(pre + "mlp.gate_proj.weight") @ n
+                up = g(pre + "mlp.up_proj.weight") @ n
+                h = h + g(pre + "mlp.down_proj.weight") @ ((gt / (1.0 + np.exp(-gt))) * up)
+                x = h
+            # Every position, not just the last. A chain that emits the right final token
+            # having taken a wrong path to it would look identical from the outside, and only
+            # per-position tokens distinguish the two.
+            lg = head @ rmsnorm(x, g("model.norm.weight"), eps)
+            per_position.append(int(np.argmax(lg)))
+            if p_ix == P - 1:
+                logits = lg
 
     write("logits.bin", logits.astype(np.float64).tobytes())
     write("tokens.bin", np.asarray(per_position, dtype="<u4").tobytes())
